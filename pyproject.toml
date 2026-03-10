@@ -1,0 +1,23 @@
+[project]
+name = "jaguar-geo-assign"
+version = "0.1.0"
+description = "Leakage-safe transfer learning scaffold for jaguar geographic assignment."
+readme = "README.md"
+requires-python = ">=3.11,<3.12"
+dependencies = []
+
+[project.scripts]
+jaguar-geo-assign = "jaguar_geo_assign.cli:main"
+
+[build-system]
+requires = ["uv_build>=0.9.28,<0.10.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3,<9",
+]
+
+[tool.pytest.ini_options]
+addopts = "-q"
+testpaths = ["tests"]

@@ -1,0 +1,31 @@
+[experiment]
+name = "jaguar_fine_tune_bootstrap"
+description = "Bootstrap fine-tuning config for coordinate regression on jaguar metadata."
+requires_private_data = false
+
+[data]
+jaguar_manifest = "manifests/jaguar/example_manifest.csv"
+jaguar_metadata_fields = [
+  "sample_id",
+  "individual_id",
+  "locality_id",
+  "biome_population_label",
+  "latitude",
+  "longitude",
+]
+split_unit = "individual_id"
+
+[tasks.primary]
+kind = "coordinate_regression"
+target_columns = ["latitude", "longitude"]
+primary_metric = "median_geodesic_error_km"
+secondary_metrics = ["mean_geodesic_error_km", "r2"]
+
+[stages]
+order = ["fine_tune", "evaluate", "baseline_evaluate", "report"]
+
+[baseline]
+stage = "baseline_evaluate"
+provider = "deferred_legacy_group_model"
+enabled = false
+extension_point = "shared_split_metric_report_contract"
