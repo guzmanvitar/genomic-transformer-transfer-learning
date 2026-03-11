@@ -203,8 +203,8 @@ def test_write_tokenized_dataset_emits_real_parquet_artifact_and_schema(tmp_path
     assert export_path.suffix == ".parquet"
     assert export_path.read_bytes()[:4] == b"PAR1"
 
-    table = pyarrow_parquet.read_table(export_path)
-    assert set(table.schema.names) == {
+    file_schema = pyarrow_parquet.read_schema(export_path)
+    assert set(file_schema.names) == {
         "attention_mask",
         "input_ids",
         "token_count",
@@ -212,9 +212,10 @@ def test_write_tokenized_dataset_emits_real_parquet_artifact_and_schema(tmp_path
         "tokenizer",
         "window",
     }
-    assert "sequence_hash" in str(table.schema)
-    assert "sequence:" not in str(table.schema)
+    assert "sequence_hash" in str(file_schema)
+    assert "sequence:" not in str(file_schema)
 
+    table = pyarrow_parquet.read_table(export_path)
     payload = table.to_pylist()[0]
     assert "sequence" not in payload["window"]
     assert payload["window"]["sequence_hash"] == "abc123"
