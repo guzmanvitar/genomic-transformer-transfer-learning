@@ -12,7 +12,7 @@ import shutil
 import subprocess
 import tempfile
 import time
-from typing import Callable, Iterable, Mapping, Sequence
+from typing import Callable, Mapping, Sequence
 from urllib.parse import urlparse
 from urllib.request import OpenerDirector, Request, build_opener
 
@@ -304,7 +304,7 @@ def generate_consensus_fasta(
         if prepared.mask_bed is not None:
             command.extend(["-m", str(prepared.mask_bed)])
         command.append(str(prepared.filtered_vcf))
-        with reference_path.open("r", encoding="utf-8") as reference_handle, output_path.open(
+        with _open_maybe_gzip(reference_path) as reference_handle, output_path.open(
             "w", encoding="utf-8"
         ) as output_handle:
             completed = subprocess.run(
