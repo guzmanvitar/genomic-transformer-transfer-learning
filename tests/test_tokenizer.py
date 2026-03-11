@@ -214,12 +214,17 @@ def test_write_tokenized_dataset_emits_real_parquet_artifact_and_schema(tmp_path
     }
     assert "sequence_hash" in str(file_schema)
     assert "sequence:" not in str(file_schema)
+    assert "split" in str(file_schema)
 
-    table = pyarrow_parquet.read_table(export_path)
+    standalone_shard = tmp_path / "standalone.parquet"
+    standalone_shard.write_bytes(export_path.read_bytes())
+
+    table = pyarrow_parquet.read_table(standalone_shard)
     payload = table.to_pylist()[0]
     assert "sequence" not in payload["window"]
     assert payload["window"]["sequence_hash"] == "abc123"
     assert payload["window"]["contig"] == "chr1"
+    assert payload["window"]["split"] == "validation"
     assert payload["tokenizer"]["unsupported_symbol_policy"] == "reject"
 
 

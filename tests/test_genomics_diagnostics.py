@@ -260,6 +260,33 @@ def test_summarize_corpus_records_caps_near_duplicate_work_to_sample_limit(monke
     assert summary["near_duplicate_analysis"]["analyzed_sequence_count"] == 64
 
 
+def test_summarize_corpus_records_handles_tied_sampling_keys_deterministically(monkeypatch) -> None:
+    tied_records = _build_realistic_records(total=3, source="consensus")
+    observed: dict[str, list[str]] = {}
+
+    def fake_count_near_duplicate_pairs(sequences: list[str]) -> int:
+        observed["analyzed_sequences"] = sequences
+        return 0
+
+    monkeypatch.setattr(genomics_diagnostics, "_near_duplicate_sampling_key", lambda _: "0")
+    monkeypatch.setattr(genomics_diagnostics, "_count_near_duplicate_pairs", fake_count_near_duplicate_pairs)
+
+    summary = summarize_corpus_records(tied_records, near_duplicate_sample_limit=2)
+
+    assert observed == {
+        "analyzed_sequences": [
+            str(tied_records[0]["sequence"]),
+            str(tied_records[1]["sequence"]),
+        ]
+    }
+    assert summary["near_duplicate_analysis"] == {
+        "mode": "sampled",
+        "total_sequence_count": 3,
+        "analyzed_sequence_count": 2,
+        "sample_limit": 2,
+    }
+
+
 def test_build_eda_payload_bounds_consensus_sample_preview_for_large_corpus() -> None:
     payload = build_eda_payload(
         _build_realistic_records(total=640, source="consensus"),

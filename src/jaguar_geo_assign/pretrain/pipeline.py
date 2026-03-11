@@ -307,20 +307,20 @@ def _build_reference_sequence_records(
     reference_sequences: dict[str, str],
     manifest_entries: tuple[FelineSampleManifestEntry, ...],
 ) -> list[SequenceRecord]:
-    records: list[SequenceRecord] = []
-    for entry in manifest_entries:
-        for contig, sequence in reference_sequences.items():
-            records.append(
-                SequenceRecord(
-                    sample_id=f"reference-{entry.sample_id}",
-                    individual_id=entry.individual_id,
-                    contig=contig,
-                    sequence=sequence,
-                    source="reference",
-                    sequence_start=0,
-                )
-            )
-    return records
+    if not manifest_entries:
+        return []
+
+    return [
+        SequenceRecord(
+            sample_id=f"reference-{contig}",
+            individual_id="reference",
+            contig=contig,
+            sequence=sequence,
+            source="reference",
+            sequence_start=0,
+        )
+        for contig, sequence in reference_sequences.items()
+    ]
 
 
 def _build_diagnostics_payload(

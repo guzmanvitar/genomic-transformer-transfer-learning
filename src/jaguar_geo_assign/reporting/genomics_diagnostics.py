@@ -463,7 +463,7 @@ def _stream_corpus_summary(
     sampled_records: list[dict[str, object]] = []
     sampled_heap: list[tuple[int, dict[str, object]]] = []
 
-    for raw_record in records:
+    for record_index, raw_record in enumerate(records):
         record = _summarize_record(raw_record, CORPUS_REQUIRED_FIELDS)
         retained_window_count += 1
         if sample_preview_limit is None or len(sample_preview) < sample_preview_limit:
@@ -504,11 +504,13 @@ def _stream_corpus_summary(
         else:
             # Keep the exact near-duplicate check bounded to a deterministic sample rather
             # than the full corpus; this avoids an unbounded O(S × L) signature expansion.
-            _update_sampled_near_duplicates(record, near_duplicate_sample_limit, sampled_heap)
+            _update_sampled_near_duplicates(
+                record, near_duplicate_sample_limit, sampled_heap, record_index
+            )
 
     duplicate_window_count = sum(count - 1 for count in duplicate_counts.values() if count > 1)
     near_duplicate_records = sampled_records if near_duplicate_sample_limit is None else [
-        item[1] for item in sorted(sampled_heap, key=lambda item: item[0])
+        item[2] for item in sorted(sampled_heap, key=lambda item: (item[0], item[1]))
     ]
     near_duplicate_summary = _summarize_near_duplicates(
         near_duplicate_records,
@@ -586,11 +588,14 @@ def _update_missingness_counts(sequence: str, missing_counts: list[int], total_c
 
 
 def _update_sampled_near_duplicates(
-    record: dict[str, object], sample_limit: int, heap: list[tuple[int, dict[str, object]]]
+    record: dict[str, object],
+    sample_limit: int,
+    heap: list[tuple[int, int, dict[str, object]]],
+    record_index: int,
 ) -> None:
     """Maintain a deterministic hash-ordered sample for bounded near-duplicate analysis."""
     sampling_key = int(_near_duplicate_sampling_key(record), 16)
-    entry = (-sampling_key, record)
+    entry = (-sampling_key, record_index, record)
     if len(heap) < sample_limit:
         heappush(heap, entry)
         return

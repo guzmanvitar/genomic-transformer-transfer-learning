@@ -766,6 +766,7 @@ def _export_window(window: WindowRecord, *, contract: ExportContract) -> dict[st
         "gc_fraction": window.gc_fraction,
         "individual_id": window.individual_id,
         "sample_id": window.sample_id,
+        "split": window.split,
         "source": window.source,
     }
     if contract.preserve_coordinates:
