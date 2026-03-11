@@ -82,6 +82,7 @@ class WindowingConfig:
 class SplitConfig:
     strategy: str
     locus_key_fields: tuple[str, ...]
+    locus_block_size: int
     assignment_stage: str
     evaluation_target: str
     baseline_policy: str
@@ -178,83 +179,105 @@ def load_experiment_config(path: str | Path) -> ExperimentConfig:
 
 def load_feline_pipeline_config(path: str | Path) -> FelinePipelineConfig:
     raw = tomllib.loads(Path(path).read_text(encoding="utf-8"))
-    pipeline = raw["pipeline"]
-    paths = raw["paths"]
-    consensus = raw["consensus"]
-    windowing = raw["windowing"]
-    split = raw["split"]
-    tokenizer = raw["tokenizer"]
-    export = raw["export"]
-    runtime = raw["runtime"]
-
-    if pipeline["project_accession"] != "PRJNA308208":
-        raise ValueError("pipeline.project_accession must remain PRJNA308208")
-    if consensus["assembly"] != "Felis_catus_9.0":
-        raise ValueError("consensus.assembly must remain Felis_catus_9.0")
-    if not consensus["require_assembly_match"] or not consensus["require_contig_match"]:
-        raise ValueError("consensus must fail fast on assembly and contig mismatches")
-    if consensus["mask_symbol"] != "N":
-        raise ValueError("consensus.mask_symbol must remain N")
-
-    policy_fields = (
-        consensus["homozygous_reference"],
-        consensus["homozygous_alternate"],
-        consensus["heterozygous"],
-        consensus["multiallelic"],
-        consensus["filtered"],
-        consensus["missing"],
-        consensus["indel"],
+    required_sections = (
+        "pipeline",
+        "paths",
+        "consensus",
+        "windowing",
+        "split",
+        "tokenizer",
+        "export",
+        "runtime",
     )
-    if any(policy not in EXPLICIT_CONSENSUS_POLICIES for policy in policy_fields):
-        raise ValueError("consensus policies must use the approved explicit policy values")
+    missing_sections = [section for section in required_sections if section not in raw]
+    if missing_sections:
+        raise ValueError(
+            "Feline pipeline config is missing required sections: " + ", ".join(missing_sections)
+        )
 
-    context_window = int(windowing["context_window"])
-    window_overlap = int(windowing["window_overlap"])
-    if context_window <= 0:
-        raise ValueError("windowing.context_window must be positive")
-    if window_overlap < 0 or window_overlap >= context_window:
-        raise ValueError("windowing.window_overlap must be >= 0 and smaller than context_window")
-    max_ambiguous_fraction = float(windowing["max_ambiguous_fraction"])
-    if not 0 <= max_ambiguous_fraction <= 1:
-        raise ValueError("windowing.max_ambiguous_fraction must be between 0 and 1")
+    try:
+        pipeline = raw["pipeline"]
+        paths = raw["paths"]
+        consensus = raw["consensus"]
+        windowing = raw["windowing"]
+        split = raw["split"]
+        tokenizer = raw["tokenizer"]
+        export = raw["export"]
+        runtime = raw["runtime"]
 
-    locus_key_fields = tuple(split["locus_key_fields"])
-    if split["strategy"] != GLOBAL_LOCUS_SPLIT_STRATEGY:
-        raise ValueError("split.strategy must use the global locus-safe contract")
-    if locus_key_fields != ("contig", "block_id"):
-        raise ValueError("split.locus_key_fields must be ['contig', 'block_id']")
-    if split["assignment_stage"] != PRE_WINDOW_ASSIGNMENT_STAGE:
-        raise ValueError("split.assignment_stage must assign loci before windowing")
-    if split["baseline_policy"] != REFERENCE_BASELINE_POLICY:
-        raise ValueError("split.baseline_policy must reuse locus assignments for the baseline corpus")
+        if pipeline["project_accession"] != "PRJNA308208":
+            raise ValueError("pipeline.project_accession must remain PRJNA308208")
+        if consensus["assembly"] != "Felis_catus_9.0":
+            raise ValueError("consensus.assembly must remain Felis_catus_9.0")
+        if not consensus["require_assembly_match"] or not consensus["require_contig_match"]:
+            raise ValueError("consensus must fail fast on assembly and contig mismatches")
+        if consensus["mask_symbol"] != "N":
+            raise ValueError("consensus.mask_symbol must remain N")
 
-    allowed_alphabet = tuple(tokenizer["allowed_alphabet"])
-    if tokenizer["identifier"] != DNABERT2_TOKENIZER_ID:
-        raise ValueError("tokenizer.identifier must pin zhihan1996/DNABERT-2-117M")
-    if tokenizer["revision"] != DNABERT2_TOKENIZER_REVISION:
-        raise ValueError("tokenizer.revision must pin the approved immutable DNABERT-2 revision")
-    if allowed_alphabet != POST_CONSENSUS_ALLOWED_ALPHABET:
-        raise ValueError("tokenizer.allowed_alphabet must exactly match the post-consensus contract")
-    if tokenizer["unsupported_symbol_policy"] not in {"reject", "normalize_to_n"}:
-        raise ValueError("tokenizer.unsupported_symbol_policy must be reject or normalize_to_n")
-    max_position_embeddings = int(tokenizer["max_position_embeddings"])
-    if max_position_embeddings < context_window:
-        raise ValueError("tokenizer.max_position_embeddings must be >= windowing.context_window")
+        policy_fields = (
+            consensus["homozygous_reference"],
+            consensus["homozygous_alternate"],
+            consensus["heterozygous"],
+            consensus["multiallelic"],
+            consensus["filtered"],
+            consensus["missing"],
+            consensus["indel"],
+        )
+        if any(policy not in EXPLICIT_CONSENSUS_POLICIES for policy in policy_fields):
+            raise ValueError("consensus policies must use the approved explicit policy values")
 
-    if export["format"] != "parquet":
-        raise ValueError("export.format must remain parquet for the approved v1 contract")
-    if int(export["row_group_size"]) <= 0:
-        raise ValueError("export.row_group_size must be positive")
-    if not export["preserve_coordinates"]:
-        raise ValueError("export.preserve_coordinates must remain enabled for auditability")
-    if not export["preserve_raw_windows"] and not export["preserve_sequence_hashes"]:
-        raise ValueError("export must preserve raw windows or immutable sequence hashes")
-    if export["sequence_hash_algorithm"] != "sha256":
-        raise ValueError("export.sequence_hash_algorithm must remain sha256")
+        context_window = int(windowing["context_window"])
+        window_overlap = int(windowing["window_overlap"])
+        if context_window <= 0:
+            raise ValueError("windowing.context_window must be positive")
+        if window_overlap < 0 or window_overlap >= context_window:
+            raise ValueError("windowing.window_overlap must be >= 0 and smaller than context_window")
+        max_ambiguous_fraction = float(windowing["max_ambiguous_fraction"])
+        if not 0 <= max_ambiguous_fraction <= 1:
+            raise ValueError("windowing.max_ambiguous_fraction must be between 0 and 1")
 
-    external_tools = tuple(runtime["external_tools"])
-    if external_tools != REQUIRED_EXTERNAL_TOOLS:
-        raise ValueError("runtime.external_tools must explicitly require bcftools")
+        locus_key_fields = tuple(split["locus_key_fields"])
+        if split["strategy"] != GLOBAL_LOCUS_SPLIT_STRATEGY:
+            raise ValueError("split.strategy must use the global locus-safe contract")
+        if locus_key_fields != ("contig", "block_id"):
+            raise ValueError("split.locus_key_fields must be ['contig', 'block_id']")
+        locus_block_size = int(split["locus_block_size"])
+        if locus_block_size < context_window:
+            raise ValueError("split.locus_block_size must be >= windowing.context_window")
+        if split["assignment_stage"] != PRE_WINDOW_ASSIGNMENT_STAGE:
+            raise ValueError("split.assignment_stage must assign loci before windowing")
+        if split["baseline_policy"] != REFERENCE_BASELINE_POLICY:
+            raise ValueError("split.baseline_policy must reuse locus assignments for the baseline corpus")
+
+        allowed_alphabet = tuple(tokenizer["allowed_alphabet"])
+        if tokenizer["identifier"] != DNABERT2_TOKENIZER_ID:
+            raise ValueError("tokenizer.identifier must pin zhihan1996/DNABERT-2-117M")
+        if tokenizer["revision"] != DNABERT2_TOKENIZER_REVISION:
+            raise ValueError("tokenizer.revision must pin the approved immutable DNABERT-2 revision")
+        if allowed_alphabet != POST_CONSENSUS_ALLOWED_ALPHABET:
+            raise ValueError("tokenizer.allowed_alphabet must exactly match the post-consensus contract")
+        if tokenizer["unsupported_symbol_policy"] not in {"reject", "normalize_to_n"}:
+            raise ValueError("tokenizer.unsupported_symbol_policy must be reject or normalize_to_n")
+        max_position_embeddings = int(tokenizer["max_position_embeddings"])
+        if max_position_embeddings < context_window:
+            raise ValueError("tokenizer.max_position_embeddings must be >= windowing.context_window")
+
+        if export["format"] != "parquet":
+            raise ValueError("export.format must remain parquet for the approved v1 contract")
+        if int(export["row_group_size"]) <= 0:
+            raise ValueError("export.row_group_size must be positive")
+        if not export["preserve_coordinates"]:
+            raise ValueError("export.preserve_coordinates must remain enabled for auditability")
+        if not export["preserve_raw_windows"] and not export["preserve_sequence_hashes"]:
+            raise ValueError("export must preserve raw windows or immutable sequence hashes")
+        if export["sequence_hash_algorithm"] != "sha256":
+            raise ValueError("export.sequence_hash_algorithm must remain sha256")
+
+        external_tools = tuple(runtime["external_tools"])
+        if external_tools != REQUIRED_EXTERNAL_TOOLS:
+            raise ValueError("runtime.external_tools must explicitly require bcftools")
+    except KeyError as exc:
+        raise ValueError(f"Feline pipeline config is missing required field: {exc.args[0]}") from exc
 
     return FelinePipelineConfig(
         name=pipeline["name"],
@@ -292,6 +315,7 @@ def load_feline_pipeline_config(path: str | Path) -> FelinePipelineConfig:
         split=SplitConfig(
             strategy=split["strategy"],
             locus_key_fields=locus_key_fields,
+            locus_block_size=locus_block_size,
             assignment_stage=split["assignment_stage"],
             evaluation_target=split["evaluation_target"],
             baseline_policy=split["baseline_policy"],
@@ -354,6 +378,7 @@ def describe_feline_pipeline(path: str | Path) -> str:
             (
                 "Split contract: "
                 f"{config.split.strategy} via {', '.join(config.split.locus_key_fields)} "
+                f"block_size={config.split.locus_block_size} "
                 f"({config.split.assignment_stage}; baseline={config.split.baseline_policy})"
             ),
             (

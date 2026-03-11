@@ -35,6 +35,7 @@ def test_load_feline_pipeline_config_preserves_scientific_contracts() -> None:
     assert config.project_accession == "PRJNA308208"
     assert config.split.strategy == "global_locus_block"
     assert config.split.locus_key_fields == ("contig", "block_id")
+    assert config.split.locus_block_size == 2048
     assert config.tokenizer.revision == "7bce263b15377fc15361f52cfab88f8b586abda0"
     assert config.runtime.external_tools == ("bcftools",)
 
@@ -50,4 +51,12 @@ def test_load_feline_pipeline_config_rejects_unpinned_tokenizer_revision(tmp_pat
     )
 
     with pytest.raises(ValueError, match="approved immutable DNABERT-2 revision"):
+        load_feline_pipeline_config(invalid_config)
+
+
+def test_load_feline_pipeline_config_reports_missing_required_sections(tmp_path: Path) -> None:
+    invalid_config = tmp_path / "invalid_sections.toml"
+    invalid_config.write_text("[experiment]\nname = 'wrong'\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="missing required sections"):
         load_feline_pipeline_config(invalid_config)

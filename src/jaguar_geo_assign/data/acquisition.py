@@ -8,6 +8,7 @@ import gzip
 import hashlib
 import json
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import tempfile
@@ -253,7 +254,7 @@ def classify_consensus_site(
     if not allele_tokens or any(token == "." for token in allele_tokens):
         return ConsensusDecision(action="mask", category="no_call", replacement=None)
     if len(set(allele_tokens)) != 1:
-        category = "multiallelic_heterozygous" if len(set(allele_tokens)) > 1 and len(alts) > 1 else "heterozygous"
+        category = "multiallelic" if len(alts) > 1 else "heterozygous"
         return ConsensusDecision(action="mask", category=category, replacement=None)
 
     allele_index = int(allele_tokens[0])
@@ -261,9 +262,13 @@ def classify_consensus_site(
         return ConsensusDecision(action="reference", category="homozygous_reference", replacement=ref)
     if allele_index > len(alts):
         return ConsensusDecision(action="mask", category="invalid_alt_index", replacement=None)
+    if len(alts) > 1:
+        return ConsensusDecision(action="mask", category="multiallelic", replacement=None)
 
     replacement = alts[allele_index - 1]
-    category = "homozygous_alternate_indel" if len(replacement) != len(ref) else "homozygous_alternate"
+    if len(replacement) != len(ref):
+        return ConsensusDecision(action="mask", category="indel", replacement=None)
+    category = "homozygous_alternate"
     return ConsensusDecision(action="apply_alt", category=category, replacement=replacement)
 
 
@@ -358,9 +363,11 @@ def _prepare_consensus(
     expected_reference_tokens: Sequence[str],
 ) -> _PreparedConsensus:
     contig_headers = _read_fasta_headers(reference_fasta)
-    if not any(token in " ".join(contig_headers.values()) or token in reference_fasta.name for token in expected_reference_tokens):
+    reference_evidence = " ".join((reference_fasta.name, *contig_headers.values()))
+    if not _matches_expected_reference_build(reference_evidence, expected_reference_tokens):
         raise ReferenceMismatchError(
-            f"Reference FASTA {reference_fasta} does not advertise any expected build token: {expected_reference_tokens}"
+            "Reference FASTA "
+            f"{reference_fasta} does not canonically match expected build evidence {expected_reference_tokens}"
         )
 
     filtered_vcf = work_dir / f"{sample_id}.prepared.vcf"
@@ -385,21 +392,27 @@ def _prepare_consensus(
                 columns = line.rstrip("\n").split("\t")
                 if sample_id not in columns[9:]:
                     raise AcquisitionError(f"Sample '{sample_id}' not found in VCF {sample_vcf}")
+                if not vcf_reference:
+                    raise ReferenceMismatchError(
+                        f"VCF {sample_vcf} is missing explicit reference/build metadata in a ##reference header"
+                    )
+                if not _matches_expected_reference_build(vcf_reference, expected_reference_tokens):
+                    raise ReferenceMismatchError(
+                        "VCF "
+                        f"{sample_vcf} declares reference '{vcf_reference}', which does not canonically match "
+                        f"expected build evidence {expected_reference_tokens}"
+                    )
+                if header_contigs and not header_contigs.issubset(contig_headers.keys()):
+                    missing_contigs = sorted(header_contigs.difference(contig_headers.keys()))
+                    raise ContigMismatchError(
+                        f"VCF {sample_vcf} references contigs absent from {reference_fasta}: {missing_contigs[:5]}"
+                    )
                 sample_index = columns.index(sample_id)
                 sink.write(line)
                 continue
 
             if sample_index is None:
                 raise AcquisitionError(f"VCF {sample_vcf} is missing a #CHROM header row")
-            if vcf_reference and not any(token in vcf_reference for token in expected_reference_tokens):
-                raise ReferenceMismatchError(
-                    f"VCF {sample_vcf} declares reference '{vcf_reference}', expected one of {expected_reference_tokens}"
-                )
-            if header_contigs and not header_contigs.issubset(contig_headers.keys()):
-                missing_contigs = sorted(header_contigs.difference(contig_headers.keys()))
-                raise ContigMismatchError(
-                    f"VCF {sample_vcf} references contigs absent from {reference_fasta}: {missing_contigs[:5]}"
-                )
 
             total_records += 1
             fields = line.rstrip("\n").split("\t")
@@ -411,14 +424,15 @@ def _prepare_consensus(
             decision = classify_consensus_site(ref, alts, sample_format.get("GT"), filter_value=filter_value)
             if decision.category in {"filtered", "no_call"}:
                 filtered_or_nocall_count += 1
+            if decision.category == "indel":
+                indel_count += 1
             if decision.action != "mask":
                 callable_records += 1
             if decision.action == "reference":
                 identical_to_reference_calls += 1
-            elif decision.action == "apply_alt":
+                continue
+            if decision.action == "apply_alt":
                 applied_variant_count += 1
-                if decision.category.endswith("indel"):
-                    indel_count += 1
                 sink.write(line)
                 continue
             start = int(pos_str) - 1
@@ -511,6 +525,17 @@ def _read_fasta_headers(reference_fasta: Path) -> dict[str, str]:
     if not headers:
         raise AcquisitionError(f"Reference FASTA {reference_fasta} did not contain any contig headers")
     return headers
+
+
+def _matches_expected_reference_build(evidence: str, expected_reference_tokens: Sequence[str]) -> bool:
+    canonical_evidence = _canonicalize_reference_evidence(evidence)
+    return all(
+        _canonicalize_reference_evidence(token) in canonical_evidence for token in expected_reference_tokens
+    )
+
+
+def _canonicalize_reference_evidence(evidence: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "_", evidence.lower()).strip("_")
 
 
 def _open_maybe_gzip(path: Path):

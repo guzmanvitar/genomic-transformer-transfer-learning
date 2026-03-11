@@ -7,6 +7,7 @@ from .genomics_diagnostics import (
     compare_reference_baseline,
     summarize_corpus_records,
     summarize_sample_records,
+    write_eda_payload_json,
 )
 
 __all__ = [
@@ -16,4 +17,5 @@ __all__ = [
     "compare_reference_baseline",
     "summarize_corpus_records",
     "summarize_sample_records",
+    "write_eda_payload_json",
 ]
