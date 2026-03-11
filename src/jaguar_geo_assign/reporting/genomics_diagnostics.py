@@ -5,10 +5,9 @@ from __future__ import annotations
 from collections import Counter, defaultdict
 import json
 from hashlib import sha256
-from heapq import nsmallest
+from heapq import heapreplace, heappush, nsmallest
 from itertools import combinations
 from pathlib import Path
-from statistics import mean
 from typing import Iterable, Mapping
 
 CANONICAL_BASES = frozenset({"A", "C", "G", "T"})
@@ -27,7 +26,19 @@ SAMPLE_REQUIRED_FIELDS = frozenset(
 )
 CORPUS_REQUIRED_FIELDS = SAMPLE_REQUIRED_FIELDS | frozenset({"locus_id", "split", "source"})
 DEFAULT_NEAR_DUPLICATE_SAMPLE_LIMIT = 512
+DEFAULT_CONSENSUS_SAMPLE_LIMIT = 128
 DEFAULT_DISTRIBUTION_BINS = 10
+FRACTION_FIELD_NAMES = (
+    "gc_fraction",
+    "ambiguity_fraction",
+    "callable_fraction",
+    "filtered_fraction",
+    "no_call_fraction",
+    "other_masked_fraction",
+    "variant_fraction",
+    "fraction_identical_to_reference",
+    "token_to_base_ratio",
+)
 
 
 def summarize_sample_records(records: Iterable[Mapping[str, object]]) -> list[dict[str, object]]:
@@ -41,45 +52,11 @@ def summarize_corpus_records(
     near_duplicate_sample_limit: int | None = DEFAULT_NEAR_DUPLICATE_SAMPLE_LIMIT,
 ) -> dict[str, object]:
     """Summarize corpus-level diversity, missingness, and duplication diagnostics."""
-    materialized = [_summarize_record(record, CORPUS_REQUIRED_FIELDS) for record in records]
-    integrity = audit_corpus_integrity(materialized, summarized=True)
-    duplicate_window_count = sum(
-        count - 1 for count in Counter(str(record["sequence"]) for record in materialized).values() if count > 1
+    summary, _, _ = _stream_corpus_summary(
+        records,
+        near_duplicate_sample_limit=near_duplicate_sample_limit,
     )
-    near_duplicate_summary = _summarize_near_duplicates(
-        materialized,
-        sample_limit=near_duplicate_sample_limit,
-    )
-
-    return {
-        "retained_window_count": len(materialized),
-        "unique_sample_count": len({record["sample_id"] for record in materialized}),
-        "unique_locus_count": len({record["locus_id"] for record in materialized}),
-        "mean_gc_fraction": _mean_metric(materialized, "gc_fraction"),
-        "mean_ambiguity_fraction": _mean_metric(materialized, "ambiguity_fraction"),
-        "mean_callable_fraction": _mean_metric(materialized, "callable_fraction"),
-        "mean_filtered_fraction": _mean_metric(materialized, "filtered_fraction"),
-        "mean_no_call_fraction": _mean_metric(materialized, "no_call_fraction"),
-        "mean_variant_fraction": _mean_metric(materialized, "variant_fraction"),
-        "mean_fraction_identical_to_reference": _mean_metric(
-            materialized, "fraction_identical_to_reference"
-        ),
-        "mean_token_to_base_ratio": _mean_metric(materialized, "token_to_base_ratio"),
-        "length_distribution": _build_length_distribution(materialized),
-        "gc_fraction_distribution": _build_fraction_distribution(
-            materialized,
-            field="gc_fraction",
-        ),
-        "duplicate_window_count": duplicate_window_count,
-        "duplicate_window_fraction": _safe_fraction(duplicate_window_count, len(materialized)),
-        "near_duplicate_pair_count": near_duplicate_summary["pair_count"],
-        "near_duplicate_pair_fraction": near_duplicate_summary["pair_fraction"],
-        "near_duplicate_analysis": near_duplicate_summary["analysis"],
-        "missingness_heatmap": build_missingness_heatmap(materialized),
-        "split_conflict_count": len(integrity["split_conflicts"]),
-        "shape_issue_count": len(integrity["shape_issues"]),
-        "source_counts": dict(Counter(record["source"] for record in materialized)),
-    }
+    return summary
 
 
 def compare_reference_baseline(
@@ -107,12 +84,14 @@ def write_eda_payload_json(
     output_path: str | Path,
     *,
     near_duplicate_sample_limit: int | None = DEFAULT_NEAR_DUPLICATE_SAMPLE_LIMIT,
+    consensus_sample_limit: int | None = DEFAULT_CONSENSUS_SAMPLE_LIMIT,
 ) -> Path:
     """Persist a notebook-friendly diagnostics payload as JSON."""
     payload = build_eda_payload(
         consensus_records,
         baseline_records,
         near_duplicate_sample_limit=near_duplicate_sample_limit,
+        consensus_sample_limit=consensus_sample_limit,
     )
     destination = Path(output_path)
     destination.parent.mkdir(parents=True, exist_ok=True)
@@ -203,6 +182,7 @@ def audit_corpus_integrity(
             int(record["callable_bases"])
             + int(record["filtered_bases"])
             + int(record["no_call_bases"])
+            + int(record.get("other_masked_bases", 0))
         )
         if observed_bases != len(str(record["sequence"])):
             shape_issues.append(
@@ -234,20 +214,26 @@ def build_eda_payload(
     baseline_records: Iterable[Mapping[str, object]],
     *,
     near_duplicate_sample_limit: int | None = DEFAULT_NEAR_DUPLICATE_SAMPLE_LIMIT,
+    consensus_sample_limit: int | None = DEFAULT_CONSENSUS_SAMPLE_LIMIT,
 ) -> dict[str, object]:
     """Build a notebook-friendly payload with per-sample and corpus-level summaries."""
-    consensus_materialized = list(consensus_records)
-    baseline_materialized = list(baseline_records)
-    consensus_summary = summarize_corpus_records(
-        consensus_materialized,
+    consensus_summary, consensus_preview, consensus_total_count = _stream_corpus_summary(
+        consensus_records,
         near_duplicate_sample_limit=near_duplicate_sample_limit,
+        sample_preview_limit=consensus_sample_limit,
     )
     baseline_summary = summarize_corpus_records(
-        baseline_materialized,
+        baseline_records,
         near_duplicate_sample_limit=near_duplicate_sample_limit,
     )
     return {
-        "consensus_samples": summarize_sample_records(consensus_materialized),
+        "consensus_samples": consensus_preview,
+        "consensus_sample_overview": {
+            "total_record_count": consensus_total_count,
+            "returned_record_count": len(consensus_preview),
+            "sample_limit": consensus_sample_limit,
+            "truncated": consensus_total_count > len(consensus_preview),
+        },
         "consensus_corpus": consensus_summary,
         "baseline_corpus": baseline_summary,
         "baseline_comparison": _build_reference_baseline_comparison(
@@ -270,6 +256,7 @@ def _summarize_record(
     callable_bases = _coerce_nonnegative_int(record, "callable_bases")
     filtered_bases = _coerce_nonnegative_int(record, "filtered_bases")
     no_call_bases = _coerce_nonnegative_int(record, "no_call_bases")
+    other_masked_bases = _coerce_optional_nonnegative_int(record, "other_masked_bases")
     token_count = _coerce_nonnegative_int(record, "token_count")
     canonical_bases = sum(base in CANONICAL_BASES for base in sequence)
 
@@ -284,6 +271,7 @@ def _summarize_record(
         "callable_fraction": round(_safe_fraction(callable_bases, len(sequence)), 6),
         "filtered_fraction": round(_safe_fraction(filtered_bases, len(sequence)), 6),
         "no_call_fraction": round(_safe_fraction(no_call_bases, len(sequence)), 6),
+        "other_masked_fraction": round(_safe_fraction(other_masked_bases, len(sequence)), 6),
         "variant_fraction": round(_safe_fraction(variant_count, len(sequence)), 6),
         "fraction_identical_to_reference": round(
             _safe_fraction(
@@ -313,14 +301,20 @@ def _count_near_duplicate_pairs(sequences: list[str]) -> int:
 
 
 def _summarize_near_duplicates(
-    records: list[dict[str, object]], *, sample_limit: int | None
+    records: list[dict[str, object]],
+    *,
+    sample_limit: int | None,
+    total_sequence_count: int | None = None,
 ) -> dict[str, object]:
     if sample_limit is not None and sample_limit <= 0:
         raise ValueError("near_duplicate_sample_limit must be positive when provided")
 
     analyzed_records = records
+    total_count = len(records) if total_sequence_count is None else total_sequence_count
     analysis_mode = "exact"
-    if sample_limit is not None and len(records) > sample_limit:
+    if sample_limit is not None and total_count > len(records):
+        analysis_mode = "sampled"
+    elif sample_limit is not None and len(records) > sample_limit:
         analyzed_records = list(
             nsmallest(sample_limit, records, key=_near_duplicate_sampling_key)
         )
@@ -334,7 +328,7 @@ def _summarize_near_duplicates(
         "pair_fraction": round(_safe_fraction(pair_count, analyzed_pair_total), 6),
         "analysis": {
             "mode": analysis_mode,
-            "total_sequence_count": len(records),
+            "total_sequence_count": total_count,
             "analyzed_sequence_count": len(analyzed_sequences),
             "sample_limit": sample_limit,
         },
@@ -393,8 +387,162 @@ def _coerce_nonnegative_int(record: Mapping[str, object], field: str) -> int:
     return value
 
 
-def _mean_metric(records: list[dict[str, object]], field: str) -> float:
-    return round(mean(float(record[field]) for record in records), 6) if records else 0.0
+def _coerce_optional_nonnegative_int(record: Mapping[str, object], field: str) -> int:
+    if field not in record:
+        return 0
+    return _coerce_nonnegative_int(record, field)
+
+
+def _stream_corpus_summary(
+    records: Iterable[Mapping[str, object]],
+    *,
+    near_duplicate_sample_limit: int | None,
+    sample_preview_limit: int | None = None,
+) -> tuple[dict[str, object], list[dict[str, object]], int]:
+    if sample_preview_limit is not None and sample_preview_limit <= 0:
+        raise ValueError("consensus_sample_limit must be positive when provided")
+
+    metric_sums = {field: 0.0 for field in FRACTION_FIELD_NAMES}
+    sample_preview: list[dict[str, object]] = []
+    unique_samples: set[str] = set()
+    unique_loci: set[str] = set()
+    source_counts: Counter[str] = Counter()
+    duplicate_counts: Counter[str] = Counter()
+    length_counts: Counter[int] = Counter()
+    gc_distribution_counts = [0] * DEFAULT_DISTRIBUTION_BINS
+    missing_counts = [0] * 8
+    total_counts = [0] * 8
+    locus_splits: dict[str, set[str]] = defaultdict(set)
+    shape_issue_count = 0
+    retained_window_count = 0
+    sampled_records: list[dict[str, object]] = [] if near_duplicate_sample_limit is None else []
+    sampled_heap: list[tuple[int, dict[str, object]]] = []
+
+    for raw_record in records:
+        record = _summarize_record(raw_record, CORPUS_REQUIRED_FIELDS)
+        retained_window_count += 1
+        if sample_preview_limit is None or len(sample_preview) < sample_preview_limit:
+            sample_preview.append(record)
+
+        unique_samples.add(str(record["sample_id"]))
+        unique_loci.add(str(record["locus_id"]))
+        source_counts[str(record["source"])] += 1
+        sequence = str(record["sequence"])
+        duplicate_counts[sequence] += 1
+        length_counts[len(sequence)] += 1
+        _update_fraction_distribution_counts(
+            gc_distribution_counts,
+            float(record["gc_fraction"]),
+            bins=DEFAULT_DISTRIBUTION_BINS,
+        )
+        _update_missingness_counts(sequence, missing_counts, total_counts)
+        locus_splits[str(record["locus_id"])].add(str(record["split"]))
+
+        observed_bases = (
+            int(record["callable_bases"])
+            + int(record["filtered_bases"])
+            + int(record["no_call_bases"])
+            + int(record.get("other_masked_bases", 0))
+        )
+        if observed_bases != len(sequence):
+            shape_issue_count += 1
+        if int(record["token_count"]) <= 0:
+            shape_issue_count += 1
+
+        for field in FRACTION_FIELD_NAMES:
+            metric_sums[field] += float(record[field])
+
+        if near_duplicate_sample_limit is None:
+            sampled_records.append(record)
+        else:
+            _update_sampled_near_duplicates(record, near_duplicate_sample_limit, sampled_heap)
+
+    duplicate_window_count = sum(count - 1 for count in duplicate_counts.values() if count > 1)
+    near_duplicate_records = sampled_records if near_duplicate_sample_limit is None else [
+        item[1] for item in sorted(sampled_heap, key=lambda item: item[0])
+    ]
+    near_duplicate_summary = _summarize_near_duplicates(
+        near_duplicate_records,
+        sample_limit=near_duplicate_sample_limit,
+        total_sequence_count=retained_window_count,
+    )
+
+    summary = {
+        "retained_window_count": retained_window_count,
+        "unique_sample_count": len(unique_samples),
+        "unique_locus_count": len(unique_loci),
+        "mean_gc_fraction": _safe_mean(metric_sums["gc_fraction"], retained_window_count),
+        "mean_ambiguity_fraction": _safe_mean(metric_sums["ambiguity_fraction"], retained_window_count),
+        "mean_callable_fraction": _safe_mean(metric_sums["callable_fraction"], retained_window_count),
+        "mean_filtered_fraction": _safe_mean(metric_sums["filtered_fraction"], retained_window_count),
+        "mean_no_call_fraction": _safe_mean(metric_sums["no_call_fraction"], retained_window_count),
+        "mean_other_masked_fraction": _safe_mean(
+            metric_sums["other_masked_fraction"], retained_window_count
+        ),
+        "mean_variant_fraction": _safe_mean(metric_sums["variant_fraction"], retained_window_count),
+        "mean_fraction_identical_to_reference": _safe_mean(
+            metric_sums["fraction_identical_to_reference"], retained_window_count
+        ),
+        "mean_token_to_base_ratio": _safe_mean(metric_sums["token_to_base_ratio"], retained_window_count),
+        "length_distribution": [
+            {"length": length, "count": count} for length, count in sorted(length_counts.items())
+        ],
+        "gc_fraction_distribution": _finalize_fraction_distribution(gc_distribution_counts),
+        "duplicate_window_count": duplicate_window_count,
+        "duplicate_window_fraction": _safe_fraction(duplicate_window_count, retained_window_count),
+        "near_duplicate_pair_count": near_duplicate_summary["pair_count"],
+        "near_duplicate_pair_fraction": near_duplicate_summary["pair_fraction"],
+        "near_duplicate_analysis": near_duplicate_summary["analysis"],
+        "missingness_heatmap": [
+            round(_safe_fraction(missing_counts[index], total_counts[index]), 6) for index in range(8)
+        ],
+        "split_conflict_count": sum(1 for splits in locus_splits.values() if len(splits) > 1),
+        "shape_issue_count": shape_issue_count,
+        "source_counts": dict(source_counts),
+    }
+    return summary, sample_preview, retained_window_count
+
+
+def _update_fraction_distribution_counts(counts: list[int], value: float, *, bins: int) -> None:
+    clamped_value = min(max(value, 0.0), 1.0)
+    bucket = min(int(clamped_value * bins), bins - 1)
+    counts[bucket] += 1
+
+
+def _finalize_fraction_distribution(counts: list[int]) -> list[dict[str, float | int]]:
+    bins = len(counts)
+    return [
+        {
+            "start": round(index / bins, 6),
+            "end": round((index + 1) / bins, 6),
+            "count": counts[index],
+        }
+        for index in range(bins)
+    ]
+
+
+def _update_missingness_counts(sequence: str, missing_counts: list[int], total_counts: list[int]) -> None:
+    for index, base in enumerate(sequence):
+        bucket = min((index * len(missing_counts)) // len(sequence), len(missing_counts) - 1)
+        total_counts[bucket] += 1
+        if base in MISSING_BASES:
+            missing_counts[bucket] += 1
+
+
+def _update_sampled_near_duplicates(
+    record: dict[str, object], sample_limit: int, heap: list[tuple[int, dict[str, object]]]
+) -> None:
+    sampling_key = int(_near_duplicate_sampling_key(record), 16)
+    entry = (-sampling_key, record)
+    if len(heap) < sample_limit:
+        heappush(heap, entry)
+        return
+    if sampling_key < -heap[0][0]:
+        heapreplace(heap, entry)
+
+
+def _safe_mean(total: float, count: int) -> float:
+    return 0.0 if count == 0 else round(total / count, 6)
 
 
 def _normalize_sequence(sequence: str) -> str:

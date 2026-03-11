@@ -6,9 +6,9 @@ import textwrap
 import pytest
 
 from jaguar_geo_assign.cli import main
+from jaguar_geo_assign.data.acquisition import ConsensusDiagnostics, ConsensusResult
 from jaguar_geo_assign.data import preprocessor as preprocessor_module
-from jaguar_geo_assign.data.preprocessor import ExportContractError
-from jaguar_geo_assign.data.preprocessor import TokenizerProvenance
+from jaguar_geo_assign.data.preprocessor import ExportContractError, TokenizedWindow, TokenizerProvenance, WindowRecord
 from jaguar_geo_assign.pretrain import pipeline as pretrain_pipeline
 
 
@@ -224,7 +224,71 @@ def test_pretrain_cli_smoke_path_runs_fixture_pipeline(
     assert "sequence" not in exported_consensus_rows[0]["window"]
     diagnostics = json.loads((tmp_path / "reports" / "eda_payload.json").read_text(encoding="utf-8"))
     assert diagnostics["consensus_generation"]["cat_1"]["applied_variant_count"] == 1
+    assert diagnostics["consensus_sample_overview"] == {
+        "total_record_count": 1,
+        "returned_record_count": 1,
+        "sample_limit": pretrain_pipeline.DEFAULT_RUNTIME_DIAGNOSTIC_SAMPLE_LIMIT,
+        "truncated": False,
+    }
+    assert diagnostics["consensus_samples"][0]["filtered_bases"] == 0
+    assert diagnostics["consensus_samples"][0]["no_call_bases"] == 1
+    assert diagnostics["consensus_samples"][0]["other_masked_bases"] == 1
+    assert diagnostics["consensus_samples"][0]["masked_base_counts"] == {
+        "heterozygous": 1,
+        "no_call": 1,
+    }
     assert diagnostics["baseline_comparison"]["deltas"]["retained_window_count"] == 0
+
+
+def test_runtime_diagnostics_payload_is_bounded_and_provenance_faithful() -> None:
+    consensus_windows = tuple(_synthetic_tokenized_window(index=index, source="consensus") for index in range(192))
+    baseline_windows = tuple(_synthetic_tokenized_window(index=index, source="reference") for index in range(192))
+
+    payload = pretrain_pipeline._build_diagnostics_payload(
+        tokenized_consensus=consensus_windows,
+        tokenized_baseline=baseline_windows,
+        consensus_results={
+            "cat-1": ConsensusResult(
+                sample_id="cat-1",
+                output_fasta=Path("cat-1.fa"),
+                diagnostics=ConsensusDiagnostics(
+                    sample_id="cat-1",
+                    total_records=192,
+                    callable_records=96,
+                    applied_variant_count=48,
+                    masked_site_count=96,
+                    filtered_or_nocall_count=48,
+                    indel_count=0,
+                    identical_to_reference_calls=48,
+                    callable_fraction=0.5,
+                    fraction_identical_to_reference_calls=0.25,
+                ),
+            )
+        },
+    )
+
+    assert payload["consensus_corpus"]["retained_window_count"] == 192
+    assert payload["consensus_corpus"]["source_counts"] == {"consensus": 192}
+    assert len(payload["consensus_samples"]) == pretrain_pipeline.DEFAULT_RUNTIME_DIAGNOSTIC_SAMPLE_LIMIT
+    assert payload["consensus_sample_overview"] == {
+        "total_record_count": 192,
+        "returned_record_count": pretrain_pipeline.DEFAULT_RUNTIME_DIAGNOSTIC_SAMPLE_LIMIT,
+        "sample_limit": pretrain_pipeline.DEFAULT_RUNTIME_DIAGNOSTIC_SAMPLE_LIMIT,
+        "truncated": True,
+    }
+    assert payload["consensus_samples"][1]["sequence"] == "ANCCAA"
+    assert payload["consensus_samples"][1]["filtered_bases"] == 1
+    assert payload["consensus_samples"][1]["no_call_bases"] == 0
+    assert payload["consensus_samples"][1]["other_masked_bases"] == 0
+    assert payload["consensus_samples"][1]["masked_base_counts"] == {"filtered": 1}
+    assert payload["consensus_samples"][3]["sequence"] == "ANCNAA"
+    assert payload["consensus_samples"][3]["filtered_bases"] == 0
+    assert payload["consensus_samples"][3]["no_call_bases"] == 1
+    assert payload["consensus_samples"][3]["other_masked_bases"] == 1
+    assert payload["consensus_samples"][3]["masked_base_counts"] == {
+        "heterozygous": 1,
+        "no_call": 1,
+    }
 
 
 def test_pretrain_cli_reports_actionable_config_error(capsys) -> None:
@@ -456,3 +520,56 @@ def _write_fake_bcftools(tmp_path: Path) -> Path:
     )
     script.chmod(script.stat().st_mode | stat.S_IEXEC)
     return script
+
+
+def _synthetic_tokenized_window(*, index: int, source: str) -> TokenizedWindow:
+    reference_sequence = "AACCAA"
+    sequence = reference_sequence
+    filtered_bases = 0
+    no_call_bases = 0
+    other_masked_bases = 0
+    masked_base_counts: tuple[tuple[str, int], ...] = ()
+    if source == "consensus":
+        pattern = index % 4
+        if pattern == 1:
+            sequence = "ANCCAA"
+            filtered_bases = 1
+            masked_base_counts = (("filtered", 1),)
+        elif pattern == 2:
+            sequence = "AACNAA"
+            no_call_bases = 1
+            masked_base_counts = (("no_call", 1),)
+        elif pattern == 3:
+            sequence = "ANCNAA"
+            no_call_bases = 1
+            other_masked_bases = 1
+            masked_base_counts = (("heterozygous", 1), ("no_call", 1))
+
+    window = WindowRecord(
+        sample_id="cat-1" if source == "consensus" else "ref-1",
+        individual_id="cat-1" if source == "consensus" else "reference",
+        contig="chr1",
+        source=source,
+        split="train" if index % 5 else "validation",
+        locus_id=f"chr1:block-{index}",
+        block_start=index * 6,
+        block_end=(index + 1) * 6,
+        window_start=index * 6,
+        window_end=(index + 1) * 6,
+        sequence=sequence,
+        gc_fraction=0.5,
+        ambiguity_fraction=sequence.count("N") / len(sequence),
+        sequence_hash=f"hash-{source}-{index}",
+        filtered_bases=filtered_bases,
+        no_call_bases=no_call_bases,
+        other_masked_bases=other_masked_bases,
+        masked_base_counts=masked_base_counts,
+    )
+    return TokenizedWindow(
+        window=window,
+        input_ids=(101, 201, 202, 203, 204, 205, 206, 102),
+        attention_mask=(1, 1, 1, 1, 1, 1, 1, 1),
+        token_count=6,
+        token_to_base_ratio=1.0,
+        tokenizer=TokenizerProvenance(max_position_embeddings=8),
+    )

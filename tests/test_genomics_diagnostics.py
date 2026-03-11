@@ -202,6 +202,12 @@ def test_build_eda_payload_collects_sample_and_baseline_views(
     payload = build_eda_payload(consensus_records, baseline_records)
 
     assert len(payload["consensus_samples"]) == 3
+    assert payload["consensus_sample_overview"] == {
+        "total_record_count": 3,
+        "returned_record_count": 3,
+        "sample_limit": 128,
+        "truncated": False,
+    }
     assert payload["consensus_corpus"]["retained_window_count"] == 3
     assert payload["consensus_corpus"]["near_duplicate_analysis"]["mode"] == "exact"
     assert payload["baseline_corpus"]["retained_window_count"] == 2
@@ -235,6 +241,25 @@ def test_summarize_corpus_records_samples_near_duplicate_analysis_for_large_corp
     assert sum(bucket["count"] for bucket in summary["gc_fraction_distribution"]) == 640
 
 
+def test_build_eda_payload_bounds_consensus_sample_preview_for_large_corpus() -> None:
+    payload = build_eda_payload(
+        _build_realistic_records(total=640, source="consensus"),
+        _build_realistic_records(total=128, source="reference"),
+        near_duplicate_sample_limit=64,
+        consensus_sample_limit=32,
+    )
+
+    assert len(payload["consensus_samples"]) == 32
+    assert payload["consensus_sample_overview"] == {
+        "total_record_count": 640,
+        "returned_record_count": 32,
+        "sample_limit": 32,
+        "truncated": True,
+    }
+    assert payload["consensus_corpus"]["retained_window_count"] == 640
+    assert payload["consensus_corpus"]["near_duplicate_analysis"]["mode"] == "sampled"
+
+
 def test_write_eda_payload_json_persists_report_payload(tmp_path, consensus_records, baseline_records) -> None:
     output_path = tmp_path / "reports" / "diagnostics_payload.json"
 
@@ -242,6 +267,12 @@ def test_write_eda_payload_json_persists_report_payload(tmp_path, consensus_reco
 
     assert written_path == output_path
     payload = json.loads(output_path.read_text(encoding="utf-8"))
+    assert payload["consensus_sample_overview"] == {
+        "total_record_count": 3,
+        "returned_record_count": 3,
+        "sample_limit": 128,
+        "truncated": False,
+    }
     assert payload["consensus_corpus"]["retained_window_count"] == 3
     assert payload["consensus_corpus"]["near_duplicate_analysis"]["mode"] == "exact"
     assert payload["baseline_comparison"]["deltas"]["near_duplicate_pair_fraction"] == pytest.approx(-1 / 3)

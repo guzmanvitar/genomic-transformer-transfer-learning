@@ -85,6 +85,11 @@ def test_generate_consensus_fasta_preserves_reference_and_masks_multiallelic_ind
     assert result.diagnostics.callable_records == 2
     assert result.diagnostics.identical_to_reference_calls == 1
     assert result.diagnostics.indel_count == 1
+    assert [(span.start, span.end, span.category) for span in result.mask_spans] == [
+        (4, 5, "multiallelic"),
+        (5, 6, "indel"),
+        (7, 8, "no_call"),
+    ]
 
 
 @pytest.mark.parametrize(

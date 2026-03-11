@@ -3,6 +3,7 @@ from jaguar_geo_assign.data.preprocessor import (
     SequenceRecord,
     normalize_sequence,
     prepare_sequences,
+    window_sequences,
 )
 
 
@@ -50,3 +51,37 @@ def test_normalize_sequence_rejects_unsupported_bases_when_requested() -> None:
         assert "Unsupported base" in str(exc)
     else:  # pragma: no cover - defensive failure branch
         raise AssertionError("expected preprocessing to reject unsupported bases")
+
+
+def test_window_sequences_preserve_mask_provenance_counts() -> None:
+    config = PreprocessingConfig(
+        min_sequence_length=8,
+        max_ambiguity_fraction=1.0,
+        window_size=4,
+        window_stride=4,
+        locus_block_size=8,
+    )
+
+    report = prepare_sequences(
+        [
+            SequenceRecord(
+                "sample-1",
+                "cat-1",
+                "chr1",
+                "ACGTNNNN",
+                mask_spans=((4, 5, "filtered"), (5, 6, "no_call"), (6, 8, "heterozygous")),
+            )
+        ],
+        config,
+    )
+
+    windows = window_sequences(list(report.retained), config)
+
+    assert len(windows) == 2
+    assert windows[0].filtered_bases == 0
+    assert windows[0].no_call_bases == 0
+    assert windows[0].other_masked_bases == 0
+    assert windows[1].filtered_bases == 1
+    assert windows[1].no_call_bases == 1
+    assert windows[1].other_masked_bases == 2
+    assert windows[1].masked_base_counts == (("filtered", 1), ("heterozygous", 2), ("no_call", 1))

@@ -107,10 +107,19 @@ class ConsensusDiagnostics:
 
 
 @dataclass(frozen=True)
+class ConsensusMaskSpan:
+    contig: str
+    start: int
+    end: int
+    category: str
+
+
+@dataclass(frozen=True)
 class ConsensusResult:
     sample_id: str
     output_fasta: Path
     diagnostics: ConsensusDiagnostics
+    mask_spans: tuple[ConsensusMaskSpan, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -119,6 +128,7 @@ class _PreparedConsensus:
     filtered_vcf: Path
     mask_bed: Path | None
     diagnostics: ConsensusDiagnostics
+    mask_spans: tuple[ConsensusMaskSpan, ...]
 
 
 def fetch_bioproject_summary(
@@ -322,7 +332,12 @@ def generate_consensus_fasta(
             )
     if completed.returncode != 0:
         raise AcquisitionError(f"bcftools consensus failed for {sample_id}: {completed.stderr.strip()}")
-    return ConsensusResult(sample_id=sample_id, output_fasta=output_path, diagnostics=prepared.diagnostics)
+    return ConsensusResult(
+        sample_id=sample_id,
+        output_fasta=output_path,
+        diagnostics=prepared.diagnostics,
+        mask_spans=prepared.mask_spans,
+    )
 
 
 def generate_consensus_fastas(
@@ -372,7 +387,7 @@ def _prepare_consensus(
 
     filtered_vcf = work_dir / f"{sample_id}.prepared.vcf"
     mask_bed = work_dir / f"{sample_id}.mask.bed"
-    mask_ranges: list[tuple[str, int, int]] = []
+    mask_spans: list[ConsensusMaskSpan] = []
     total_records = callable_records = applied_variant_count = 0
     filtered_or_nocall_count = indel_count = identical_to_reference_calls = 0
 
@@ -436,19 +451,26 @@ def _prepare_consensus(
                 sink.write(line)
                 continue
             start = int(pos_str) - 1
-            mask_ranges.append((chrom, start, start + len(ref)))
+            mask_spans.append(
+                ConsensusMaskSpan(
+                    contig=chrom,
+                    start=start,
+                    end=start + len(ref),
+                    category=decision.category,
+                )
+            )
         if not total_records:
             raise AcquisitionError(f"VCF {sample_vcf} does not contain any records for sample {sample_id}")
 
-    if mask_ranges:
+    if mask_spans:
         with mask_bed.open("w", encoding="utf-8") as handle:
-            for chrom, start, end in mask_ranges:
-                handle.write(f"{chrom}\t{start}\t{end}\n")
+            for span in mask_spans:
+                handle.write(f"{span.contig}\t{span.start}\t{span.end}\n")
         mask_path: Path | None = mask_bed
     else:
         mask_path = None
 
-    masked_site_count = len(mask_ranges)
+    masked_site_count = len(mask_spans)
     diagnostics = ConsensusDiagnostics(
         sample_id=sample_id,
         total_records=total_records,
@@ -468,6 +490,7 @@ def _prepare_consensus(
         filtered_vcf=filtered_vcf,
         mask_bed=mask_path,
         diagnostics=diagnostics,
+        mask_spans=tuple(mask_spans),
     )
 
 

@@ -27,6 +27,7 @@ from ..reporting import build_eda_payload
 
 TokenizerLoader = Callable[[], tuple[object, TokenizerProvenance]]
 ExportWriter = Callable[[tuple[TokenizedWindow, ...], Path, FelinePipelineConfig], Path]
+DEFAULT_RUNTIME_DIAGNOSTIC_SAMPLE_LIMIT = 128
 
 
 @dataclass(frozen=True)
@@ -283,6 +284,9 @@ def _build_consensus_sequence_records(
     individual_by_sample = {entry.sample_id: entry.individual_id for entry in manifest_entries}
     records: list[SequenceRecord] = []
     for sample_id, result in sorted(consensus_results.items()):
+        mask_spans_by_contig: dict[str, list[tuple[int, int, str]]] = {}
+        for span in result.mask_spans:
+            mask_spans_by_contig.setdefault(span.contig, []).append((span.start, span.end, span.category))
         for contig, sequence in _load_fasta_sequences(result.output_fasta).items():
             records.append(
                 SequenceRecord(
@@ -292,6 +296,7 @@ def _build_consensus_sequence_records(
                     sequence=sequence,
                     source="consensus",
                     sequence_start=0,
+                    mask_spans=tuple(sorted(mask_spans_by_contig.get(contig, []))),
                 )
             )
     return records
@@ -334,6 +339,7 @@ def _build_diagnostics_payload(
         **build_eda_payload(
             _tokenized_windows_to_diagnostics_records(tokenized_consensus, reference_lookup),
             _tokenized_windows_to_diagnostics_records(tokenized_baseline, reference_lookup),
+            consensus_sample_limit=DEFAULT_RUNTIME_DIAGNOSTIC_SAMPLE_LIMIT,
         ),
     }
 
@@ -346,7 +352,9 @@ def _tokenized_windows_to_diagnostics_records(
     for record in tokenized_windows:
         key = (record.window.contig, record.window.window_start, record.window.window_end)
         reference_sequence = reference_lookup[key]
-        no_call_bases = record.window.sequence.count("N")
+        filtered_bases = record.window.filtered_bases
+        no_call_bases = record.window.no_call_bases
+        other_masked_bases = record.window.other_masked_bases
         records.append(
             {
                 "sample_id": record.window.sample_id,
@@ -360,9 +368,14 @@ def _tokenized_windows_to_diagnostics_records(
                     for base, reference_base in zip(record.window.sequence, reference_sequence)
                     if base != "N" and base != reference_base
                 ),
-                "callable_bases": len(record.window.sequence) - no_call_bases,
-                "filtered_bases": 0,
+                "callable_bases": len(record.window.sequence)
+                - filtered_bases
+                - no_call_bases
+                - other_masked_bases,
+                "filtered_bases": filtered_bases,
                 "no_call_bases": no_call_bases,
+                "other_masked_bases": other_masked_bases,
+                "masked_base_counts": dict(record.window.masked_base_counts),
                 "token_count": record.token_count,
             }
         )

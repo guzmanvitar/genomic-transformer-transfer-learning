@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections import defaultdict
+from collections import Counter, defaultdict
 from dataclasses import asdict, dataclass
 from hashlib import sha256
 from io import BytesIO
@@ -119,6 +119,7 @@ class SequenceRecord:
     sequence: str
     source: str = "consensus"
     sequence_start: int = 0
+    mask_spans: tuple[tuple[int, int, str], ...] = ()
 
     @property
     def sequence_end(self) -> int:
@@ -135,6 +136,7 @@ class PreparedSequence:
     sequence: str
     gc_fraction: float
     ambiguity_fraction: float
+    mask_spans: tuple[tuple[int, int, str], ...] = ()
 
     @property
     def sequence_end(self) -> int:
@@ -176,6 +178,10 @@ class WindowRecord:
     gc_fraction: float
     ambiguity_fraction: float
     sequence_hash: str
+    filtered_bases: int = 0
+    no_call_bases: int = 0
+    other_masked_bases: int = 0
+    masked_base_counts: tuple[tuple[str, int], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -264,6 +270,30 @@ def ambiguity_fraction(sequence: str) -> float:
     return sequence.count("N") / len(sequence)
 
 
+@dataclass
+class _WindowMaskCounter:
+    mask_spans: tuple[tuple[int, int, str], ...]
+    next_index: int = 0
+    active_spans: list[tuple[int, int, str]] | None = None
+
+    def __post_init__(self) -> None:
+        self.active_spans = []
+
+    def count(self, *, window_start: int, window_end: int) -> Counter[str]:
+        assert self.active_spans is not None
+        while self.next_index < len(self.mask_spans) and self.mask_spans[self.next_index][0] < window_end:
+            self.active_spans.append(self.mask_spans[self.next_index])
+            self.next_index += 1
+        self.active_spans = [span for span in self.active_spans if span[1] > window_start]
+
+        counts: Counter[str] = Counter()
+        for span_start, span_end, category in self.active_spans:
+            overlap = min(window_end, span_end) - max(window_start, span_start)
+            if overlap > 0:
+                counts[category] += overlap
+        return counts
+
+
 def prepare_sequences(
     records: list[SequenceRecord],
     config: PreprocessingConfig,
@@ -314,6 +344,7 @@ def prepare_sequences(
                 sequence=normalized,
                 gc_fraction=gc_fraction(normalized),
                 ambiguity_fraction=ambiguity,
+                mask_spans=tuple(sorted(record.mask_spans)),
             )
         )
 
@@ -347,6 +378,7 @@ def window_sequences(
 ) -> tuple[WindowRecord, ...]:
     windows: list[WindowRecord] = []
     for sequence in sequences:
+        mask_counter = _WindowMaskCounter(sequence.mask_spans)
         genomic_start = sequence.sequence_start
         genomic_end = sequence.sequence_end
         first_block_start = (genomic_start // config.locus_block_size) * config.locus_block_size
@@ -370,6 +402,12 @@ def window_sequences(
                 if window_end > overlap_end:
                     break
                 window_sequence = block_sequence[offset : offset + config.window_size]
+                mask_counts = mask_counter.count(window_start=window_start, window_end=window_end)
+                filtered_bases = mask_counts.get("filtered", 0)
+                no_call_bases = mask_counts.get("no_call", 0)
+                other_masked_bases = sum(
+                    count for category, count in mask_counts.items() if category not in {"filtered", "no_call"}
+                )
                 windows.append(
                     WindowRecord(
                         sample_id=sequence.sample_id,
@@ -386,6 +424,10 @@ def window_sequences(
                         gc_fraction=gc_fraction(window_sequence),
                         ambiguity_fraction=ambiguity_fraction(window_sequence),
                         sequence_hash=sha256(window_sequence.encode("utf-8")).hexdigest(),
+                        filtered_bases=filtered_bases,
+                        no_call_bases=no_call_bases,
+                        other_masked_bases=other_masked_bases,
+                        masked_base_counts=tuple(sorted(mask_counts.items())),
                     )
                 )
     assert_split_safety(tuple(windows))
@@ -670,6 +712,10 @@ def _prepare_window_for_tokenization(
         gc_fraction=gc_fraction(normalized_sequence),
         ambiguity_fraction=ambiguity_fraction(normalized_sequence),
         sequence_hash=sha256(normalized_sequence.encode("utf-8")).hexdigest(),
+        filtered_bases=window.filtered_bases,
+        no_call_bases=window.no_call_bases,
+        other_masked_bases=window.other_masked_bases,
+        masked_base_counts=window.masked_base_counts,
     )
 
 
