@@ -269,6 +269,20 @@ def test_runtime_diagnostics_payload_is_bounded_and_provenance_faithful() -> Non
 
     assert payload["consensus_corpus"]["retained_window_count"] == 192
     assert payload["consensus_corpus"]["source_counts"] == {"consensus": 192}
+    assert payload["consensus_corpus"]["masked_category_base_counts"] == {
+        "filtered": 64,
+        "heterozygous": 22,
+        "indel": 21,
+        "multiallelic": 21,
+        "no_call": 64,
+    }
+    assert payload["consensus_corpus"]["masked_category_base_fractions"] == {
+        "filtered": round(64 / 1152, 6),
+        "heterozygous": round(22 / 1152, 6),
+        "indel": round(21 / 1152, 6),
+        "multiallelic": round(21 / 1152, 6),
+        "no_call": round(64 / 1152, 6),
+    }
     assert len(payload["consensus_samples"]) == pretrain_pipeline.DEFAULT_RUNTIME_DIAGNOSTIC_SAMPLE_LIMIT
     assert payload["consensus_sample_overview"] == {
         "total_record_count": 192,
@@ -276,19 +290,51 @@ def test_runtime_diagnostics_payload_is_bounded_and_provenance_faithful() -> Non
         "sample_limit": pretrain_pipeline.DEFAULT_RUNTIME_DIAGNOSTIC_SAMPLE_LIMIT,
         "truncated": True,
     }
-    assert payload["consensus_samples"][1]["sequence"] == "ANCCAA"
-    assert payload["consensus_samples"][1]["filtered_bases"] == 1
-    assert payload["consensus_samples"][1]["no_call_bases"] == 0
-    assert payload["consensus_samples"][1]["other_masked_bases"] == 0
-    assert payload["consensus_samples"][1]["masked_base_counts"] == {"filtered": 1}
-    assert payload["consensus_samples"][3]["sequence"] == "ANCNAA"
-    assert payload["consensus_samples"][3]["filtered_bases"] == 0
-    assert payload["consensus_samples"][3]["no_call_bases"] == 1
-    assert payload["consensus_samples"][3]["other_masked_bases"] == 1
-    assert payload["consensus_samples"][3]["masked_base_counts"] == {
-        "heterozygous": 1,
-        "no_call": 1,
+    preview_categories = {
+        category
+        for sample in payload["consensus_samples"]
+        for category in sample["masked_base_counts"]
     }
+    assert preview_categories == {"filtered", "no_call"}
+    assert payload["consensus_samples"][0]["sequence"] == "ANCCAA"
+    assert payload["consensus_samples"][0]["masked_base_counts"] == {"filtered": 1}
+    assert payload["consensus_samples"][1]["sequence"] == "AACNAA"
+    assert payload["consensus_samples"][1]["masked_base_counts"] == {"no_call": 1}
+
+
+def test_runtime_diagnostics_passes_streaming_records_into_aggregation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured_types: dict[str, str] = {}
+
+    def fake_build_eda_payload(consensus_records, baseline_records, **_: object) -> dict[str, object]:
+        captured_types["consensus"] = type(consensus_records).__name__
+        captured_types["baseline"] = type(baseline_records).__name__
+        assert next(iter(consensus_records))["sample_id"] == "cat-1"
+        assert next(iter(baseline_records))["sample_id"] == "ref-1"
+        return {
+            "consensus_samples": [],
+            "consensus_sample_overview": {
+                "total_record_count": 0,
+                "returned_record_count": 0,
+                "sample_limit": pretrain_pipeline.DEFAULT_RUNTIME_DIAGNOSTIC_SAMPLE_LIMIT,
+                "truncated": False,
+            },
+            "consensus_corpus": {},
+            "baseline_corpus": {},
+            "baseline_comparison": {},
+        }
+
+    monkeypatch.setattr(pretrain_pipeline, "build_eda_payload", fake_build_eda_payload)
+
+    payload = pretrain_pipeline._build_diagnostics_payload(
+        tokenized_consensus=tuple(_synthetic_tokenized_window(index=index, source="consensus") for index in range(4)),
+        tokenized_baseline=tuple(_synthetic_tokenized_window(index=index, source="reference") for index in range(4)),
+        consensus_results={},
+    )
+
+    assert captured_types == {"consensus": "generator", "baseline": "generator"}
+    assert payload["consensus_generation"] == {}
 
 
 def test_pretrain_cli_reports_actionable_config_error(capsys) -> None:
@@ -530,20 +576,29 @@ def _synthetic_tokenized_window(*, index: int, source: str) -> TokenizedWindow:
     other_masked_bases = 0
     masked_base_counts: tuple[tuple[str, int], ...] = ()
     if source == "consensus":
-        pattern = index % 4
-        if pattern == 1:
-            sequence = "ANCCAA"
-            filtered_bases = 1
-            masked_base_counts = (("filtered", 1),)
-        elif pattern == 2:
-            sequence = "AACNAA"
-            no_call_bases = 1
-            masked_base_counts = (("no_call", 1),)
-        elif pattern == 3:
-            sequence = "ANCNAA"
-            no_call_bases = 1
-            other_masked_bases = 1
-            masked_base_counts = (("heterozygous", 1), ("no_call", 1))
+        if index < pretrain_pipeline.DEFAULT_RUNTIME_DIAGNOSTIC_SAMPLE_LIMIT:
+            if index % 2 == 0:
+                sequence = "ANCCAA"
+                filtered_bases = 1
+                masked_base_counts = (("filtered", 1),)
+            else:
+                sequence = "AACNAA"
+                no_call_bases = 1
+                masked_base_counts = (("no_call", 1),)
+        else:
+            pattern = (index - pretrain_pipeline.DEFAULT_RUNTIME_DIAGNOSTIC_SAMPLE_LIMIT) % 3
+            if pattern == 0:
+                sequence = "ANCNAA"
+                other_masked_bases = 1
+                masked_base_counts = (("heterozygous", 1),)
+            elif pattern == 1:
+                sequence = "AANCNA"
+                other_masked_bases = 1
+                masked_base_counts = (("multiallelic", 1),)
+            else:
+                sequence = "AACCAN"
+                other_masked_bases = 1
+                masked_base_counts = (("indel", 1),)
 
     window = WindowRecord(
         sample_id="cat-1" if source == "consensus" else "ref-1",

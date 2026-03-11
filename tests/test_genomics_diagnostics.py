@@ -260,6 +260,99 @@ def test_build_eda_payload_bounds_consensus_sample_preview_for_large_corpus() ->
     assert payload["consensus_corpus"]["near_duplicate_analysis"]["mode"] == "sampled"
 
 
+def test_build_eda_payload_preserves_full_corpus_mask_totals_beyond_preview_truncation() -> None:
+    def consensus_records():
+        reference = "AACCAA"
+        for index in range(160):
+            record = {
+                "sample_id": f"cat-{index}",
+                "locus_id": f"chr1:block-{index}",
+                "split": "train",
+                "source": "consensus",
+                "sequence": reference,
+                "reference_sequence": reference,
+                "variant_count": 0,
+                "callable_bases": 6,
+                "filtered_bases": 0,
+                "no_call_bases": 0,
+                "token_count": 6,
+            }
+            if index < 128:
+                if index % 2 == 0:
+                    record.update(
+                        sequence="ANCCAA",
+                        callable_bases=5,
+                        filtered_bases=1,
+                        masked_base_counts={"filtered": 1},
+                    )
+                else:
+                    record.update(
+                        sequence="AACNAA",
+                        callable_bases=5,
+                        no_call_bases=1,
+                        masked_base_counts={"no_call": 1},
+                    )
+            else:
+                tail_pattern = (index - 128) % 3
+                if tail_pattern == 0:
+                    record.update(
+                        sequence="ANCNAA",
+                        callable_bases=5,
+                        other_masked_bases=1,
+                        masked_base_counts={"heterozygous": 1},
+                    )
+                elif tail_pattern == 1:
+                    record.update(
+                        sequence="AANCNA",
+                        callable_bases=5,
+                        other_masked_bases=1,
+                        masked_base_counts={"multiallelic": 1},
+                    )
+                else:
+                    record.update(
+                        sequence="AACCAN",
+                        callable_bases=5,
+                        other_masked_bases=1,
+                        masked_base_counts={"indel": 1},
+                    )
+            yield record
+
+    payload = build_eda_payload(
+        consensus_records(),
+        _build_realistic_records(total=32, source="reference"),
+        near_duplicate_sample_limit=64,
+        consensus_sample_limit=128,
+    )
+
+    preview_categories = {
+        category
+        for sample in payload["consensus_samples"]
+        for category in sample.get("masked_base_counts", {})
+    }
+
+    assert payload["consensus_sample_overview"] == {
+        "total_record_count": 160,
+        "returned_record_count": 128,
+        "sample_limit": 128,
+        "truncated": True,
+    }
+    assert preview_categories == {"filtered", "no_call"}
+    assert payload["consensus_corpus"]["masked_category_base_counts"] == {
+        "filtered": 64,
+        "heterozygous": 11,
+        "indel": 10,
+        "multiallelic": 11,
+        "no_call": 64,
+    }
+    assert payload["consensus_corpus"]["masked_category_base_fractions"] == {
+        "filtered": round(64 / 960, 6),
+        "heterozygous": round(11 / 960, 6),
+        "indel": round(10 / 960, 6),
+        "multiallelic": round(11 / 960, 6),
+        "no_call": round(64 / 960, 6),
+    }
+
+
 def test_write_eda_payload_json_persists_report_payload(tmp_path, consensus_records, baseline_records) -> None:
     output_path = tmp_path / "reports" / "diagnostics_payload.json"
 

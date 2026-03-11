@@ -258,12 +258,19 @@ def _summarize_record(
     no_call_bases = _coerce_nonnegative_int(record, "no_call_bases")
     other_masked_bases = _coerce_optional_nonnegative_int(record, "other_masked_bases")
     token_count = _coerce_nonnegative_int(record, "token_count")
+    masked_base_counts = _coerce_masked_base_counts(
+        record,
+        filtered_bases=filtered_bases,
+        no_call_bases=no_call_bases,
+        other_masked_bases=other_masked_bases,
+    )
     canonical_bases = sum(base in CANONICAL_BASES for base in sequence)
 
     return {
         **dict(record),
         "sequence": sequence,
         "reference_sequence": reference_sequence,
+        "masked_base_counts": masked_base_counts,
         "gc_fraction": round(
             _safe_fraction(sum(base in {"G", "C"} for base in sequence), canonical_bases), 6
         ),
@@ -393,6 +400,33 @@ def _coerce_optional_nonnegative_int(record: Mapping[str, object], field: str) -
     return _coerce_nonnegative_int(record, field)
 
 
+def _coerce_masked_base_counts(
+    record: Mapping[str, object],
+    *,
+    filtered_bases: int,
+    no_call_bases: int,
+    other_masked_bases: int,
+) -> dict[str, int]:
+    raw_value = record.get("masked_base_counts")
+    counts: dict[str, int] = {}
+    if raw_value is not None:
+        if not hasattr(raw_value, "items"):
+            raise ValueError("masked_base_counts must be a mapping when provided")
+        for category, count in raw_value.items():
+            if not isinstance(category, str):
+                raise ValueError("masked_base_counts keys must be strings")
+            if not isinstance(count, int) or count < 0:
+                raise ValueError("masked_base_counts values must be non-negative integers")
+            counts[category] = count
+    if filtered_bases and "filtered" not in counts:
+        counts["filtered"] = filtered_bases
+    if no_call_bases and "no_call" not in counts:
+        counts["no_call"] = no_call_bases
+    if other_masked_bases and not any(category not in {"filtered", "no_call"} for category in counts):
+        counts["other_masked"] = other_masked_bases
+    return {category: count for category, count in sorted(counts.items())}
+
+
 def _stream_corpus_summary(
     records: Iterable[Mapping[str, object]],
     *,
@@ -408,12 +442,14 @@ def _stream_corpus_summary(
     unique_loci: set[str] = set()
     source_counts: Counter[str] = Counter()
     duplicate_counts: Counter[str] = Counter()
+    masked_category_counts: Counter[str] = Counter()
     length_counts: Counter[int] = Counter()
     gc_distribution_counts = [0] * DEFAULT_DISTRIBUTION_BINS
     missing_counts = [0] * 8
     total_counts = [0] * 8
     locus_splits: dict[str, set[str]] = defaultdict(set)
     shape_issue_count = 0
+    total_base_count = 0
     retained_window_count = 0
     sampled_records: list[dict[str, object]] = [] if near_duplicate_sample_limit is None else []
     sampled_heap: list[tuple[int, dict[str, object]]] = []
@@ -428,7 +464,9 @@ def _stream_corpus_summary(
         unique_loci.add(str(record["locus_id"]))
         source_counts[str(record["source"])] += 1
         sequence = str(record["sequence"])
+        total_base_count += len(sequence)
         duplicate_counts[sequence] += 1
+        masked_category_counts.update(dict(record["masked_base_counts"]))
         length_counts[len(sequence)] += 1
         _update_fraction_distribution_counts(
             gc_distribution_counts,
@@ -493,6 +531,13 @@ def _stream_corpus_summary(
         "near_duplicate_pair_count": near_duplicate_summary["pair_count"],
         "near_duplicate_pair_fraction": near_duplicate_summary["pair_fraction"],
         "near_duplicate_analysis": near_duplicate_summary["analysis"],
+        "masked_category_base_counts": {
+            category: count for category, count in sorted(masked_category_counts.items())
+        },
+        "masked_category_base_fractions": {
+            category: round(_safe_fraction(count, total_base_count), 6)
+            for category, count in sorted(masked_category_counts.items())
+        },
         "missingness_heatmap": [
             round(_safe_fraction(missing_counts[index], total_counts[index]), 6) for index in range(8)
         ],

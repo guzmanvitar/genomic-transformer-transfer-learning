@@ -6,7 +6,7 @@ import csv
 from dataclasses import asdict, dataclass
 import json
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Iterable
 
 from ..config import FelinePipelineConfig, load_feline_pipeline_config
 from ..data.acquisition import ConsensusResult, generate_consensus_fastas
@@ -347,39 +347,35 @@ def _build_diagnostics_payload(
 def _tokenized_windows_to_diagnostics_records(
     tokenized_windows: tuple[TokenizedWindow, ...],
     reference_lookup: dict[tuple[str, int, int], str],
-) -> list[dict[str, object]]:
-    records: list[dict[str, object]] = []
+) -> Iterable[dict[str, object]]:
     for record in tokenized_windows:
         key = (record.window.contig, record.window.window_start, record.window.window_end)
         reference_sequence = reference_lookup[key]
         filtered_bases = record.window.filtered_bases
         no_call_bases = record.window.no_call_bases
         other_masked_bases = record.window.other_masked_bases
-        records.append(
-            {
-                "sample_id": record.window.sample_id,
-                "locus_id": record.window.locus_id,
-                "split": record.window.split,
-                "source": record.window.source,
-                "sequence": record.window.sequence,
-                "reference_sequence": reference_sequence,
-                "variant_count": sum(
-                    1
-                    for base, reference_base in zip(record.window.sequence, reference_sequence)
-                    if base != "N" and base != reference_base
-                ),
-                "callable_bases": len(record.window.sequence)
-                - filtered_bases
-                - no_call_bases
-                - other_masked_bases,
-                "filtered_bases": filtered_bases,
-                "no_call_bases": no_call_bases,
-                "other_masked_bases": other_masked_bases,
-                "masked_base_counts": dict(record.window.masked_base_counts),
-                "token_count": record.token_count,
-            }
-        )
-    return records
+        yield {
+            "sample_id": record.window.sample_id,
+            "locus_id": record.window.locus_id,
+            "split": record.window.split,
+            "source": record.window.source,
+            "sequence": record.window.sequence,
+            "reference_sequence": reference_sequence,
+            "variant_count": sum(
+                1
+                for base, reference_base in zip(record.window.sequence, reference_sequence)
+                if base != "N" and base != reference_base
+            ),
+            "callable_bases": len(record.window.sequence)
+            - filtered_bases
+            - no_call_bases
+            - other_masked_bases,
+            "filtered_bases": filtered_bases,
+            "no_call_bases": no_call_bases,
+            "other_masked_bases": other_masked_bases,
+            "masked_base_counts": dict(record.window.masked_base_counts),
+            "token_count": record.token_count,
+        }
 
 
 def _load_fasta_sequences(path: str | Path) -> dict[str, str]:
