@@ -50,6 +50,10 @@ class MissingToolError(AcquisitionError):
     """Raised when a required external executable is unavailable."""
 
 
+class MalformedGenotypeError(AcquisitionError):
+    """Raised when a VCF GT field contains malformed non-numeric allele tokens."""
+
+
 @dataclass(frozen=True)
 class BioProjectSummary:
     accession: str
@@ -255,15 +259,21 @@ def classify_consensus_site(
     genotype: str | None,
     *,
     filter_value: str = "PASS",
+    sample_id: str | None = None,
+    contig: str | None = None,
+    position: int | None = None,
+    vcf_path: str | Path | None = None,
 ) -> ConsensusDecision:
+    allele_tokens = _validated_gt_tokens(
+        genotype,
+        sample_id=sample_id,
+        contig=contig,
+        position=position,
+        vcf_path=vcf_path,
+    )
     if filter_value not in PASSING_FILTER_VALUES:
         return ConsensusDecision(action="mask", category="filtered", replacement=None)
-    if not genotype or "." in genotype:
-        return ConsensusDecision(action="mask", category="no_call", replacement=None)
-
-    separator = "/" if "/" in genotype else "|"
-    allele_tokens = genotype.split(separator)
-    if not allele_tokens or any(token == "." for token in allele_tokens):
+    if allele_tokens is None:
         return ConsensusDecision(action="mask", category="no_call", replacement=None)
     if len(set(allele_tokens)) != 1:
         category = "multiallelic" if len(alts) > 1 else "heterozygous"
@@ -282,6 +292,34 @@ def classify_consensus_site(
         return ConsensusDecision(action="mask", category="indel", replacement=None)
     category = "homozygous_alternate"
     return ConsensusDecision(action="apply_alt", category=category, replacement=replacement)
+
+
+def _validated_gt_tokens(
+    genotype: str | None,
+    *,
+    sample_id: str | None,
+    contig: str | None,
+    position: int | None,
+    vcf_path: str | Path | None,
+) -> list[str] | None:
+    if not genotype:
+        return None
+    separator = "/" if "/" in genotype else "|"
+    allele_tokens = genotype.split(separator)
+    if not allele_tokens or any(token == "." for token in allele_tokens):
+        return None
+
+    malformed_tokens = sorted({token for token in allele_tokens if not token.isdigit()})
+    if malformed_tokens:
+        sample_fragment = f" for sample '{sample_id}'" if sample_id else ""
+        locus_fragment = f" at {contig}:{position}" if contig and position is not None else ""
+        vcf_fragment = f" in VCF {vcf_path}" if vcf_path is not None else ""
+        raise MalformedGenotypeError(
+            "Malformed non-numeric GT token(s) "
+            f"{malformed_tokens} in GT='{genotype}'{sample_fragment}{locus_fragment}{vcf_fragment}; "
+            "expected numeric allele indices or '.' no-call markers."
+        )
+    return allele_tokens
 
 
 def ensure_bcftools_available(executable: str = "bcftools") -> str:
@@ -324,16 +362,28 @@ def generate_consensus_fasta(
         with _open_maybe_gzip(reference_path) as reference_handle, output_path.open(
             "w", encoding="utf-8"
         ) as output_handle:
-            completed = subprocess.run(
+            with subprocess.Popen(
                 command,
-                stdin=reference_handle,
+                stdin=subprocess.PIPE,
                 stdout=output_handle,
                 stderr=subprocess.PIPE,
                 text=True,
-                check=False,
-            )
-    if completed.returncode != 0:
-        raise AcquisitionError(f"bcftools consensus failed for {sample_id}: {completed.stderr.strip()}")
+            ) as completed:
+                if completed.stdin is None:
+                    raise AcquisitionError(f"bcftools consensus did not expose stdin for {sample_id}")
+                try:
+                    shutil.copyfileobj(reference_handle, completed.stdin)
+                except BrokenPipeError:
+                    pass
+                finally:
+                    try:
+                        completed.stdin.close()
+                    except BrokenPipeError:
+                        pass
+                stderr_text = completed.stderr.read() if completed.stderr is not None else ""
+                return_code = completed.wait()
+    if return_code != 0:
+        raise AcquisitionError(f"bcftools consensus failed for {sample_id}: {stderr_text.strip()}")
     return ConsensusResult(
         sample_id=sample_id,
         output_fasta=output_path,
@@ -438,7 +488,16 @@ def _prepare_consensus(
                 raise ContigMismatchError(f"Contig '{chrom}' from {sample_vcf} is absent from {reference_fasta}")
             alts = alt_field.split(",") if alt_field else []
             sample_format = dict(zip(format_field.split(":"), fields[sample_index].split(":"), strict=False))
-            decision = classify_consensus_site(ref, alts, sample_format.get("GT"), filter_value=filter_value)
+            decision = classify_consensus_site(
+                ref,
+                alts,
+                sample_format.get("GT"),
+                filter_value=filter_value,
+                sample_id=sample_id,
+                contig=chrom,
+                position=int(pos_str),
+                vcf_path=sample_vcf,
+            )
             if decision.category in {"filtered", "no_call"}:
                 filtered_or_nocall_count += 1
             if decision.category == "indel":
