@@ -329,31 +329,60 @@ def _build_diagnostics_payload(
     consensus_results: dict[str, ConsensusResult],
 ) -> dict[str, object]:
     reference_lookup = {
-        (record.window.contig, record.window.window_start, record.window.window_end): record.window.sequence
+        _tokenized_window_lookup_key(record): record.window.sequence
         for record in tokenized_baseline
     }
+    unmatched_consensus_window_count = sum(
+        1 for record in tokenized_consensus if _tokenized_window_lookup_key(record) not in reference_lookup
+    )
     return {
         "consensus_generation": {
             sample_id: asdict(result.diagnostics) for sample_id, result in sorted(consensus_results.items())
         },
+        "baseline_window_alignment": {
+            "matched_consensus_window_count": len(tokenized_consensus) - unmatched_consensus_window_count,
+            "unmatched_consensus_window_count": unmatched_consensus_window_count,
+        },
         **build_eda_payload(
-            _tokenized_windows_to_diagnostics_records(tokenized_consensus, reference_lookup),
+            _tokenized_windows_to_diagnostics_records(
+                tokenized_consensus,
+                reference_lookup,
+                allow_unmatched_reference=True,
+            ),
             _tokenized_windows_to_diagnostics_records(tokenized_baseline, reference_lookup),
             consensus_sample_limit=DEFAULT_RUNTIME_DIAGNOSTIC_SAMPLE_LIMIT,
         ),
     }
 
 
+def _tokenized_window_lookup_key(record: TokenizedWindow) -> tuple[str, int, int]:
+    return record.window.contig, record.window.window_start, record.window.window_end
+
+
 def _tokenized_windows_to_diagnostics_records(
     tokenized_windows: tuple[TokenizedWindow, ...],
     reference_lookup: dict[tuple[str, int, int], str],
+    *,
+    allow_unmatched_reference: bool = False,
 ) -> Iterable[dict[str, object]]:
     for record in tokenized_windows:
-        key = (record.window.contig, record.window.window_start, record.window.window_end)
-        reference_sequence = reference_lookup[key]
+        key = _tokenized_window_lookup_key(record)
+        reference_sequence = reference_lookup.get(key)
+        reference_window_matched = reference_sequence is not None
+        if reference_sequence is None:
+            if not allow_unmatched_reference:
+                raise KeyError(key)
+            reference_sequence = record.window.sequence
         filtered_bases = record.window.filtered_bases
         no_call_bases = record.window.no_call_bases
         other_masked_bases = record.window.other_masked_bases
+        variant_count = 0
+        if reference_window_matched:
+            variant_count = sum(
+                1
+                for base, reference_base in zip(record.window.sequence, reference_sequence)
+                if base != "N" and base != reference_base
+            )
         yield {
             "sample_id": record.window.sample_id,
             "locus_id": record.window.locus_id,
@@ -361,11 +390,7 @@ def _tokenized_windows_to_diagnostics_records(
             "source": record.window.source,
             "sequence": record.window.sequence,
             "reference_sequence": reference_sequence,
-            "variant_count": sum(
-                1
-                for base, reference_base in zip(record.window.sequence, reference_sequence)
-                if base != "N" and base != reference_base
-            ),
+            "variant_count": variant_count,
             "callable_bases": len(record.window.sequence)
             - filtered_bases
             - no_call_bases
@@ -375,6 +400,7 @@ def _tokenized_windows_to_diagnostics_records(
             "other_masked_bases": other_masked_bases,
             "masked_base_counts": dict(record.window.masked_base_counts),
             "token_count": record.token_count,
+            "reference_window_matched": reference_window_matched,
         }
 
 

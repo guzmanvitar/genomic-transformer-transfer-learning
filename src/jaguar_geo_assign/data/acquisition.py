@@ -239,6 +239,8 @@ def download_with_retry(
                 skipped_existing=False,
                 bytes_written=bytes_written,
             )
+        except AcquisitionError:
+            raise
         except Exception as exc:  # pragma: no cover - exercised through tests
             last_error = exc
             if attempt >= retries:

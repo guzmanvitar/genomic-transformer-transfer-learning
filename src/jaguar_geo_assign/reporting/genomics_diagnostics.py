@@ -292,6 +292,13 @@ def _summarize_record(
 
 
 def _count_near_duplicate_pairs(sequences: list[str]) -> int:
+    """Count one-mismatch pairs across the analyzed sequence subset.
+
+    The signature expansion below is intentionally exact, but its work scales with the
+    analyzed sample size (`S`) and sequence length (`L`). Callers keep `S` bounded via
+    `near_duplicate_sample_limit` for corpus-scale diagnostics unless an exact full-corpus
+    pass is explicitly requested with `None`.
+    """
     signatures: dict[tuple[int, str], set[int]] = defaultdict(set)
     for index, sequence in enumerate(sequences):
         for position in range(len(sequence)):
@@ -313,6 +320,7 @@ def _summarize_near_duplicates(
     sample_limit: int | None,
     total_sequence_count: int | None = None,
 ) -> dict[str, object]:
+    """Summarize near-duplicate pairs for either the full set or a bounded sample."""
     if sample_limit is not None and sample_limit <= 0:
         raise ValueError("near_duplicate_sample_limit must be positive when provided")
 
@@ -320,6 +328,7 @@ def _summarize_near_duplicates(
     total_count = len(records) if total_sequence_count is None else total_sequence_count
     analysis_mode = "exact"
     if sample_limit is not None and total_count > len(records):
+        # `_stream_corpus_summary()` already handed us a deterministic bounded sample.
         analysis_mode = "sampled"
     elif sample_limit is not None and len(records) > sample_limit:
         analyzed_records = list(
@@ -451,7 +460,7 @@ def _stream_corpus_summary(
     shape_issue_count = 0
     total_base_count = 0
     retained_window_count = 0
-    sampled_records: list[dict[str, object]] = [] if near_duplicate_sample_limit is None else []
+    sampled_records: list[dict[str, object]] = []
     sampled_heap: list[tuple[int, dict[str, object]]] = []
 
     for raw_record in records:
@@ -493,6 +502,8 @@ def _stream_corpus_summary(
         if near_duplicate_sample_limit is None:
             sampled_records.append(record)
         else:
+            # Keep the exact near-duplicate check bounded to a deterministic sample rather
+            # than the full corpus; this avoids an unbounded O(S × L) signature expansion.
             _update_sampled_near_duplicates(record, near_duplicate_sample_limit, sampled_heap)
 
     duplicate_window_count = sum(count - 1 for count in duplicate_counts.values() if count > 1)
@@ -577,6 +588,7 @@ def _update_missingness_counts(sequence: str, missing_counts: list[int], total_c
 def _update_sampled_near_duplicates(
     record: dict[str, object], sample_limit: int, heap: list[tuple[int, dict[str, object]]]
 ) -> None:
+    """Maintain a deterministic hash-ordered sample for bounded near-duplicate analysis."""
     sampling_key = int(_near_duplicate_sampling_key(record), 16)
     entry = (-sampling_key, record)
     if len(heap) < sample_limit:

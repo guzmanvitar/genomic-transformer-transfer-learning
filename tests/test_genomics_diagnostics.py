@@ -1,6 +1,7 @@
 import json
 
 import pytest
+import jaguar_geo_assign.reporting.genomics_diagnostics as genomics_diagnostics
 
 from jaguar_geo_assign.reporting import (
     audit_corpus_integrity,
@@ -239,6 +240,24 @@ def test_summarize_corpus_records_samples_near_duplicate_analysis_for_large_corp
         {"length": 36, "count": 320},
     ]
     assert sum(bucket["count"] for bucket in summary["gc_fraction_distribution"]) == 640
+
+
+def test_summarize_corpus_records_caps_near_duplicate_work_to_sample_limit(monkeypatch) -> None:
+    realistic_consensus = _build_realistic_records(total=640, source="consensus")
+    observed: dict[str, int] = {}
+
+    def fake_count_near_duplicate_pairs(sequences: list[str]) -> int:
+        observed["analyzed_sequence_count"] = len(sequences)
+        return 0
+
+    monkeypatch.setattr(genomics_diagnostics, "_count_near_duplicate_pairs", fake_count_near_duplicate_pairs)
+
+    summary = summarize_corpus_records(realistic_consensus, near_duplicate_sample_limit=64)
+
+    assert observed == {"analyzed_sequence_count": 64}
+    assert summary["near_duplicate_analysis"]["mode"] == "sampled"
+    assert summary["near_duplicate_analysis"]["total_sequence_count"] == 640
+    assert summary["near_duplicate_analysis"]["analyzed_sequence_count"] == 64
 
 
 def test_build_eda_payload_bounds_consensus_sample_preview_for_large_corpus() -> None:

@@ -1,3 +1,4 @@
+from dataclasses import replace
 from pathlib import Path
 import json
 import stat
@@ -335,6 +336,36 @@ def test_runtime_diagnostics_passes_streaming_records_into_aggregation(
 
     assert captured_types == {"consensus": "generator", "baseline": "generator"}
     assert payload["consensus_generation"] == {}
+
+
+def test_runtime_diagnostics_records_unmatched_consensus_windows_without_crashing() -> None:
+    unmatched_consensus = replace(
+        _synthetic_tokenized_window(index=2, source="consensus"),
+        window=replace(
+            _synthetic_tokenized_window(index=2, source="consensus").window,
+            window_start=999,
+            window_end=1005,
+        ),
+    )
+    payload = pretrain_pipeline._build_diagnostics_payload(
+        tokenized_consensus=(
+            _synthetic_tokenized_window(index=0, source="consensus"),
+            _synthetic_tokenized_window(index=1, source="consensus"),
+            unmatched_consensus,
+        ),
+        tokenized_baseline=tuple(_synthetic_tokenized_window(index=index, source="reference") for index in range(2)),
+        consensus_results={},
+    )
+
+    assert payload["baseline_window_alignment"] == {
+        "matched_consensus_window_count": 2,
+        "unmatched_consensus_window_count": 1,
+    }
+    assert payload["consensus_corpus"]["retained_window_count"] == 3
+    unmatched_sample = payload["consensus_samples"][2]
+    assert unmatched_sample["reference_window_matched"] is False
+    assert unmatched_sample["reference_sequence"] == unmatched_sample["sequence"]
+    assert unmatched_sample["variant_count"] == 0
 
 
 def test_pretrain_cli_reports_actionable_config_error(capsys) -> None:

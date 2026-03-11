@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pytest
 
+from jaguar_geo_assign.data import acquisition
 from jaguar_geo_assign.data.acquisition import AcquisitionError, DownloadAsset, download_with_retry
 
 
@@ -77,7 +78,7 @@ def test_download_with_retry_fails_on_checksum_mismatch(tmp_path: Path) -> None:
     destination = tmp_path / "cat.vcf.gz"
     opener = _FakeOpener([_FakeResponse(b"wrong")])
 
-    with pytest.raises(AcquisitionError, match="Failed to download"):
+    with pytest.raises(AcquisitionError, match="Checksum mismatch"):
         download_with_retry(
             DownloadAsset(
                 url="https://example.test/cat.vcf.gz",
@@ -85,9 +86,33 @@ def test_download_with_retry_fails_on_checksum_mismatch(tmp_path: Path) -> None:
                 checksum=hashlib.sha256(b"expected").hexdigest(),
             ),
             opener=opener,
-            retries=1,
+            retries=3,
             sleep=lambda _: None,
         )
 
+    assert len(opener.requests) == 1
     assert not destination.exists()
     assert not destination.with_name(f"{destination.name}.part").exists()
+
+
+def test_download_with_retry_does_not_retry_non_transient_acquisition_errors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    destination = tmp_path / "cat.vcf.gz"
+    attempts = 0
+
+    def _fail_download_once(**_: object) -> int:
+        nonlocal attempts
+        attempts += 1
+        raise AcquisitionError("deterministic failure")
+
+    monkeypatch.setattr(acquisition, "_download_once", _fail_download_once)
+
+    with pytest.raises(AcquisitionError, match="deterministic failure"):
+        download_with_retry(
+            DownloadAsset(url="https://example.test/cat.vcf.gz", destination=destination),
+            retries=3,
+            sleep=lambda _: None,
+        )
+
+    assert attempts == 1
