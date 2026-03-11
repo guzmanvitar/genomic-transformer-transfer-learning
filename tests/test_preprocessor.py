@@ -85,3 +85,29 @@ def test_window_sequences_preserve_mask_provenance_counts() -> None:
     assert windows[1].no_call_bases == 1
     assert windows[1].other_masked_bases == 2
     assert windows[1].masked_base_counts == (("filtered", 1), ("heterozygous", 2), ("no_call", 1))
+
+
+def test_window_sequences_drop_high_ambiguity_windows_from_retained_sequence() -> None:
+    config = PreprocessingConfig(
+        min_sequence_length=8,
+        max_ambiguity_fraction=0.25,
+        window_size=4,
+        window_stride=4,
+        locus_block_size=8,
+    )
+
+    report = prepare_sequences(
+        [SequenceRecord("sample-1", "cat-1", "chr1", "ACGTNNAC")],
+        config,
+    )
+
+    assert len(report.retained) == 1
+    assert report.retained[0].ambiguity_fraction == 0.25
+
+    windows = window_sequences(list(report.retained), config)
+
+    assert len(windows) == 1
+    assert windows[0].window_start == 0
+    assert windows[0].window_end == 4
+    assert windows[0].sequence == "ACGT"
+    assert windows[0].ambiguity_fraction == 0.0

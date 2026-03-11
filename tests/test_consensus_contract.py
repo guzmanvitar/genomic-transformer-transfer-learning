@@ -8,6 +8,7 @@ import pytest
 
 from jaguar_geo_assign.data.acquisition import (
     ContigMismatchError,
+    MalformedGenotypeError,
     MissingToolError,
     ReferenceMismatchError,
     classify_consensus_site,
@@ -41,6 +42,27 @@ def test_classify_consensus_site_covers_explicit_contract(
 
     assert decision.action == expected_action
     assert decision.category == expected_category
+
+
+@pytest.mark.parametrize(
+    ("genotype", "filter_value"),
+    [("*/*", "PASS"), ("?/?", "LowQual"), ("1/?", "PASS")],
+)
+def test_classify_consensus_site_raises_actionable_error_on_malformed_gt(
+    genotype: str,
+    filter_value: str,
+) -> None:
+    with pytest.raises(MalformedGenotypeError, match=r"GT='.*'.*sample 'cat_1'.*chr1:4"):
+        classify_consensus_site(
+            "A",
+            ["T"],
+            genotype,
+            filter_value=filter_value,
+            sample_id="cat_1",
+            contig="chr1",
+            position=4,
+            vcf_path=Path("fixture.vcf"),
+        )
 
 
 def test_generate_consensus_fasta_preserves_reference_and_masks_multiallelic_indel_and_ambiguous_calls(
@@ -90,6 +112,38 @@ def test_generate_consensus_fasta_preserves_reference_and_masks_multiallelic_ind
         (5, 6, "indel"),
         (7, 8, "no_call"),
     ]
+
+
+@pytest.mark.parametrize("genotype", ["*/*", "?/?"])
+def test_generate_consensus_fasta_fails_fast_on_malformed_gt_tokens(tmp_path: Path, genotype: str) -> None:
+    reference = tmp_path / "reference.fa"
+    reference.write_text(
+        ">chr1 GCF_000181335.3 Felis_catus_9.0\nAACCAA\n",
+        encoding="utf-8",
+    )
+    vcf = tmp_path / "cat_1.vcf"
+    vcf.write_text(
+        textwrap.dedent(
+            f"""\
+            ##fileformat=VCFv4.2
+            ##reference=GCF_000181335.3_Felis_catus_9.0
+            ##contig=<ID=chr1,length=6>
+            #CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tcat_1
+            chr1\t2\t.\tA\tT\t.\tPASS\t.\tGT\t{genotype}
+            """
+        ),
+        encoding="utf-8",
+    )
+    fake_bcftools = _write_fake_bcftools(tmp_path)
+
+    with pytest.raises(MalformedGenotypeError, match=r"GT='.*'.*sample 'cat_1'.*chr1:2"):
+        generate_consensus_fasta(
+            sample_id="cat_1",
+            reference_fasta=reference,
+            sample_vcf=vcf,
+            output_fasta=tmp_path / "cat_1.fa",
+            bcftools_executable=str(fake_bcftools),
+        )
 
 
 @pytest.mark.parametrize(

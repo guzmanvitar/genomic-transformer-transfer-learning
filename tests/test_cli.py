@@ -1,4 +1,5 @@
 from dataclasses import replace
+import gzip
 from pathlib import Path
 import json
 import stat
@@ -239,6 +240,148 @@ def test_pretrain_cli_smoke_path_runs_fixture_pipeline(
         "no_call": 1,
     }
     assert diagnostics["baseline_comparison"]["deltas"]["retained_window_count"] == 0
+
+
+def test_pretrain_cli_smoke_path_accepts_gzip_fasta_inputs(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys
+) -> None:
+    reference = tmp_path / "reference.fasta.gz"
+    with gzip.open(reference, "wt", encoding="utf-8") as handle:
+        handle.write(">chr1 GCF_000181335.3 Felis_catus_9.0\nAACCAA\n")
+
+    sample_vcf = tmp_path / "cat_1.vcf"
+    sample_vcf.write_text(
+        textwrap.dedent(
+            """\
+            ##fileformat=VCFv4.2
+            ##reference=GCF_000181335.3_Felis_catus_9.0
+            ##contig=<ID=chr1,length=6>
+            #CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tcat_1
+            chr1\t2\t.\tA\tT\t.\tPASS\t.\tGT\t1/1
+            chr1\t4\t.\tC\tG\t.\tPASS\t.\tGT\t0/1
+            chr1\t6\t.\tA\tG\t.\tPASS\t.\tGT\t./.
+            """
+        ),
+        encoding="utf-8",
+    )
+    sample_manifest = tmp_path / "sample_manifest.tsv"
+    sample_manifest.write_text(
+        f"sample_id\tindividual_id\tvcf_path\ncat_1\tcat-1\t{sample_vcf}\n",
+        encoding="utf-8",
+    )
+    config_path = tmp_path / "feline_smoke.toml"
+    config_path.write_text(
+        textwrap.dedent(
+            f"""\
+            [pipeline]
+            name = "feline_smoke"
+            description = "Fixture-backed feline pipeline smoke test."
+            project_accession = "PRJNA308208"
+
+            [paths]
+            reference_fasta = "{reference}"
+            sample_manifest = "{sample_manifest}"
+            source_vcf = "{sample_vcf}"
+            raw_dir = "{tmp_path / 'raw'}"
+            processed_dir = "{tmp_path / 'processed'}"
+            baseline_dir = "{tmp_path / 'baseline'}"
+            artifact_dir = "{tmp_path / 'artifacts'}"
+            report_dir = "{tmp_path / 'reports'}"
+
+            [consensus]
+            assembly = "Felis_catus_9.0"
+            require_assembly_match = true
+            require_contig_match = true
+            mask_symbol = "N"
+            homozygous_reference = "emit_reference_if_callable"
+            homozygous_alternate = "apply_alternate_allele"
+            heterozygous = "mask_and_report"
+            multiallelic = "mask_and_report"
+            filtered = "mask_and_report"
+            missing = "mask_and_report"
+            indel = "mask_and_report"
+
+            [windowing]
+            context_window = 6
+            window_overlap = 0
+            max_ambiguous_fraction = 0.5
+            drop_short_sequences = true
+
+            [split]
+            strategy = "global_locus_block"
+            locus_key_fields = ["contig", "block_id"]
+            locus_block_size = 6
+            assignment_stage = "before_windowing"
+            evaluation_target = "unseen_loci"
+            baseline_policy = "reuse_locus_assignments"
+
+            [tokenizer]
+            identifier = "zhihan1996/DNABERT-2-117M"
+            revision = "7bce263b15377fc15361f52cfab88f8b586abda0"
+            allowed_alphabet = ["A", "C", "G", "T", "N"]
+            unsupported_symbol_policy = "reject"
+            max_position_embeddings = 8
+
+            [export]
+            format = "parquet"
+            access_pattern = "offline_window_materialization"
+            row_group_size = 2
+            deterministic_partition_keys = ["split", "contig", "block_id"]
+            preserve_raw_windows = false
+            preserve_sequence_hashes = true
+            preserve_coordinates = true
+            sequence_hash_algorithm = "sha256"
+
+            [runtime]
+            external_tools = ["bcftools"]
+            """
+        ),
+        encoding="utf-8",
+    )
+
+    class FakeTokenizer:
+        def __call__(self, sequence: str, **_: object) -> dict[str, list[int]]:
+            return {
+                "input_ids": [101, *range(200, 200 + len(sequence)), 102],
+                "attention_mask": [1] * (len(sequence) + 2),
+            }
+
+    def fake_tokenizer_loader() -> tuple[object, TokenizerProvenance]:
+        return (FakeTokenizer(), TokenizerProvenance(max_position_embeddings=8))
+
+    monkeypatch.setattr(pretrain_pipeline, "load_dnabert2_tokenizer", fake_tokenizer_loader)
+    monkeypatch.setattr(preprocessor_module, "_load_pyarrow_parquet", _fake_pyarrow_parquet_backend)
+    fake_bcftools = _write_fake_bcftools(tmp_path)
+
+    exit_code = main(
+        [
+            "pretrain",
+            "--config",
+            str(config_path),
+            "--bcftools-executable",
+            str(fake_bcftools),
+        ]
+    )
+
+    captured = capsys.readouterr()
+    assert exit_code == 0
+    assert "Feline pretrain artifact generation finished for 'feline_smoke'." in captured.out
+    consensus_fasta = tmp_path / "processed" / "consensus_fastas" / "cat_1.fa"
+    assert consensus_fasta.read_text(encoding="utf-8") == ">chr1\nATCNAN\n"
+    consensus_metadata = json.loads(
+        (tmp_path / "processed" / "consensus_tokens" / "metadata.json").read_text(encoding="utf-8")
+    )
+    baseline_metadata = json.loads(
+        (tmp_path / "baseline" / "reference_tokens" / "metadata.json").read_text(encoding="utf-8")
+    )
+    assert consensus_metadata["export_format"] == "parquet"
+    assert baseline_metadata["export_format"] == "parquet"
+    diagnostics = json.loads((tmp_path / "reports" / "eda_payload.json").read_text(encoding="utf-8"))
+    assert diagnostics["consensus_generation"]["cat_1"]["applied_variant_count"] == 1
+    assert diagnostics["consensus_samples"][0]["no_call_bases"] == 1
+    assert diagnostics["consensus_samples"][0]["other_masked_bases"] == 1
+    assert diagnostics["consensus_samples"][0]["sequence"] == "ATCNAN"
+    assert diagnostics["consensus_samples"][0]["reference_sequence"] == "AACCAA"
 
 
 def test_runtime_diagnostics_payload_is_bounded_and_provenance_faithful() -> None:

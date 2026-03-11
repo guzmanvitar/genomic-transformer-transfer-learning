@@ -402,6 +402,9 @@ def window_sequences(
                 if window_end > overlap_end:
                     break
                 window_sequence = block_sequence[offset : offset + config.window_size]
+                window_ambiguity = ambiguity_fraction(window_sequence)
+                if window_ambiguity > config.max_ambiguity_fraction:
+                    continue
                 mask_counts = mask_counter.count(window_start=window_start, window_end=window_end)
                 filtered_bases = mask_counts.get("filtered", 0)
                 no_call_bases = mask_counts.get("no_call", 0)
@@ -422,7 +425,7 @@ def window_sequences(
                         window_end=window_end,
                         sequence=window_sequence,
                         gc_fraction=gc_fraction(window_sequence),
-                        ambiguity_fraction=ambiguity_fraction(window_sequence),
+                        ambiguity_fraction=window_ambiguity,
                         sequence_hash=sha256(window_sequence.encode("utf-8")).hexdigest(),
                         filtered_bases=filtered_bases,
                         no_call_bases=no_call_bases,

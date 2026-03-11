@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import csv
 from dataclasses import asdict, dataclass
+import gzip
 import json
 from pathlib import Path
 from typing import Callable, Iterable
@@ -408,7 +409,7 @@ def _load_fasta_sequences(path: str | Path) -> dict[str, str]:
     fasta_path = Path(path)
     sequences: dict[str, list[str]] = {}
     current_name: str | None = None
-    with fasta_path.open("r", encoding="utf-8") as handle:
+    with _open_maybe_gzip(fasta_path) as handle:
         for raw_line in handle:
             line = raw_line.strip()
             if not line:
@@ -423,6 +424,10 @@ def _load_fasta_sequences(path: str | Path) -> dict[str, str]:
     if not sequences:
         raise ValueError(f"FASTA {fasta_path} did not contain any sequences")
     return {name: "".join(parts) for name, parts in sequences.items()}
+
+
+def _open_maybe_gzip(path: Path):
+    return gzip.open(path, "rt", encoding="utf-8") if path.suffix == ".gz" else path.open("r", encoding="utf-8")
 
 
 def _resolve_path(base_dir: Path, path: str | Path, *, prefer_cwd: bool = False) -> Path:
