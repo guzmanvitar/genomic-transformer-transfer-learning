@@ -4,6 +4,10 @@ import pytest
 
 from jaguar_geo_assign.config import load_experiment_config, load_feline_pipeline_config
 from jaguar_geo_assign.data.contracts import JAGUAR_METADATA_FIELDS
+from jaguar_geo_assign.data.pipeline_contract import (
+    APPROVED_BIOPROJECT_ACCESSION,
+    APPROVED_REFERENCE_ASSEMBLY,
+)
 
 
 def test_load_experiment_config_preserves_metadata_contract() -> None:
@@ -32,7 +36,8 @@ def test_load_experiment_config_rejects_extra_metadata_fields(tmp_path: Path) ->
 def test_load_feline_pipeline_config_preserves_scientific_contracts() -> None:
     config = load_feline_pipeline_config("configs/examples/feline_pretrain.toml")
 
-    assert config.project_accession == "PRJNA308208"
+    assert config.project_accession == APPROVED_BIOPROJECT_ACCESSION
+    assert config.consensus.assembly == APPROVED_REFERENCE_ASSEMBLY
     assert config.split.strategy == "global_locus_block"
     assert config.split.locus_key_fields == ("contig", "block_id")
     assert config.split.locus_block_size == 2048

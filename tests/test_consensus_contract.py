@@ -24,6 +24,7 @@ from jaguar_geo_assign.data.acquisition import (
     [
         ("A", ["T"], "0/0", "PASS", "reference", "homozygous_reference"),
         ("A", ["T"], "1/1", "PASS", "apply_alt", "homozygous_alternate"),
+        ("A", ["."], "1/1", "PASS", "mask", "invalid_alt_index"),
         ("A", ["AT"], "1/1", "PASS", "mask", "indel"),
         ("A", ["T"], "0/1", "PASS", "mask", "heterozygous"),
         ("A", ["T", "G"], "1/2", "PASS", "mask", "multiallelic"),
@@ -44,6 +45,8 @@ def test_classify_consensus_site_covers_explicit_contract(
 
     assert decision.action == expected_action
     assert decision.category == expected_category
+    if alts == ["."]:
+        assert decision.replacement is None
 
 
 @pytest.mark.parametrize(
@@ -113,6 +116,45 @@ def test_generate_consensus_fasta_preserves_reference_and_masks_multiallelic_ind
         (4, 5, "multiallelic"),
         (5, 6, "indel"),
         (7, 8, "no_call"),
+    ]
+
+
+def test_generate_consensus_fasta_treats_alt_dot_as_no_alt_site(tmp_path: Path) -> None:
+    reference = tmp_path / "reference.fa"
+    reference.write_text(
+        ">chr1 GCF_000181335.3 Felis_catus_9.0\nAACCAA\n",
+        encoding="utf-8",
+    )
+    vcf = tmp_path / "cat_1.vcf"
+    vcf.write_text(
+        textwrap.dedent(
+            """\
+            ##fileformat=VCFv4.2
+            ##reference=GCF_000181335.3_Felis_catus_9.0
+            ##contig=<ID=chr1,length=6>
+            #CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tcat_1
+            chr1\t2\t.\tA\t.\t.\tPASS\t.\tGT\t1/1
+            """
+        ),
+        encoding="utf-8",
+    )
+    fake_bcftools = _write_fake_bcftools(tmp_path)
+
+    result = generate_consensus_fasta(
+        sample_id="cat_1",
+        reference_fasta=reference,
+        sample_vcf=vcf,
+        output_fasta=tmp_path / "cat_1.fa",
+        bcftools_executable=str(fake_bcftools),
+    )
+
+    assert result.output_fasta.read_text(encoding="utf-8") == ">chr1\nANCCAA\n"
+    assert "." not in result.output_fasta.read_text(encoding="utf-8")
+    assert result.diagnostics.applied_variant_count == 0
+    assert result.diagnostics.masked_site_count == 1
+    assert result.diagnostics.callable_records == 0
+    assert [(span.start, span.end, span.category) for span in result.mask_spans] == [
+        (1, 2, "invalid_alt_index"),
     ]
 
 

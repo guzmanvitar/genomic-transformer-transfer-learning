@@ -13,6 +13,8 @@ from .baselines import (
 )
 from .data.contracts import JAGUAR_METADATA_FIELDS
 from .data.pipeline_contract import (
+    APPROVED_BIOPROJECT_ACCESSION,
+    APPROVED_REFERENCE_ASSEMBLY,
     DNABERT2_TOKENIZER_ID,
     DNABERT2_TOKENIZER_REVISION,
     EXPLICIT_CONSENSUS_POLICIES,
@@ -205,10 +207,12 @@ def load_feline_pipeline_config(path: str | Path) -> FelinePipelineConfig:
         export = raw["export"]
         runtime = raw["runtime"]
 
-        if pipeline["project_accession"] != "PRJNA308208":
-            raise ValueError("pipeline.project_accession must remain PRJNA308208")
-        if consensus["assembly"] != "Felis_catus_9.0":
-            raise ValueError("consensus.assembly must remain Felis_catus_9.0")
+        if pipeline["project_accession"] != APPROVED_BIOPROJECT_ACCESSION:
+            raise ValueError(
+                f"pipeline.project_accession must remain {APPROVED_BIOPROJECT_ACCESSION}"
+            )
+        if consensus["assembly"] != APPROVED_REFERENCE_ASSEMBLY:
+            raise ValueError(f"consensus.assembly must remain {APPROVED_REFERENCE_ASSEMBLY}")
         if not consensus["require_assembly_match"] or not consensus["require_contig_match"]:
             raise ValueError("consensus must fail fast on assembly and contig mismatches")
         if consensus["mask_symbol"] != "N":

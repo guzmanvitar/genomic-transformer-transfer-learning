@@ -5,6 +5,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 import shutil
 
+APPROVED_BIOPROJECT_ACCESSION = "PRJNA308208"
+APPROVED_REFERENCE_ASSEMBLY = "Felis_catus_9.0"
 DNABERT2_TOKENIZER_ID = "zhihan1996/DNABERT-2-117M"
 DNABERT2_TOKENIZER_REVISION = "7bce263b15377fc15361f52cfab88f8b586abda0"
 POST_CONSENSUS_ALLOWED_ALPHABET = ("A", "C", "G", "T", "N")

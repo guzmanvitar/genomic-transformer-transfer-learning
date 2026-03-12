@@ -91,25 +91,26 @@ def run_feline_pretrain_pipeline(
         bcftools_executable=bcftools_executable,
     )
 
-    reference_sequences = _load_fasta_sequences(reference_fasta)
     preprocessing_config = _build_preprocessing_config(config)
-
-    consensus_records = _build_consensus_sequence_records(consensus_results, manifest_entries)
-    baseline_records = _build_reference_sequence_records(reference_sequences, manifest_entries)
-
-    prepared_consensus = prepare_sequences(consensus_records, preprocessing_config)
-    prepared_baseline = prepare_sequences(baseline_records, preprocessing_config)
-    consensus_windows = window_sequences(list(prepared_consensus.retained), preprocessing_config)
-    baseline_windows = window_sequences(list(prepared_baseline.retained), preprocessing_config)
-    if not consensus_windows:
-        raise RuntimeError("No consensus windows survived preprocessing; check sequence length and ambiguity filters")
-    if not baseline_windows:
-        raise RuntimeError("No baseline windows survived preprocessing; check the reference FASTA and window settings")
-
     tokenizer, provenance = tokenizer_loader()
     _assert_tokenizer_matches_config(config, provenance)
-    tokenized_consensus = tokenize_windows(consensus_windows, tokenizer, provenance=provenance)
-    tokenized_baseline = tokenize_windows(baseline_windows, tokenizer, provenance=provenance)
+
+    tokenized_consensus = _tokenize_sequence_records(
+        _iter_consensus_sequence_records(consensus_results, manifest_entries),
+        preprocessing_config,
+        tokenizer,
+        provenance,
+    )
+    tokenized_baseline = _tokenize_sequence_records(
+        _iter_reference_sequence_records(reference_fasta),
+        preprocessing_config,
+        tokenizer,
+        provenance,
+    )
+    if not tokenized_consensus:
+        raise RuntimeError("No consensus windows survived preprocessing; check sequence length and ambiguity filters")
+    if not tokenized_baseline:
+        raise RuntimeError("No baseline windows survived preprocessing; check the reference FASTA and window settings")
 
     consensus_export = export_writer(tokenized_consensus, processed_dir / "consensus_tokens", config)
     baseline_export = export_writer(tokenized_baseline, baseline_dir / "reference_tokens", config)
@@ -282,25 +283,28 @@ def _build_consensus_sequence_records(
     consensus_results: dict[str, ConsensusResult],
     manifest_entries: tuple[FelineSampleManifestEntry, ...],
 ) -> list[SequenceRecord]:
+    return list(_iter_consensus_sequence_records(consensus_results, manifest_entries))
+
+
+def _iter_consensus_sequence_records(
+    consensus_results: dict[str, ConsensusResult],
+    manifest_entries: tuple[FelineSampleManifestEntry, ...],
+) -> Iterable[SequenceRecord]:
     individual_by_sample = {entry.sample_id: entry.individual_id for entry in manifest_entries}
-    records: list[SequenceRecord] = []
     for sample_id, result in sorted(consensus_results.items()):
         mask_spans_by_contig: dict[str, list[tuple[int, int, str]]] = {}
         for span in result.mask_spans:
             mask_spans_by_contig.setdefault(span.contig, []).append((span.start, span.end, span.category))
-        for contig, sequence in _load_fasta_sequences(result.output_fasta).items():
-            records.append(
-                SequenceRecord(
-                    sample_id=sample_id,
-                    individual_id=individual_by_sample[sample_id],
-                    contig=contig,
-                    sequence=sequence,
-                    source="consensus",
-                    sequence_start=0,
-                    mask_spans=tuple(sorted(mask_spans_by_contig.get(contig, []))),
-                )
+        for contig, sequence in _iter_fasta_sequences(result.output_fasta):
+            yield SequenceRecord(
+                sample_id=sample_id,
+                individual_id=individual_by_sample[sample_id],
+                contig=contig,
+                sequence=sequence,
+                source="consensus",
+                sequence_start=0,
+                mask_spans=tuple(sorted(mask_spans_by_contig.get(contig, []))),
             )
-    return records
 
 
 def _build_reference_sequence_records(
@@ -321,6 +325,36 @@ def _build_reference_sequence_records(
         )
         for contig, sequence in reference_sequences.items()
     ]
+
+
+def _iter_reference_sequence_records(reference_fasta: str | Path) -> Iterable[SequenceRecord]:
+    for contig, sequence in _iter_fasta_sequences(reference_fasta):
+        yield SequenceRecord(
+            sample_id=f"reference-{contig}",
+            individual_id="reference",
+            contig=contig,
+            sequence=sequence,
+            source="reference",
+            sequence_start=0,
+        )
+
+
+def _tokenize_sequence_records(
+    records: Iterable[SequenceRecord],
+    preprocessing_config: PreprocessingConfig,
+    tokenizer: object,
+    provenance: TokenizerProvenance,
+) -> tuple[TokenizedWindow, ...]:
+    tokenized_windows: list[TokenizedWindow] = []
+    for record in records:
+        prepared = prepare_sequences([record], preprocessing_config)
+        if not prepared.retained:
+            continue
+        windows = window_sequences(list(prepared.retained), preprocessing_config)
+        if not windows:
+            continue
+        tokenized_windows.extend(tokenize_windows(windows, tokenizer, provenance=provenance))
+    return tuple(tokenized_windows)
 
 
 def _build_diagnostics_payload(
@@ -392,10 +426,7 @@ def _tokenized_windows_to_diagnostics_records(
             "sequence": record.window.sequence,
             "reference_sequence": reference_sequence,
             "variant_count": variant_count,
-            "callable_bases": len(record.window.sequence)
-            - filtered_bases
-            - no_call_bases
-            - other_masked_bases,
+            "callable_bases": _count_callable_bases(record.window.sequence),
             "filtered_bases": filtered_bases,
             "no_call_bases": no_call_bases,
             "other_masked_bases": other_masked_bases,
@@ -405,25 +436,35 @@ def _tokenized_windows_to_diagnostics_records(
         }
 
 
+def _count_callable_bases(sequence: str) -> int:
+    return sum(base != "N" for base in sequence)
+
+
 def _load_fasta_sequences(path: str | Path) -> dict[str, str]:
+    return dict(_iter_fasta_sequences(path))
+
+
+def _iter_fasta_sequences(path: str | Path) -> Iterable[tuple[str, str]]:
     fasta_path = Path(path)
-    sequences: dict[str, list[str]] = {}
     current_name: str | None = None
+    current_parts: list[str] = []
     with _open_maybe_gzip(fasta_path) as handle:
         for raw_line in handle:
             line = raw_line.strip()
             if not line:
                 continue
             if line.startswith(">"):
+                if current_name is not None:
+                    yield current_name, "".join(current_parts)
                 current_name = line[1:].split()[0]
-                sequences.setdefault(current_name, [])
+                current_parts = []
                 continue
             if current_name is None:
                 raise ValueError(f"FASTA {fasta_path} contains sequence data before the first header")
-            sequences[current_name].append(line)
-    if not sequences:
+            current_parts.append(line)
+    if current_name is None:
         raise ValueError(f"FASTA {fasta_path} did not contain any sequences")
-    return {name: "".join(parts) for name, parts in sequences.items()}
+    yield current_name, "".join(current_parts)
 
 
 def _open_maybe_gzip(path: Path):

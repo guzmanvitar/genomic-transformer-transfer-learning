@@ -178,13 +178,8 @@ def audit_corpus_integrity(
 
     for record in summarized_records:
         locus_splits[str(record["locus_id"])].add(str(record["split"]))
-        observed_bases = (
-            int(record["callable_bases"])
-            + int(record["filtered_bases"])
-            + int(record["no_call_bases"])
-            + int(record.get("other_masked_bases", 0))
-        )
-        if observed_bases != len(str(record["sequence"])):
+        sequence = _normalize_sequence(str(record["sequence"]))
+        if _has_unique_coverage_mismatch(sequence, int(record["callable_bases"])):
             shape_issues.append(
                 {
                     "sample_id": record["sample_id"],
@@ -436,6 +431,11 @@ def _coerce_masked_base_counts(
     return {category: count for category, count in sorted(counts.items())}
 
 
+def _has_unique_coverage_mismatch(sequence: str, callable_bases: int) -> bool:
+    unique_masked_bases = sum(base in MISSING_BASES for base in sequence)
+    return callable_bases + unique_masked_bases != len(sequence)
+
+
 def _stream_corpus_summary(
     records: Iterable[Mapping[str, object]],
     *,
@@ -485,13 +485,7 @@ def _stream_corpus_summary(
         _update_missingness_counts(sequence, missing_counts, total_counts)
         locus_splits[str(record["locus_id"])].add(str(record["split"]))
 
-        observed_bases = (
-            int(record["callable_bases"])
-            + int(record["filtered_bases"])
-            + int(record["no_call_bases"])
-            + int(record.get("other_masked_bases", 0))
-        )
-        if observed_bases != len(sequence):
+        if _has_unique_coverage_mismatch(sequence, int(record["callable_bases"])):
             shape_issue_count += 1
         if int(record["token_count"]) <= 0:
             shape_issue_count += 1

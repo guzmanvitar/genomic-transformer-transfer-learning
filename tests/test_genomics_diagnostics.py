@@ -197,6 +197,61 @@ def test_audit_corpus_integrity_flags_split_conflicts_and_shape_issues(consensus
     ]
 
 
+def test_overlap_aware_integrity_accepts_overlapping_mask_tallies() -> None:
+    overlapping_record = {
+        "sample_id": "cat-overlap",
+        "locus_id": "chr2:block-overlap",
+        "split": "train",
+        "source": "consensus",
+        "sequence": "NNNNAA",
+        "reference_sequence": "AACCAA",
+        "variant_count": 0,
+        "callable_bases": 2,
+        "filtered_bases": 4,
+        "no_call_bases": 4,
+        "other_masked_bases": 0,
+        "masked_base_counts": {"filtered": 4, "no_call": 4},
+        "token_count": 6,
+    }
+
+    summary = summarize_corpus_records([overlapping_record])
+    issues = audit_corpus_integrity([overlapping_record])
+
+    assert summary["shape_issue_count"] == 0
+    assert summary["masked_category_base_counts"] == {"filtered": 4, "no_call": 4}
+    assert issues["shape_issues"] == []
+
+
+def test_overlap_aware_integrity_still_flags_unique_callable_coverage_mismatches() -> None:
+    malformed_record = {
+        "sample_id": "cat-malformed",
+        "locus_id": "chr2:block-malformed",
+        "split": "train",
+        "source": "consensus",
+        "sequence": "NNNNAA",
+        "reference_sequence": "AACCAA",
+        "variant_count": 0,
+        "callable_bases": 3,
+        "filtered_bases": 4,
+        "no_call_bases": 4,
+        "other_masked_bases": 0,
+        "masked_base_counts": {"filtered": 4, "no_call": 4},
+        "token_count": 6,
+    }
+
+    summary = summarize_corpus_records([malformed_record])
+    issues = audit_corpus_integrity([malformed_record])
+
+    assert summary["shape_issue_count"] == 1
+    assert issues["shape_issues"] == [
+        {
+            "sample_id": "cat-malformed",
+            "locus_id": "chr2:block-malformed",
+            "issue": "status_counts_do_not_match_sequence_length",
+        }
+    ]
+
+
 def test_build_eda_payload_collects_sample_and_baseline_views(
     consensus_records, baseline_records
 ) -> None:

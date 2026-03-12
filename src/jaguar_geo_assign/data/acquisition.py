@@ -264,6 +264,7 @@ def classify_consensus_site(
     position: int | None = None,
     vcf_path: str | Path | None = None,
 ) -> ConsensusDecision:
+    normalized_alts = _normalize_alt_alleles(alts)
     allele_tokens = _validated_gt_tokens(
         genotype,
         sample_id=sample_id,
@@ -276,22 +277,28 @@ def classify_consensus_site(
     if allele_tokens is None:
         return ConsensusDecision(action="mask", category="no_call", replacement=None)
     if len(set(allele_tokens)) != 1:
-        category = "multiallelic" if len(alts) > 1 else "heterozygous"
+        category = "multiallelic" if len(normalized_alts) > 1 else "heterozygous"
         return ConsensusDecision(action="mask", category=category, replacement=None)
 
     allele_index = int(allele_tokens[0])
     if allele_index == 0:
         return ConsensusDecision(action="reference", category="homozygous_reference", replacement=ref)
-    if allele_index > len(alts):
+    if allele_index > len(normalized_alts):
         return ConsensusDecision(action="mask", category="invalid_alt_index", replacement=None)
-    if len(alts) > 1:
+    if len(normalized_alts) > 1:
         return ConsensusDecision(action="mask", category="multiallelic", replacement=None)
 
-    replacement = alts[allele_index - 1]
+    replacement = normalized_alts[allele_index - 1]
     if len(replacement) != len(ref):
         return ConsensusDecision(action="mask", category="indel", replacement=None)
     category = "homozygous_alternate"
     return ConsensusDecision(action="apply_alt", category=category, replacement=replacement)
+
+
+def _normalize_alt_alleles(alts: Sequence[str]) -> tuple[str, ...]:
+    if len(alts) == 1 and alts[0] == ".":
+        return ()
+    return tuple(alts)
 
 
 def _validated_gt_tokens(
@@ -493,7 +500,7 @@ def _prepare_consensus(
             chrom, pos_str, _, ref, alt_field, _, filter_value, _, format_field = fields[:9]
             if chrom not in contig_headers:
                 raise ContigMismatchError(f"Contig '{chrom}' from {sample_vcf} is absent from {reference_fasta}")
-            alts = alt_field.split(",") if alt_field else []
+            alts = _normalize_alt_alleles(alt_field.split(",") if alt_field else [])
             sample_format = dict(zip(format_field.split(":"), fields[sample_index].split(":"), strict=False))
             decision = classify_consensus_site(
                 ref,
