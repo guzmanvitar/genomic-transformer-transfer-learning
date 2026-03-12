@@ -36,6 +36,7 @@ def _build_realistic_records(*, total: int, source: str) -> list[dict[str, objec
                 "reference_sequence": reference_sequence,
                 "variant_count": 0 if sequence == reference_sequence else 1,
                 "callable_bases": len(sequence) - sequence.count("N"),
+                "unique_masked_bases": sequence.count("N"),
                 "filtered_bases": 0,
                 "no_call_bases": sequence.count("N"),
                 "token_count": max(1, len(sequence) // 4),
@@ -56,6 +57,7 @@ def consensus_records() -> list[dict[str, object]]:
             "reference_sequence": "ACGTACGT",
             "variant_count": 1,
             "callable_bases": 7,
+            "unique_masked_bases": 1,
             "filtered_bases": 0,
             "no_call_bases": 1,
             "token_count": 4,
@@ -69,6 +71,7 @@ def consensus_records() -> list[dict[str, object]]:
             "reference_sequence": "ACGTACGT",
             "variant_count": 1,
             "callable_bases": 8,
+            "unique_masked_bases": 0,
             "filtered_bases": 0,
             "no_call_bases": 0,
             "token_count": 4,
@@ -82,6 +85,7 @@ def consensus_records() -> list[dict[str, object]]:
             "reference_sequence": "ACGTACGT",
             "variant_count": 1,
             "callable_bases": 8,
+            "unique_masked_bases": 0,
             "filtered_bases": 0,
             "no_call_bases": 0,
             "token_count": 4,
@@ -101,6 +105,7 @@ def baseline_records() -> list[dict[str, object]]:
             "reference_sequence": "ACGTACGT",
             "variant_count": 0,
             "callable_bases": 8,
+            "unique_masked_bases": 0,
             "filtered_bases": 0,
             "no_call_bases": 0,
             "token_count": 4,
@@ -114,6 +119,7 @@ def baseline_records() -> list[dict[str, object]]:
             "reference_sequence": "ACGTACGA",
             "variant_count": 0,
             "callable_bases": 8,
+            "unique_masked_bases": 0,
             "filtered_bases": 0,
             "no_call_bases": 0,
             "token_count": 4,
@@ -207,6 +213,7 @@ def test_overlap_aware_integrity_accepts_overlapping_mask_tallies() -> None:
         "reference_sequence": "AACCAA",
         "variant_count": 0,
         "callable_bases": 2,
+        "unique_masked_bases": 4,
         "filtered_bases": 4,
         "no_call_bases": 4,
         "other_masked_bases": 0,
@@ -231,7 +238,8 @@ def test_overlap_aware_integrity_still_flags_unique_callable_coverage_mismatches
         "sequence": "NNNNAA",
         "reference_sequence": "AACCAA",
         "variant_count": 0,
-        "callable_bases": 3,
+        "callable_bases": 2,
+        "unique_masked_bases": 3,
         "filtered_bases": 4,
         "no_call_bases": 4,
         "other_masked_bases": 0,
@@ -383,6 +391,7 @@ def test_build_eda_payload_preserves_full_corpus_mask_totals_beyond_preview_trun
                     record.update(
                         sequence="ANCCAA",
                         callable_bases=5,
+                        unique_masked_bases=1,
                         filtered_bases=1,
                         masked_base_counts={"filtered": 1},
                     )
@@ -390,6 +399,7 @@ def test_build_eda_payload_preserves_full_corpus_mask_totals_beyond_preview_trun
                     record.update(
                         sequence="AACNAA",
                         callable_bases=5,
+                        unique_masked_bases=1,
                         no_call_bases=1,
                         masked_base_counts={"no_call": 1},
                     )
@@ -399,6 +409,7 @@ def test_build_eda_payload_preserves_full_corpus_mask_totals_beyond_preview_trun
                     record.update(
                         sequence="ANCNAA",
                         callable_bases=5,
+                        unique_masked_bases=1,
                         other_masked_bases=1,
                         masked_base_counts={"heterozygous": 1},
                     )
@@ -406,6 +417,7 @@ def test_build_eda_payload_preserves_full_corpus_mask_totals_beyond_preview_trun
                     record.update(
                         sequence="AANCNA",
                         callable_bases=5,
+                        unique_masked_bases=1,
                         other_masked_bases=1,
                         masked_base_counts={"multiallelic": 1},
                     )
@@ -413,6 +425,7 @@ def test_build_eda_payload_preserves_full_corpus_mask_totals_beyond_preview_trun
                     record.update(
                         sequence="AACCAN",
                         callable_bases=5,
+                        unique_masked_bases=1,
                         other_masked_bases=1,
                         masked_base_counts={"indel": 1},
                     )

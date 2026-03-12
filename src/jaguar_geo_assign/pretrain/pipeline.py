@@ -459,6 +459,7 @@ def _tokenized_windows_to_diagnostics_records(
             "reference_sequence": reference_sequence,
             "variant_count": variant_count,
             "callable_bases": _count_callable_bases(record.window.sequence),
+            "unique_masked_bases": record.window.unique_masked_bases,
             "filtered_bases": filtered_bases,
             "no_call_bases": no_call_bases,
             "other_masked_bases": other_masked_bases,

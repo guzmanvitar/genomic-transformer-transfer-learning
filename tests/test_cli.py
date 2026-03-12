@@ -72,6 +72,30 @@ def test_validate_feline_config_rejects_non_boolean_trust_remote_code(
     assert "Traceback" not in captured.err
 
 
+@pytest.mark.parametrize("field_name", ["require_assembly_match", "require_contig_match"])
+def test_validate_feline_config_rejects_non_boolean_consensus_mismatch_guards(
+    tmp_path: Path, capsys, field_name: str
+) -> None:
+    invalid_config = tmp_path / f"invalid_{field_name}.toml"
+    invalid_config.write_text(
+        Path("configs/examples/feline_pretrain.toml").read_text(encoding="utf-8").replace(
+            f"{field_name} = true",
+            f"{field_name} = 1",
+            1,
+        ),
+        encoding="utf-8",
+    )
+
+    exit_code = main(["validate-feline-config", str(invalid_config)])
+
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    assert f"consensus.{field_name} must be a TOML boolean true/false" in captured.out
+    assert "1 (int)" in captured.out
+    assert "Traceback" not in captured.out
+    assert "Traceback" not in captured.err
+
+
 def test_describe_feline_config_reports_split_contract(capsys) -> None:
     exit_code = main(["describe-feline-config", "configs/examples/feline_pretrain.toml"])
 
@@ -932,6 +956,7 @@ def test_runtime_diagnostics_handles_overlapping_mask_categories_without_callabl
             _synthetic_tokenized_window(index=0, source="consensus").window,
             sequence="NNNNAA",
             ambiguity_fraction=4 / 6,
+            unique_masked_bases=4,
             filtered_bases=4,
             no_call_bases=4,
             other_masked_bases=0,
@@ -947,11 +972,39 @@ def test_runtime_diagnostics_handles_overlapping_mask_categories_without_callabl
 
     sample = payload["consensus_samples"][0]
     assert sample["callable_bases"] == 2
+    assert sample["unique_masked_bases"] == 4
     assert sample["filtered_bases"] == 4
     assert sample["no_call_bases"] == 4
     assert sample["masked_base_counts"] == {"filtered": 4, "no_call": 4}
     assert payload["consensus_corpus"]["shape_issue_count"] == 0
     assert payload["consensus_corpus"]["masked_category_base_counts"] == {"filtered": 4, "no_call": 4}
+
+
+def test_runtime_diagnostics_flags_inconsistent_unique_masked_coverage() -> None:
+    malformed_window = replace(
+        _synthetic_tokenized_window(index=0, source="consensus"),
+        window=replace(
+            _synthetic_tokenized_window(index=0, source="consensus").window,
+            sequence="NNNNAA",
+            ambiguity_fraction=4 / 6,
+            unique_masked_bases=3,
+            filtered_bases=4,
+            no_call_bases=4,
+            other_masked_bases=0,
+            masked_base_counts=(("filtered", 4), ("no_call", 4)),
+        ),
+    )
+
+    payload = pretrain_pipeline._build_diagnostics_payload(
+        tokenized_consensus=(malformed_window,),
+        tokenized_baseline=(_synthetic_tokenized_window(index=0, source="reference"),),
+        consensus_results={},
+    )
+
+    sample = payload["consensus_samples"][0]
+    assert sample["callable_bases"] == 2
+    assert sample["unique_masked_bases"] == 3
+    assert payload["consensus_corpus"]["shape_issue_count"] == 1
 
 
 def test_pretrain_cli_reports_actionable_config_error(capsys) -> None:
@@ -1194,29 +1247,35 @@ def _synthetic_tokenized_window(*, index: int, source: str) -> TokenizedWindow:
     filtered_bases = 0
     no_call_bases = 0
     other_masked_bases = 0
+    unique_masked_bases = 0
     masked_base_counts: tuple[tuple[str, int], ...] = ()
     if source == "consensus":
         if index < pretrain_pipeline.DEFAULT_RUNTIME_DIAGNOSTIC_SAMPLE_LIMIT:
             if index % 2 == 0:
                 sequence = "ANCCAA"
+                unique_masked_bases = 1
                 filtered_bases = 1
                 masked_base_counts = (("filtered", 1),)
             else:
                 sequence = "AACNAA"
+                unique_masked_bases = 1
                 no_call_bases = 1
                 masked_base_counts = (("no_call", 1),)
         else:
             pattern = (index - pretrain_pipeline.DEFAULT_RUNTIME_DIAGNOSTIC_SAMPLE_LIMIT) % 3
             if pattern == 0:
                 sequence = "ANCNAA"
+                unique_masked_bases = 1
                 other_masked_bases = 1
                 masked_base_counts = (("heterozygous", 1),)
             elif pattern == 1:
                 sequence = "AANCNA"
+                unique_masked_bases = 1
                 other_masked_bases = 1
                 masked_base_counts = (("multiallelic", 1),)
             else:
                 sequence = "AACCAN"
+                unique_masked_bases = 1
                 other_masked_bases = 1
                 masked_base_counts = (("indel", 1),)
 
@@ -1235,6 +1294,7 @@ def _synthetic_tokenized_window(*, index: int, source: str) -> TokenizedWindow:
         gc_fraction=0.5,
         ambiguity_fraction=sequence.count("N") / len(sequence),
         sequence_hash=f"hash-{source}-{index}",
+        unique_masked_bases=unique_masked_bases,
         filtered_bases=filtered_bases,
         no_call_bases=no_call_bases,
         other_masked_bases=other_masked_bases,

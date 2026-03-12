@@ -19,6 +19,7 @@ SAMPLE_REQUIRED_FIELDS = frozenset(
         "reference_sequence",
         "variant_count",
         "callable_bases",
+        "unique_masked_bases",
         "filtered_bases",
         "no_call_bases",
         "token_count",
@@ -179,7 +180,11 @@ def audit_corpus_integrity(
     for record in summarized_records:
         locus_splits[str(record["locus_id"])].add(str(record["split"]))
         sequence = _normalize_sequence(str(record["sequence"]))
-        if _has_unique_coverage_mismatch(sequence, int(record["callable_bases"])):
+        if _has_unique_coverage_mismatch(
+            sequence_length=len(sequence),
+            callable_bases=int(record["callable_bases"]),
+            unique_masked_bases=int(record["unique_masked_bases"]),
+        ):
             shape_issues.append(
                 {
                     "sample_id": record["sample_id"],
@@ -249,6 +254,7 @@ def _summarize_record(
 
     variant_count = _coerce_nonnegative_int(record, "variant_count")
     callable_bases = _coerce_nonnegative_int(record, "callable_bases")
+    unique_masked_bases = _coerce_nonnegative_int(record, "unique_masked_bases")
     filtered_bases = _coerce_nonnegative_int(record, "filtered_bases")
     no_call_bases = _coerce_nonnegative_int(record, "no_call_bases")
     other_masked_bases = _coerce_optional_nonnegative_int(record, "other_masked_bases")
@@ -265,6 +271,7 @@ def _summarize_record(
         **dict(record),
         "sequence": sequence,
         "reference_sequence": reference_sequence,
+        "unique_masked_bases": unique_masked_bases,
         "masked_base_counts": masked_base_counts,
         "gc_fraction": round(
             _safe_fraction(sum(base in {"G", "C"} for base in sequence), canonical_bases), 6
@@ -431,9 +438,13 @@ def _coerce_masked_base_counts(
     return {category: count for category, count in sorted(counts.items())}
 
 
-def _has_unique_coverage_mismatch(sequence: str, callable_bases: int) -> bool:
-    unique_masked_bases = sum(base in MISSING_BASES for base in sequence)
-    return callable_bases + unique_masked_bases != len(sequence)
+def _has_unique_coverage_mismatch(
+    *,
+    sequence_length: int,
+    callable_bases: int,
+    unique_masked_bases: int,
+) -> bool:
+    return callable_bases + unique_masked_bases != sequence_length
 
 
 def _stream_corpus_summary(
@@ -485,7 +496,11 @@ def _stream_corpus_summary(
         _update_missingness_counts(sequence, missing_counts, total_counts)
         locus_splits[str(record["locus_id"])].add(str(record["split"]))
 
-        if _has_unique_coverage_mismatch(sequence, int(record["callable_bases"])):
+        if _has_unique_coverage_mismatch(
+            sequence_length=len(sequence),
+            callable_bases=int(record["callable_bases"]),
+            unique_masked_bases=int(record["unique_masked_bases"]),
+        ):
             shape_issue_count += 1
         if int(record["token_count"]) <= 0:
             shape_issue_count += 1

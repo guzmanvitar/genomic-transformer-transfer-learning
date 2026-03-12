@@ -194,6 +194,7 @@ class WindowRecord:
     gc_fraction: float
     ambiguity_fraction: float
     sequence_hash: str
+    unique_masked_bases: int = 0
     filtered_bases: int = 0
     no_call_bases: int = 0
     other_masked_bases: int = 0
@@ -295,7 +296,7 @@ class _WindowMaskCounter:
     def __post_init__(self) -> None:
         self.active_spans = []
 
-    def count(self, *, window_start: int, window_end: int) -> Counter[str]:
+    def summarize(self, *, window_start: int, window_end: int) -> tuple[Counter[str], int]:
         assert self.active_spans is not None
         while self.next_index < len(self.mask_spans) and self.mask_spans[self.next_index][0] < window_end:
             self.active_spans.append(self.mask_spans[self.next_index])
@@ -303,11 +304,30 @@ class _WindowMaskCounter:
         self.active_spans = [span for span in self.active_spans if span[1] > window_start]
 
         counts: Counter[str] = Counter()
+        overlapping_ranges: list[tuple[int, int]] = []
         for span_start, span_end, category in self.active_spans:
             overlap = min(window_end, span_end) - max(window_start, span_start)
             if overlap > 0:
                 counts[category] += overlap
-        return counts
+                overlapping_ranges.append((max(window_start, span_start), min(window_end, span_end)))
+        return counts, _count_unique_masked_bases(overlapping_ranges)
+
+
+def _count_unique_masked_bases(overlapping_ranges: list[tuple[int, int]]) -> int:
+    if not overlapping_ranges:
+        return 0
+
+    merged_ranges = sorted(overlapping_ranges)
+    merged_total = 0
+    current_start, current_end = merged_ranges[0]
+    for span_start, span_end in merged_ranges[1:]:
+        if span_start > current_end:
+            merged_total += current_end - current_start
+            current_start, current_end = span_start, span_end
+            continue
+        current_end = max(current_end, span_end)
+
+    return merged_total + (current_end - current_start)
 
 
 def prepare_sequences(
@@ -421,7 +441,10 @@ def window_sequences(
                 window_ambiguity = ambiguity_fraction(window_sequence)
                 if window_ambiguity > config.max_ambiguity_fraction:
                     continue
-                mask_counts = mask_counter.count(window_start=window_start, window_end=window_end)
+                mask_counts, unique_masked_bases = mask_counter.summarize(
+                    window_start=window_start,
+                    window_end=window_end,
+                )
                 filtered_bases = mask_counts.get("filtered", 0)
                 no_call_bases = mask_counts.get("no_call", 0)
                 other_masked_bases = sum(
@@ -443,6 +466,7 @@ def window_sequences(
                         gc_fraction=gc_fraction(window_sequence),
                         ambiguity_fraction=window_ambiguity,
                         sequence_hash=sha256(window_sequence.encode("utf-8")).hexdigest(),
+                        unique_masked_bases=unique_masked_bases,
                         filtered_bases=filtered_bases,
                         no_call_bases=no_call_bases,
                         other_masked_bases=other_masked_bases,
@@ -788,6 +812,7 @@ def _prepare_window_for_tokenization(
         gc_fraction=gc_fraction(normalized_sequence),
         ambiguity_fraction=ambiguity_fraction(normalized_sequence),
         sequence_hash=sha256(normalized_sequence.encode("utf-8")).hexdigest(),
+        unique_masked_bases=window.unique_masked_bases,
         filtered_bases=window.filtered_bases,
         no_call_bases=window.no_call_bases,
         other_masked_bases=window.other_masked_bases,

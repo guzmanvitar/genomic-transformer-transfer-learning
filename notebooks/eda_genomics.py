@@ -46,6 +46,7 @@ def build_realistic_records(*, total: int, source: str) -> list[dict[str, object
                 "reference_sequence": reference_sequence,
                 "variant_count": 0 if sequence == reference_sequence else 1,
                 "callable_bases": len(sequence) - sequence.count("N"),
+                "unique_masked_bases": sequence.count("N"),
                 "filtered_bases": 0,
                 "no_call_bases": sequence.count("N"),
                 "token_count": max(1, len(sequence) // 4),
