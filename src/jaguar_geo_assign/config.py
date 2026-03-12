@@ -17,6 +17,7 @@ from .data.pipeline_contract import (
     APPROVED_REFERENCE_ASSEMBLY,
     DNABERT2_TOKENIZER_ID,
     DNABERT2_TOKENIZER_REVISION,
+    DNABERT2_TRUST_REMOTE_CODE,
     EXPLICIT_CONSENSUS_POLICIES,
     GLOBAL_LOCUS_SPLIT_STRATEGY,
     POST_CONSENSUS_ALLOWED_ALPHABET,
@@ -97,6 +98,7 @@ class TokenizerConfig:
     allowed_alphabet: tuple[str, ...]
     unsupported_symbol_policy: str
     max_position_embeddings: int
+    trust_remote_code: bool
 
 
 @dataclass(frozen=True)
@@ -128,6 +130,15 @@ class FelinePipelineConfig:
     tokenizer: TokenizerConfig
     export: ExportConfig
     runtime: RuntimeConfig
+
+
+def _require_boolean_field(value: object, *, field_name: str) -> bool:
+    if type(value) is not bool:
+        raise ValueError(
+            f"{field_name} must be a TOML boolean true/false matching the approved DNABERT-2 contract; "
+            f"got {value!r} ({type(value).__name__})"
+        )
+    return value
 
 
 def load_experiment_config(path: str | Path) -> ExperimentConfig:
@@ -265,6 +276,15 @@ def load_feline_pipeline_config(path: str | Path) -> FelinePipelineConfig:
         max_position_embeddings = int(tokenizer["max_position_embeddings"])
         if max_position_embeddings < context_window:
             raise ValueError("tokenizer.max_position_embeddings must be >= windowing.context_window")
+        trust_remote_code = _require_boolean_field(
+            tokenizer["trust_remote_code"],
+            field_name="tokenizer.trust_remote_code",
+        )
+        if trust_remote_code is not DNABERT2_TRUST_REMOTE_CODE:
+            raise ValueError(
+                "tokenizer.trust_remote_code must remain "
+                f"{DNABERT2_TRUST_REMOTE_CODE} for the approved DNABERT-2 contract"
+            )
 
         if export["format"] != "parquet":
             raise ValueError("export.format must remain parquet for the approved v1 contract")
@@ -330,6 +350,7 @@ def load_feline_pipeline_config(path: str | Path) -> FelinePipelineConfig:
             allowed_alphabet=allowed_alphabet,
             unsupported_symbol_policy=tokenizer["unsupported_symbol_policy"],
             max_position_embeddings=max_position_embeddings,
+            trust_remote_code=trust_remote_code,
         ),
         export=ExportConfig(
             format=export["format"],
