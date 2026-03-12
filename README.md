@@ -85,12 +85,18 @@ With that config, the implemented pipeline is designed to materialize outputs in
 
 These artifacts describe corpus construction and diagnostics. They are **not** trained-model checkpoints or downstream jaguar assignment results.
 
+## Diagnostics workflow entry point
+
+The maintained exploratory diagnostics workflow lives at `notebooks/eda_genomics.py`.
+
+It is the canonical VS Code interactive `#%%` entry point for inspecting helper-backed genomics EDA outputs derived from the reporting layer and generated payload artifacts.
+
 ## Repository layout
 
 - `src/jaguar_geo_assign/`: package source, config loading, CLI, pipeline, tokenization, and reporting helpers
 - `configs/examples/`: versioned example configs, including the feline pretraining contract
 - `tests/`: regression coverage for CLI/config behavior, consensus semantics, preprocessing, tokenization, split safety, and diagnostics
-- `notebooks/`: exploratory diagnostics workflow entry points that consume generated reporting artifacts
+- `notebooks/eda_genomics.py`: canonical interactive genomics EDA workflow entry point
 - `data/`: ignored raw and processed data locations referenced by the pipeline config
 - `artifacts/`: ignored run summaries and other generated artifacts
 - `reports/generated/`: ignored generated diagnostics payloads and related report outputs
