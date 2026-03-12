@@ -132,10 +132,18 @@ class FelinePipelineConfig:
     runtime: RuntimeConfig
 
 
-def _require_boolean_field(value: object, *, field_name: str) -> bool:
+def _require_boolean_field(
+    value: object,
+    *,
+    field_name: str,
+    contract_description: str | None = None,
+) -> bool:
     if type(value) is not bool:
+        contract_suffix = ""
+        if contract_description is not None:
+            contract_suffix = f" matching {contract_description}"
         raise ValueError(
-            f"{field_name} must be a TOML boolean true/false matching the approved DNABERT-2 contract; "
+            f"{field_name} must be a TOML boolean true/false{contract_suffix}; "
             f"got {value!r} ({type(value).__name__})"
         )
     return value
@@ -224,7 +232,17 @@ def load_feline_pipeline_config(path: str | Path) -> FelinePipelineConfig:
             )
         if consensus["assembly"] != APPROVED_REFERENCE_ASSEMBLY:
             raise ValueError(f"consensus.assembly must remain {APPROVED_REFERENCE_ASSEMBLY}")
-        if not consensus["require_assembly_match"] or not consensus["require_contig_match"]:
+        require_assembly_match = _require_boolean_field(
+            consensus["require_assembly_match"],
+            field_name="consensus.require_assembly_match",
+            contract_description="the approved consensus mismatch-guard contract",
+        )
+        require_contig_match = _require_boolean_field(
+            consensus["require_contig_match"],
+            field_name="consensus.require_contig_match",
+            contract_description="the approved consensus mismatch-guard contract",
+        )
+        if not require_assembly_match or not require_contig_match:
             raise ValueError("consensus must fail fast on assembly and contig mismatches")
         if consensus["mask_symbol"] != "N":
             raise ValueError("consensus.mask_symbol must remain N")
@@ -279,6 +297,7 @@ def load_feline_pipeline_config(path: str | Path) -> FelinePipelineConfig:
         trust_remote_code = _require_boolean_field(
             tokenizer["trust_remote_code"],
             field_name="tokenizer.trust_remote_code",
+            contract_description="the approved DNABERT-2 contract",
         )
         if trust_remote_code is not DNABERT2_TRUST_REMOTE_CODE:
             raise ValueError(
@@ -319,8 +338,8 @@ def load_feline_pipeline_config(path: str | Path) -> FelinePipelineConfig:
         ),
         consensus=ConsensusConfig(
             assembly=consensus["assembly"],
-            require_assembly_match=bool(consensus["require_assembly_match"]),
-            require_contig_match=bool(consensus["require_contig_match"]),
+            require_assembly_match=require_assembly_match,
+            require_contig_match=require_contig_match,
             mask_symbol=consensus["mask_symbol"],
             homozygous_reference=consensus["homozygous_reference"],
             homozygous_alternate=consensus["homozygous_alternate"],
