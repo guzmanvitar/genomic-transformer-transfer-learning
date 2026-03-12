@@ -81,8 +81,18 @@ def test_tokenize_windows_pins_tokenizer_provenance() -> None:
 def test_tokenize_windows_enforces_max_position_embeddings() -> None:
     window = _window()
 
-    with pytest.raises(TokenizerContractError, match="max_position_embeddings"):
+    with pytest.raises(TokenizerContractError, match="Retained genomic window tokenized beyond max_position_embeddings") as exc_info:
         tokenize_windows((window,), TooLongTokenizer())
+
+    message = str(exc_info.value)
+    assert "observed token_count=606" in message
+    assert "max_position_embeddings=512" in message
+    assert "sample_id=sample-1" in message
+    assert "individual_id=cat-1" in message
+    assert "source=consensus" in message
+    assert "contig=chr1" in message
+    assert "locus_id=chr1:0-8" in message
+    assert "window=0-6" in message
 
 
 def test_tokenize_windows_rejects_unsupported_symbols_at_tokenizer_boundary() -> None:
