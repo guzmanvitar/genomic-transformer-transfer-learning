@@ -330,6 +330,10 @@ def _count_unique_masked_bases(overlapping_ranges: list[tuple[int, int]]) -> int
     return merged_total + (current_end - current_start)
 
 
+def _count_realized_unique_masked_bases(sequence: str, span_unique_masked_bases: int) -> int:
+    return max(span_unique_masked_bases, sequence.count("N"))
+
+
 def prepare_sequences(
     records: list[SequenceRecord],
     config: PreprocessingConfig,
@@ -441,9 +445,13 @@ def window_sequences(
                 window_ambiguity = ambiguity_fraction(window_sequence)
                 if window_ambiguity > config.max_ambiguity_fraction:
                     continue
-                mask_counts, unique_masked_bases = mask_counter.summarize(
+                mask_counts, span_unique_masked_bases = mask_counter.summarize(
                     window_start=window_start,
                     window_end=window_end,
+                )
+                unique_masked_bases = _count_realized_unique_masked_bases(
+                    window_sequence,
+                    span_unique_masked_bases,
                 )
                 filtered_bases = mask_counts.get("filtered", 0)
                 no_call_bases = mask_counts.get("no_call", 0)

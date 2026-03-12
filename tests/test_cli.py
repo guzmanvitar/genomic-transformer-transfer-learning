@@ -980,6 +980,56 @@ def test_runtime_diagnostics_handles_overlapping_mask_categories_without_callabl
     assert payload["consensus_corpus"]["masked_category_base_counts"] == {"filtered": 4, "no_call": 4}
 
 
+def test_runtime_diagnostics_accepts_retained_reference_window_with_realized_n_coverage() -> None:
+    config = preprocessor_module.PreprocessingConfig(
+        min_sequence_length=6,
+        max_ambiguity_fraction=1.0,
+        window_size=6,
+        window_stride=6,
+        locus_block_size=6,
+    )
+    prepared = preprocessor_module.prepare_sequences(
+        [
+            preprocessor_module.SequenceRecord(
+                "ref-1",
+                "reference",
+                "chr1",
+                "ACGNAA",
+                source="reference",
+            )
+        ],
+        config,
+    )
+    baseline_window = preprocessor_module.window_sequences(list(prepared.retained), config)[0]
+    baseline_tokenized_window = TokenizedWindow(
+        window=baseline_window,
+        input_ids=(101, 201, 202, 203, 204, 205, 206, 102),
+        attention_mask=(1, 1, 1, 1, 1, 1, 1, 1),
+        token_count=6,
+        token_to_base_ratio=1.0,
+        tokenizer=TokenizerProvenance(max_position_embeddings=8),
+    )
+
+    payload = pretrain_pipeline._build_diagnostics_payload(
+        tokenized_consensus=(),
+        tokenized_baseline=(baseline_tokenized_window,),
+        consensus_results={},
+    )
+    baseline_records = list(
+        pretrain_pipeline._tokenized_windows_to_diagnostics_records(
+            (baseline_tokenized_window,),
+            {("chr1", 0, 6): "ACGNAA"},
+        )
+    )
+
+    sample = baseline_records[0]
+    assert sample["sequence"] == "ACGNAA"
+    assert sample["callable_bases"] == 5
+    assert sample["unique_masked_bases"] == 1
+    assert sample["masked_base_counts"] == {}
+    assert payload["baseline_corpus"]["shape_issue_count"] == 0
+
+
 def test_runtime_diagnostics_flags_inconsistent_unique_masked_coverage() -> None:
     malformed_window = replace(
         _synthetic_tokenized_window(index=0, source="consensus"),
