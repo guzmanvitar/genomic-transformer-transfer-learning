@@ -1,3 +1,4 @@
+from dataclasses import replace
 import json
 import tarfile
 
@@ -32,6 +33,17 @@ class TooLongTokenizer:
         return {
             "input_ids": [1] * (len(sequence) + 600),
             "attention_mask": [1] * (len(sequence) + 600),
+        }
+
+
+class SelectiveTooLongTokenizer:
+    def __call__(self, sequence: str, **_: object) -> dict[str, list[int]]:
+        token_count = len(sequence) + 2
+        if sequence == "AACCGG":
+            token_count += 600
+        return {
+            "input_ids": [1] * token_count,
+            "attention_mask": [1] * token_count,
         }
 
 
@@ -93,6 +105,24 @@ def test_tokenize_windows_enforces_max_position_embeddings() -> None:
     assert "contig=chr1" in message
     assert "locus_id=chr1:0-8" in message
     assert "window=0-6" in message
+
+
+def test_tokenize_windows_fail_fast_instead_of_silently_skipping_over_length_window() -> None:
+    retained_window = _window(sequence="ACGT", sequence_hash="retained")
+    offending_window = replace(
+        _window(sequence="AACCGG", sequence_hash="offending"),
+        sample_id="sample-2",
+        individual_id="cat-2",
+        contig="chr2",
+        locus_id="chr2:8-16",
+        block_start=8,
+        block_end=16,
+        window_start=8,
+        window_end=14,
+    )
+
+    with pytest.raises(TokenizerContractError, match="sample_id=sample-2"):
+        tokenize_windows((retained_window, offending_window), SelectiveTooLongTokenizer())
 
 
 def test_tokenize_windows_rejects_unsupported_symbols_at_tokenizer_boundary() -> None:

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import multiprocessing
+import queue
 from pathlib import Path
 import stat
 import textwrap
@@ -263,8 +265,83 @@ def test_ensure_bcftools_available_raises_actionable_error() -> None:
         ensure_bcftools_available("bcftools-does-not-exist")
 
 
-def _write_fake_bcftools(tmp_path: Path) -> Path:
+def test_generate_consensus_fasta_handles_stderr_heavy_subprocess_without_hanging(tmp_path: Path) -> None:
+    sequence = "A" * 262_144
+    reference = tmp_path / "reference.fa"
+    reference.write_text(f">chr1 GCF_000181335.3 Felis_catus_9.0\n{sequence}\n", encoding="utf-8")
+    vcf = tmp_path / "cat_1.vcf"
+    vcf.write_text(
+        textwrap.dedent(
+            """\
+            ##fileformat=VCFv4.2
+            ##reference=GCF_000181335.3_Felis_catus_9.0
+            ##contig=<ID=chr1,length=262144>
+            #CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tcat_1
+            chr1\t2\t.\tA\tT\t.\tPASS\t.\tGT\t0/0
+            """
+        ),
+        encoding="utf-8",
+    )
+    fake_bcftools = _write_fake_bcftools(tmp_path, emit_stderr_before_stdin_bytes=262_144)
+    output_fasta = tmp_path / "cat_1.fa"
+    ctx = multiprocessing.get_context("spawn")
+    result_queue = ctx.Queue()
+    process = ctx.Process(
+        target=_run_generate_consensus_fasta,
+        args=(result_queue, reference, vcf, output_fasta, fake_bcftools),
+    )
+
+    process.start()
+    process.join(timeout=5)
+    if process.is_alive():
+        process.terminate()
+        process.join(timeout=1)
+        pytest.fail("generate_consensus_fasta hung when bcftools emitted stderr before consuming stdin")
+
+    try:
+        result = result_queue.get(timeout=1)
+    except queue.Empty as exc:
+        raise AssertionError(
+            f"consensus subprocess exited without a result payload (exit code {process.exitcode})"
+        ) from exc
+
+    assert process.exitcode == 0
+    assert result["ok"] is True, result.get("error")
+    assert result["applied_variant_count"] == 0
+    assert result["sequence_length"] == len(sequence)
+
+
+def _run_generate_consensus_fasta(result_queue, reference: Path, vcf: Path, output_fasta: Path, fake_bcftools: Path) -> None:  # noqa: ANN001
+    try:
+        result = generate_consensus_fasta(
+            sample_id="cat_1",
+            reference_fasta=reference,
+            sample_vcf=vcf,
+            output_fasta=output_fasta,
+            bcftools_executable=str(fake_bcftools),
+        )
+    except Exception as exc:  # noqa: BLE001
+        result_queue.put({"ok": False, "error": f"{type(exc).__name__}: {exc}"})
+        return
+
+    sequence = output_fasta.read_text(encoding="utf-8").splitlines()[1]
+    result_queue.put(
+        {
+            "ok": True,
+            "applied_variant_count": result.diagnostics.applied_variant_count,
+            "sequence_length": len(sequence),
+        }
+    )
+
+
+def _write_fake_bcftools(tmp_path: Path, *, emit_stderr_before_stdin_bytes: int = 0) -> Path:
     script = tmp_path / "fake_bcftools.py"
+    stderr_preamble = (
+        f"sys.stderr.write('E' * {emit_stderr_before_stdin_bytes})\n"
+        "sys.stderr.flush()\n"
+        if emit_stderr_before_stdin_bytes
+        else ""
+    )
     script.write_text(
         (
             "#!/usr/bin/env python3\n"
@@ -304,6 +381,7 @@ def _write_fake_bcftools(tmp_path: Path) -> Path:
             "        continue\n"
             "    index += 1\n"
             "vcf_path = Path(args[-1])\n"
+            f"{stderr_preamble}"
             "sequences = read_fasta(sys.stdin.read())\n"
             "if mask_path and mask_path.exists():\n"
             "    for line in mask_path.read_text(encoding='utf-8').splitlines():\n"

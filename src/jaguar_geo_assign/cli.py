@@ -85,18 +85,26 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0
 
     if args.command == "validate-feline-config":
-        config = load_feline_pipeline_config(args.config)
+        try:
+            config = load_feline_pipeline_config(args.config)
+        except ValueError as error:
+            print(str(error))
+            return 1
         print(f"Feline pipeline config '{config.name}' matches the approved contract.")
         return 0
 
     if args.command == "describe-feline-config":
-        print(describe_feline_pipeline(args.config))
+        try:
+            print(describe_feline_pipeline(args.config))
+        except ValueError as error:
+            print(str(error))
+            return 1
         return 0
 
     if args.command == "check-feline-runtime":
         try:
             config = check_feline_pipeline_runtime(args.config)
-        except RuntimeError as error:
+        except (RuntimeError, ValueError) as error:
             print(str(error))
             return 1
         print(

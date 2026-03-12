@@ -513,8 +513,10 @@ def tokenize_windows(
             raise TokenizerContractError("attention_mask must align with input_ids length")
         if len(input_ids) > provenance.max_position_embeddings:
             raise TokenizerContractError(
-                f"Tokenized length {len(input_ids)} exceeds max_position_embeddings "
-                f"{provenance.max_position_embeddings} for {window.locus_id}"
+                "Retained genomic window tokenized beyond max_position_embeddings: "
+                f"observed token_count={len(input_ids)}, "
+                f"max_position_embeddings={provenance.max_position_embeddings}, "
+                f"{_format_window_context(tokenization_window)}"
             )
         tokenized.append(
             TokenizedWindow(
@@ -638,7 +640,7 @@ def write_webdataset_shards(
         shard_index = len(shard_paths[split])
         shard_path = output_path / f"{split}-{shard_index:05d}.tar"
         with tarfile.open(shard_path, mode="w") as archive:
-            for record_offset, record in enumerate(shard_records):
+            for record in shard_records:
                 split_counts[split] += 1
                 sample_key = f"{split_counts[split] - 1:08d}"
                 payload = json.dumps(
@@ -719,6 +721,17 @@ def _prepare_window_for_tokenization(
         no_call_bases=window.no_call_bases,
         other_masked_bases=window.other_masked_bases,
         masked_base_counts=window.masked_base_counts,
+    )
+
+
+def _format_window_context(window: WindowRecord) -> str:
+    return (
+        f"sample_id={window.sample_id}, "
+        f"individual_id={window.individual_id}, "
+        f"source={window.source}, "
+        f"contig={window.contig}, "
+        f"locus_id={window.locus_id}, "
+        f"window={window.window_start}-{window.window_end}"
     )
 
 

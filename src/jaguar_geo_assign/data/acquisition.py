@@ -369,19 +369,26 @@ def generate_consensus_fasta(
                 stderr=subprocess.PIPE,
                 text=True,
             ) as completed:
-                if completed.stdin is None:
+                stdin_handle = completed.stdin
+                if stdin_handle is None:
                     raise AcquisitionError(f"bcftools consensus did not expose stdin for {sample_id}")
-                try:
-                    shutil.copyfileobj(reference_handle, completed.stdin)
-                except BrokenPipeError:
-                    pass
-                finally:
+
+                def _write_reference_to_stdin() -> None:
                     try:
-                        completed.stdin.close()
+                        shutil.copyfileobj(reference_handle, stdin_handle)
                     except BrokenPipeError:
                         pass
-                stderr_text = completed.stderr.read() if completed.stderr is not None else ""
-                return_code = completed.wait()
+                    finally:
+                        try:
+                            stdin_handle.close()
+                        except BrokenPipeError:
+                            pass
+
+                with ThreadPoolExecutor(max_workers=1) as stdin_writer:
+                    stdin_future = stdin_writer.submit(_write_reference_to_stdin)
+                    stderr_text = completed.stderr.read() if completed.stderr is not None else ""
+                    return_code = completed.wait()
+                    stdin_future.result()
     if return_code != 0:
         raise AcquisitionError(f"bcftools consensus failed for {sample_id}: {stderr_text.strip()}")
     return ConsensusResult(

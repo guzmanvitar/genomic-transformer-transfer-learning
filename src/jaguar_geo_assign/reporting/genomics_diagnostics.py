@@ -461,7 +461,7 @@ def _stream_corpus_summary(
     total_base_count = 0
     retained_window_count = 0
     sampled_records: list[dict[str, object]] = []
-    sampled_heap: list[tuple[int, dict[str, object]]] = []
+    sampled_heap: list[tuple[int, int, dict[str, object]]] = []
 
     for record_index, raw_record in enumerate(records):
         record = _summarize_record(raw_record, CORPUS_REQUIRED_FIELDS)

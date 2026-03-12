@@ -71,6 +71,22 @@ def test_check_feline_runtime_reports_missing_tool(
     assert "Missing required external tools" in captured.out
 
 
+@pytest.mark.parametrize(
+    "command",
+    ["validate-feline-config", "describe-feline-config", "check-feline-runtime"],
+)
+def test_feline_cli_inspection_commands_report_actionable_config_errors(
+    command: str, capsys
+) -> None:
+    exit_code = main([command, "configs/examples/fine_tune.toml"])
+
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    assert "Feline pipeline config is missing required sections" in captured.out
+    assert "Traceback" not in captured.out
+    assert "Traceback" not in captured.err
+
+
 def test_pretrain_cli_smoke_path_runs_fixture_pipeline(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys
 ) -> None:
