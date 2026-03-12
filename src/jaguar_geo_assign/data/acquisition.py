@@ -329,6 +329,26 @@ def _validated_gt_tokens(
     return allele_tokens
 
 
+def _raise_malformed_vcf_record(
+    *,
+    sample_vcf: Path,
+    sample_id: str,
+    line_number: int,
+    raw_record: str,
+    observed_columns: int,
+    expected_min_columns: int,
+) -> None:
+    record_preview = raw_record if raw_record else "<blank line>"
+    if len(record_preview) > 200:
+        record_preview = f"{record_preview[:197]}..."
+    raise AcquisitionError(
+        "Malformed VCF record "
+        f"in {sample_vcf} for sample '{sample_id}' at line {line_number}: expected at least "
+        f"{expected_min_columns} tab-delimited columns, found {observed_columns}; "
+        f"record={record_preview!r}"
+    )
+
+
 def ensure_bcftools_available(executable: str = "bcftools") -> str:
     resolved = shutil.which(executable)
     if not resolved:
@@ -461,7 +481,7 @@ def _prepare_consensus(
         sample_index: int | None = None
         header_contigs: set[str] = set()
         vcf_reference = ""
-        for line in source:
+        for line_number, line in enumerate(source, start=1):
             if line.startswith("##"):
                 if line.startswith("##contig=<ID="):
                     header_contigs.add(line.split("ID=", 1)[1].split(",", 1)[0].rstrip(">\n"))
@@ -496,7 +516,18 @@ def _prepare_consensus(
                 raise AcquisitionError(f"VCF {sample_vcf} is missing a #CHROM header row")
 
             total_records += 1
-            fields = line.rstrip("\n").split("\t")
+            raw_record = line.rstrip("\n")
+            fields = raw_record.split("\t")
+            expected_min_columns = max(9, sample_index + 1)
+            if len(fields) < expected_min_columns:
+                _raise_malformed_vcf_record(
+                    sample_vcf=sample_vcf,
+                    sample_id=sample_id,
+                    line_number=line_number,
+                    raw_record=raw_record,
+                    observed_columns=len(fields),
+                    expected_min_columns=expected_min_columns,
+                )
             chrom, pos_str, _, ref, alt_field, _, filter_value, _, format_field = fields[:9]
             if chrom not in contig_headers:
                 raise ContigMismatchError(f"Contig '{chrom}' from {sample_vcf} is absent from {reference_fasta}")
