@@ -50,6 +50,28 @@ def test_validate_feline_config_reports_success(capsys) -> None:
     assert "matches the approved contract" in captured.out
 
 
+def test_validate_feline_config_rejects_non_boolean_trust_remote_code(
+    tmp_path: Path, capsys
+) -> None:
+    invalid_config = tmp_path / "invalid_trust_remote_code.toml"
+    invalid_config.write_text(
+        Path("configs/examples/feline_pretrain.toml").read_text(encoding="utf-8").replace(
+            "trust_remote_code = true",
+            "trust_remote_code = 1",
+        ),
+        encoding="utf-8",
+    )
+
+    exit_code = main(["validate-feline-config", str(invalid_config)])
+
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    assert "tokenizer.trust_remote_code must be a TOML boolean true/false" in captured.out
+    assert "1 (int)" in captured.out
+    assert "Traceback" not in captured.out
+    assert "Traceback" not in captured.err
+
+
 def test_describe_feline_config_reports_split_contract(capsys) -> None:
     exit_code = main(["describe-feline-config", "configs/examples/feline_pretrain.toml"])
 
@@ -167,6 +189,7 @@ def test_pretrain_cli_smoke_path_runs_fixture_pipeline(
             allowed_alphabet = ["A", "C", "G", "T", "N"]
             unsupported_symbol_policy = "reject"
             max_position_embeddings = 8
+            trust_remote_code = true
 
             [export]
             format = "parquet"
@@ -192,10 +215,12 @@ def test_pretrain_cli_smoke_path_runs_fixture_pipeline(
                 "attention_mask": [1] * (len(sequence) + 2),
             }
 
-    def fake_tokenizer_loader() -> tuple[object, TokenizerProvenance]:
+    def fake_tokenizer_loader(
+        expected_provenance: TokenizerProvenance,
+    ) -> tuple[object, TokenizerProvenance]:
         return (
             FakeTokenizer(),
-            TokenizerProvenance(max_position_embeddings=8),
+            expected_provenance,
         )
 
     monkeypatch.setattr(pretrain_pipeline, "load_dnabert2_tokenizer", fake_tokenizer_loader)
@@ -225,6 +250,8 @@ def test_pretrain_cli_smoke_path_runs_fixture_pipeline(
     )
     assert consensus_metadata["export_format"] == "parquet"
     assert baseline_metadata["export_format"] == "parquet"
+    assert consensus_metadata["tokenizer"]["trust_remote_code"] is True
+    assert baseline_metadata["tokenizer"]["trust_remote_code"] is True
     consensus_files = [
         tmp_path / "processed" / "consensus_tokens" / relative_path
         for split in consensus_metadata["splits"].values()
@@ -380,6 +407,7 @@ def test_pretrain_pipeline_does_not_inflate_identical_reference_baseline_counts(
             allowed_alphabet = ["A", "C", "G", "T", "N"]
             unsupported_symbol_policy = "reject"
             max_position_embeddings = 8
+            trust_remote_code = true
 
             [export]
             format = "parquet"
@@ -408,8 +436,10 @@ def test_pretrain_pipeline_does_not_inflate_identical_reference_baseline_counts(
                 "attention_mask": [1] * (len(sequence) + 2),
             }
 
-    def fake_tokenizer_loader() -> tuple[object, TokenizerProvenance]:
-        return (FakeTokenizer(), TokenizerProvenance(max_position_embeddings=8))
+    def fake_tokenizer_loader(
+        expected_provenance: TokenizerProvenance,
+    ) -> tuple[object, TokenizerProvenance]:
+        return (FakeTokenizer(), expected_provenance)
 
     monkeypatch.setattr(pretrain_pipeline, "load_dnabert2_tokenizer", fake_tokenizer_loader)
     monkeypatch.setattr(preprocessor_module, "_load_pyarrow_parquet", _fake_pyarrow_parquet_backend)
@@ -545,6 +575,7 @@ def test_pretrain_pipeline_streams_fasta_records_and_prunes_only_non_emittable_b
             allowed_alphabet = ["A", "C", "G", "T", "N"]
             unsupported_symbol_policy = "reject"
             max_position_embeddings = 8
+            trust_remote_code = true
 
             [export]
             format = "parquet"
@@ -577,8 +608,10 @@ def test_pretrain_pipeline_streams_fasta_records_and_prunes_only_non_emittable_b
                 "attention_mask": [1] * (len(sequence) + 2),
             }
 
-    def fake_tokenizer_loader() -> tuple[object, TokenizerProvenance]:
-        return (FakeTokenizer(), TokenizerProvenance(max_position_embeddings=8))
+    def fake_tokenizer_loader(
+        expected_provenance: TokenizerProvenance,
+    ) -> tuple[object, TokenizerProvenance]:
+        return (FakeTokenizer(), expected_provenance)
 
     monkeypatch.setattr(pretrain_pipeline, "load_dnabert2_tokenizer", fake_tokenizer_loader)
     monkeypatch.setattr(pretrain_pipeline, "prepare_sequences", recording_prepare_sequences)
@@ -699,6 +732,7 @@ def test_pretrain_cli_smoke_path_accepts_gzip_fasta_inputs(
             allowed_alphabet = ["A", "C", "G", "T", "N"]
             unsupported_symbol_policy = "reject"
             max_position_embeddings = 8
+            trust_remote_code = true
 
             [export]
             format = "parquet"
@@ -724,8 +758,10 @@ def test_pretrain_cli_smoke_path_accepts_gzip_fasta_inputs(
                 "attention_mask": [1] * (len(sequence) + 2),
             }
 
-    def fake_tokenizer_loader() -> tuple[object, TokenizerProvenance]:
-        return (FakeTokenizer(), TokenizerProvenance(max_position_embeddings=8))
+    def fake_tokenizer_loader(
+        expected_provenance: TokenizerProvenance,
+    ) -> tuple[object, TokenizerProvenance]:
+        return (FakeTokenizer(), expected_provenance)
 
     monkeypatch.setattr(pretrain_pipeline, "load_dnabert2_tokenizer", fake_tokenizer_loader)
     monkeypatch.setattr(preprocessor_module, "_load_pyarrow_parquet", _fake_pyarrow_parquet_backend)
@@ -1001,6 +1037,7 @@ def test_pretrain_cli_reports_actionable_parquet_dependency_error(
             allowed_alphabet = ["A", "C", "G", "T", "N"]
             unsupported_symbol_policy = "reject"
             max_position_embeddings = 8
+            trust_remote_code = true
 
             [export]
             format = "parquet"
@@ -1026,8 +1063,10 @@ def test_pretrain_cli_reports_actionable_parquet_dependency_error(
                 "attention_mask": [1] * (len(sequence) + 2),
             }
 
-    def fake_tokenizer_loader() -> tuple[object, TokenizerProvenance]:
-        return (FakeTokenizer(), TokenizerProvenance(max_position_embeddings=8))
+    def fake_tokenizer_loader(
+        expected_provenance: TokenizerProvenance,
+    ) -> tuple[object, TokenizerProvenance]:
+        return (FakeTokenizer(), expected_provenance)
 
     monkeypatch.setattr(pretrain_pipeline, "load_dnabert2_tokenizer", fake_tokenizer_loader)
     monkeypatch.setattr(preprocessor_module, "_load_pyarrow_parquet", _raise_missing_pyarrow)

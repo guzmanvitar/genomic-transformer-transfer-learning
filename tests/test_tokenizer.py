@@ -78,6 +78,27 @@ def _window(*, sequence: str = "ACGTNN", sequence_hash: str = "hash") -> WindowR
     )
 
 
+def _tokenized_window(**window_overrides: object) -> TokenizedWindow:
+    return TokenizedWindow(
+        window=replace(_window(), **window_overrides),
+        input_ids=(1, 2, 3),
+        attention_mask=(1, 1, 1),
+        token_count=3,
+        token_to_base_ratio=0.5,
+        tokenizer=TokenizerProvenance(),
+    )
+
+
+def _read_webdataset_records(shard_path) -> list[dict[str, object]]:
+    payloads: list[dict[str, object]] = []
+    with tarfile.open(shard_path, mode="r") as archive:
+        for member in sorted(archive.getmembers(), key=lambda item: item.name):
+            extracted = archive.extractfile(member)
+            assert extracted is not None
+            payloads.append(json.loads(extracted.read().decode("utf-8")))
+    return payloads
+
+
 def test_tokenize_windows_pins_tokenizer_provenance() -> None:
     window = _window()
 
@@ -268,11 +289,23 @@ def test_write_tokenized_dataset_emits_real_parquet_artifact_and_schema(tmp_path
     assert payload["tokenizer"]["unsupported_symbol_policy"] == "reject"
 
 
+def test_write_tokenized_dataset_requires_explicit_provenance_for_empty_export(tmp_path) -> None:
+    with pytest.raises(ExportContractError, match="explicit tokenizer provenance"):
+        write_tokenized_dataset(
+            (),
+            tmp_path,
+            contract=ExportContract(
+                format="parquet",
+                row_group_size=1,
+                preserve_raw_windows=False,
+                preserve_sequence_hashes=True,
+                preserve_coordinates=True,
+            ),
+        )
+
+
 def test_write_webdataset_shards_persists_retokenization_provenance(tmp_path) -> None:
-    window = WindowRecord(
-        sample_id="sample-1",
-        individual_id="cat-1",
-        contig="chr1",
+    tokenized = _tokenized_window(
         source="reference",
         split="validation",
         locus_id="chr1:8-16",
@@ -281,17 +314,8 @@ def test_write_webdataset_shards_persists_retokenization_provenance(tmp_path) ->
         window_start=8,
         window_end=14,
         sequence="AACCGT",
-        gc_fraction=0.5,
         ambiguity_fraction=0.0,
         sequence_hash="abc123",
-    )
-    tokenized = TokenizedWindow(
-        window=window,
-        input_ids=(1, 2, 3),
-        attention_mask=(1, 1, 1),
-        token_count=3,
-        token_to_base_ratio=0.5,
-        tokenizer=TokenizerProvenance(),
     )
 
     shard_paths = write_webdataset_shards((tokenized,), tmp_path, records_per_shard=1)
@@ -306,3 +330,102 @@ def test_write_webdataset_shards_persists_retokenization_provenance(tmp_path) ->
         payload = json.loads(member.read().decode("utf-8"))
     assert payload["window"]["sequence"] == "AACCGT"
     assert payload["window"]["sequence_hash"] == "abc123"
+
+
+def test_write_webdataset_shards_default_sizing_stays_split_pure(tmp_path) -> None:
+    tokenized = (
+        _tokenized_window(
+            sample_id="train-sample",
+            individual_id="cat-train",
+            split="train",
+            sequence_hash="train-hash",
+        ),
+        _tokenized_window(
+            sample_id="validation-sample",
+            individual_id="cat-validation",
+            split="validation",
+            locus_id="chr1:8-16",
+            block_start=8,
+            block_end=16,
+            window_start=8,
+            window_end=14,
+            sequence_hash="validation-hash",
+        ),
+    )
+
+    shard_paths = write_webdataset_shards(tokenized, tmp_path)
+
+    metadata = json.loads((tmp_path / "metadata.json").read_text(encoding="utf-8"))
+    assert metadata["records_per_shard"] is None
+    assert metadata["splits"]["train"]["shards"] == ["train-00000.tar"]
+    assert metadata["splits"]["validation"]["shards"] == ["validation-00000.tar"]
+    for split, paths in shard_paths.items():
+        assert len(paths) == 1
+        records = _read_webdataset_records(paths[0])
+        assert {record["window"]["split"] for record in records} == {split}
+
+
+def test_write_webdataset_shards_oversize_shard_request_stays_within_split(tmp_path) -> None:
+    tokenized = (
+        _tokenized_window(sample_id="train-1", individual_id="cat-train-1", split="train", sequence_hash="train-1"),
+        _tokenized_window(
+            sample_id="train-2",
+            individual_id="cat-train-2",
+            split="train",
+            locus_id="chr1:8-16",
+            block_start=8,
+            block_end=16,
+            window_start=8,
+            window_end=14,
+            sequence_hash="train-2",
+        ),
+        _tokenized_window(
+            sample_id="validation-1",
+            individual_id="cat-validation-1",
+            split="validation",
+            contig="chr2",
+            locus_id="chr2:0-8",
+            sequence_hash="validation-1",
+        ),
+    )
+
+    shard_paths = write_webdataset_shards(tokenized, tmp_path, records_per_shard=10)
+
+    assert [path.name for path in shard_paths["train"]] == ["train-00000.tar"]
+    assert [path.name for path in shard_paths["validation"]] == ["validation-00000.tar"]
+    assert len(_read_webdataset_records(shard_paths["train"][0])) == 2
+    assert len(_read_webdataset_records(shard_paths["validation"][0])) == 1
+
+
+def test_write_webdataset_shards_does_not_bridge_train_validation_boundary(tmp_path) -> None:
+    tokenized = (
+        _tokenized_window(sample_id="train-1", individual_id="cat-train-1", split="train", sequence_hash="train-1"),
+        _tokenized_window(
+            sample_id="validation-1",
+            individual_id="cat-validation-1",
+            split="validation",
+            locus_id="chr1:8-16",
+            block_start=8,
+            block_end=16,
+            window_start=8,
+            window_end=14,
+            sequence_hash="validation-1",
+        ),
+        _tokenized_window(
+            sample_id="validation-2",
+            individual_id="cat-validation-2",
+            split="validation",
+            contig="chr2",
+            locus_id="chr2:0-8",
+            sequence_hash="validation-2",
+        ),
+    )
+
+    shard_paths = write_webdataset_shards(tokenized, tmp_path, records_per_shard=2)
+
+    assert [path.name for path in shard_paths["train"]] == ["train-00000.tar"]
+    assert [path.name for path in shard_paths["validation"]] == ["validation-00000.tar"]
+    assert {record["window"]["split"] for record in _read_webdataset_records(shard_paths["train"][0])} == {"train"}
+    assert {
+        record["window"]["split"] for record in _read_webdataset_records(shard_paths["validation"][0])
+    } == {"validation"}

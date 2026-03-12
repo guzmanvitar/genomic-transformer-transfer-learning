@@ -26,8 +26,8 @@ from ..data.preprocessor import (
 )
 from ..reporting import build_eda_payload
 
-TokenizerLoader = Callable[[], tuple[object, TokenizerProvenance]]
-ExportWriter = Callable[[tuple[TokenizedWindow, ...], Path, FelinePipelineConfig], Path]
+TokenizerLoader = Callable[[TokenizerProvenance], tuple[object, TokenizerProvenance]]
+ExportWriter = Callable[[tuple[TokenizedWindow, ...], Path, FelinePipelineConfig, TokenizerProvenance], Path]
 DEFAULT_RUNTIME_DIAGNOSTIC_SAMPLE_LIMIT = 128
 
 
@@ -92,7 +92,8 @@ def run_feline_pretrain_pipeline(
     )
 
     preprocessing_config = _build_preprocessing_config(config)
-    tokenizer, provenance = tokenizer_loader()
+    expected_provenance = _build_tokenizer_provenance(config)
+    tokenizer, provenance = tokenizer_loader(expected_provenance)
     _assert_tokenizer_matches_config(config, provenance)
 
     tokenized_consensus = _tokenize_sequence_records(
@@ -112,8 +113,8 @@ def run_feline_pretrain_pipeline(
     if not tokenized_baseline:
         raise RuntimeError("No baseline windows survived preprocessing; check the reference FASTA and window settings")
 
-    consensus_export = export_writer(tokenized_consensus, processed_dir / "consensus_tokens", config)
-    baseline_export = export_writer(tokenized_baseline, baseline_dir / "reference_tokens", config)
+    consensus_export = export_writer(tokenized_consensus, processed_dir / "consensus_tokens", config, provenance)
+    baseline_export = export_writer(tokenized_baseline, baseline_dir / "reference_tokens", config, provenance)
 
     diagnostics_payload = _build_diagnostics_payload(
         tokenized_consensus=tokenized_consensus,
@@ -220,14 +221,22 @@ def write_tokenized_corpus(
     tokenized_windows: tuple[TokenizedWindow, ...],
     output_path: str | Path,
     config: FelinePipelineConfig,
+    provenance: TokenizerProvenance,
 ) -> Path:
     destination = Path(output_path)
     write_tokenized_dataset(
         tokenized_windows,
         destination,
         contract=_build_export_contract(config),
+        provenance=provenance,
     )
     return destination
+
+
+def _require_runtime_boolean(value: object, *, field_name: str) -> bool:
+    if type(value) is not bool:
+        raise RuntimeError(f"{field_name} must be an actual boolean, got {value!r} ({type(value).__name__})")
+    return value
 
 
 def _build_preprocessing_config(config: FelinePipelineConfig) -> PreprocessingConfig:
@@ -240,6 +249,17 @@ def _build_preprocessing_config(config: FelinePipelineConfig) -> PreprocessingCo
         ambiguity_mode=(
             "reject" if config.tokenizer.unsupported_symbol_policy == "reject" else "mask"
         ),
+    )
+
+
+def _build_tokenizer_provenance(config: FelinePipelineConfig) -> TokenizerProvenance:
+    return TokenizerProvenance(
+        identifier=config.tokenizer.identifier,
+        revision=config.tokenizer.revision,
+        max_position_embeddings=config.tokenizer.max_position_embeddings,
+        allowed_alphabet=config.tokenizer.allowed_alphabet,
+        unsupported_symbol_policy=config.tokenizer.unsupported_symbol_policy,
+        trust_remote_code=config.tokenizer.trust_remote_code,
     )
 
 
@@ -263,6 +283,18 @@ def _assert_tokenizer_matches_config(
     if provenance.unsupported_symbol_policy != config.tokenizer.unsupported_symbol_policy:
         raise RuntimeError(
             "Tokenizer loader unsupported_symbol_policy does not match the approved config"
+        )
+    expected_trust_remote_code = _require_runtime_boolean(
+        config.tokenizer.trust_remote_code,
+        field_name="Config tokenizer trust_remote_code",
+    )
+    actual_trust_remote_code = _require_runtime_boolean(
+        provenance.trust_remote_code,
+        field_name="Tokenizer loader trust_remote_code",
+    )
+    if actual_trust_remote_code is not expected_trust_remote_code:
+        raise RuntimeError(
+            "Tokenizer loader trust_remote_code does not match the approved config"
         )
 
 

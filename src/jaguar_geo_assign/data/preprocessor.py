@@ -14,6 +14,7 @@ from typing import Any, Protocol
 from .pipeline_contract import (
     DNABERT2_TOKENIZER_ID,
     DNABERT2_TOKENIZER_REVISION as DNABERT2_TOKENIZER_REVISION_HASH,
+    DNABERT2_TRUST_REMOTE_CODE,
     POST_CONSENSUS_ALLOWED_ALPHABET,
 )
 
@@ -50,6 +51,17 @@ class ExportContractError(ValueError):
     """Raised when export settings violate the approved artifact contract."""
 
 
+def _require_boolean_trust_remote_code(
+    value: object,
+    *,
+    field_name: str,
+    error_type: type[ValueError] = ValueError,
+) -> bool:
+    if type(value) is not bool:
+        raise error_type(f"{field_name} must be an actual boolean, got {value!r} ({type(value).__name__})")
+    return value
+
+
 @dataclass(frozen=True)
 class TokenizerProvenance:
     identifier: str = DNABERT2_TOKENIZER_NAME
@@ -57,7 +69,7 @@ class TokenizerProvenance:
     max_position_embeddings: int = DNABERT2_MAX_POSITION_EMBEDDINGS
     allowed_alphabet: tuple[str, ...] = ALLOWED_DNA_ALPHABET
     unsupported_symbol_policy: str = DEFAULT_UNSUPPORTED_SYMBOL_POLICY
-    trust_remote_code: bool = True
+    trust_remote_code: bool = DNABERT2_TRUST_REMOTE_CODE
 
     def __post_init__(self) -> None:
         if self.identifier != DNABERT2_TOKENIZER_NAME:
@@ -68,6 +80,10 @@ class TokenizerProvenance:
             raise ValueError("Tokenizer provenance allowed_alphabet must match A/C/G/T/N")
         if self.unsupported_symbol_policy not in {"reject", "normalize_to_n"}:
             raise ValueError("unsupported_symbol_policy must be reject or normalize_to_n")
+        _require_boolean_trust_remote_code(
+            self.trust_remote_code,
+            field_name="Tokenizer provenance trust_remote_code",
+        )
 
 
 DNABERT2_TOKENIZER_PROVENANCE = TokenizerProvenance()
@@ -480,7 +496,10 @@ def assert_split_safety(windows: tuple[WindowRecord, ...]) -> None:
             active.append(window)
 
 
-def load_dnabert2_tokenizer() -> tuple[TokenizerLike, TokenizerProvenance]:
+def load_dnabert2_tokenizer(
+    provenance: TokenizerProvenance = DNABERT2_TOKENIZER_PROVENANCE,
+) -> tuple[TokenizerLike, TokenizerProvenance]:
+    _assert_approved_dnabert2_trust_policy(provenance.trust_remote_code)
     try:
         from transformers import AutoTokenizer
     except ImportError as exc:  # pragma: no cover - exercised through integration, not unit logic
@@ -490,11 +509,48 @@ def load_dnabert2_tokenizer() -> tuple[TokenizerLike, TokenizerProvenance]:
         ) from exc
 
     tokenizer = AutoTokenizer.from_pretrained(
-        DNABERT2_TOKENIZER_PROVENANCE.identifier,
-        revision=DNABERT2_TOKENIZER_PROVENANCE.revision,
-        trust_remote_code=DNABERT2_TOKENIZER_PROVENANCE.trust_remote_code,
+        provenance.identifier,
+        revision=provenance.revision,
+        trust_remote_code=provenance.trust_remote_code,
     )
-    return tokenizer, DNABERT2_TOKENIZER_PROVENANCE
+    return tokenizer, provenance
+
+
+def _assert_approved_dnabert2_trust_policy(trust_remote_code: bool) -> None:
+    trust_remote_code = _require_boolean_trust_remote_code(
+        trust_remote_code,
+        field_name="DNABERT-2 trust_remote_code policy",
+        error_type=TokenizerContractError,
+    )
+    if trust_remote_code is not DNABERT2_TRUST_REMOTE_CODE:
+        raise TokenizerContractError(
+            "DNABERT-2 trust_remote_code policy mismatch: "
+            f"expected {DNABERT2_TRUST_REMOTE_CODE}, got {trust_remote_code}. "
+            "Use the approved pipeline contract value explicitly."
+        )
+
+
+def _resolve_export_tokenizer_provenance(
+    tokenized_windows: tuple[TokenizedWindow, ...],
+    *,
+    provenance: TokenizerProvenance | None,
+) -> TokenizerProvenance:
+    if tokenized_windows:
+        resolved = tokenized_windows[0].tokenizer
+        _assert_approved_dnabert2_trust_policy(resolved.trust_remote_code)
+        if any(record.tokenizer != resolved for record in tokenized_windows[1:]):
+            raise ExportContractError("All tokenized windows must share identical tokenizer provenance")
+        if provenance is not None and provenance != resolved:
+            raise ExportContractError(
+                "Explicit tokenizer provenance does not match the tokenized window metadata"
+            )
+        return resolved
+    if provenance is None:
+        raise ExportContractError(
+            "Tokenized export metadata requires explicit tokenizer provenance when no tokenized windows are available"
+        )
+    _assert_approved_dnabert2_trust_policy(provenance.trust_remote_code)
+    return provenance
 
 
 def tokenize_windows(
@@ -536,6 +592,7 @@ def write_tokenized_dataset(
     output_dir: str | Path,
     *,
     contract: ExportContract = DEFAULT_PARQUET_EXPORT_CONTRACT,
+    provenance: TokenizerProvenance | None = None,
 ) -> dict[str, list[Path]]:
     if contract.format != "parquet":
         raise ExportContractError(
@@ -556,6 +613,10 @@ def write_tokenized_dataset(
             item.window.sample_id,
             item.window.source,
         ),
+    )
+    metadata_provenance = _resolve_export_tokenizer_provenance(
+        tuple(sorted_records),
+        provenance=provenance,
     )
     manifest = build_split_manifest(tuple(item.window for item in sorted_records))
 
@@ -590,7 +651,7 @@ def write_tokenized_dataset(
         "preserve_sequence_hashes": contract.preserve_sequence_hashes,
         "row_group_size": contract.row_group_size,
         "sequence_hash_algorithm": contract.sequence_hash_algorithm,
-        "tokenizer": asdict(sorted_records[0].tokenizer) if sorted_records else asdict(DNABERT2_TOKENIZER_PROVENANCE),
+        "tokenizer": asdict(metadata_provenance),
         "splits": {
             split: {
                 "record_count": len([item for item in sorted_records if item.window.split == split]),
@@ -609,6 +670,7 @@ def write_webdataset_shards(
     output_dir: str | Path,
     *,
     records_per_shard: int | None = None,
+    provenance: TokenizerProvenance | None = None,
 ) -> dict[str, list[Path]]:
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
@@ -627,6 +689,10 @@ def write_webdataset_shards(
             item.window.sample_id,
             item.window.source,
         ),
+    )
+    metadata_provenance = _resolve_export_tokenizer_provenance(
+        tuple(sorted_records),
+        provenance=provenance,
     )
 
     shard_paths: dict[str, list[Path]] = defaultdict(list)
@@ -673,7 +739,7 @@ def write_webdataset_shards(
     metadata = {
         "export_format": "webdataset",
         "records_per_shard": requested_records_per_shard,
-        "tokenizer": asdict(DNABERT2_TOKENIZER_PROVENANCE),
+        "tokenizer": asdict(metadata_provenance),
         "splits": {
             split: {
                 "record_count": len(records),

@@ -46,6 +46,7 @@ revision = "7bce263b15377fc15361f52cfab88f8b586abda0"
 allowed_alphabet = ["A", "C", "G", "T", "N"]
 unsupported_symbol_policy = "reject"
 max_position_embeddings = 512
+trust_remote_code = true
 
 [export]
 format = "parquet"
