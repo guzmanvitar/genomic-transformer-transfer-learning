@@ -613,9 +613,8 @@ def write_webdataset_shards(
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
 
-    if records_per_shard is None:
-        records_per_shard = max(1, len(tokenized_windows) or 1)
-    if records_per_shard <= 0:
+    requested_records_per_shard = records_per_shard
+    if requested_records_per_shard is not None and requested_records_per_shard <= 0:
         raise ValueError("records_per_shard must be positive")
 
     sorted_records = sorted(
@@ -631,51 +630,57 @@ def write_webdataset_shards(
     )
 
     shard_paths: dict[str, list[Path]] = defaultdict(list)
+    split_records: dict[str, list[TokenizedWindow]] = defaultdict(list)
     split_counts: dict[str, int] = defaultdict(int)
     manifest = build_split_manifest(tuple(item.window for item in sorted_records))
+    for record in sorted_records:
+        split_records[record.window.split].append(record)
 
-    for index in range(0, len(sorted_records), records_per_shard):
-        shard_records = sorted_records[index : index + records_per_shard]
-        split = shard_records[0].window.split if shard_records else "empty"
-        shard_index = len(shard_paths[split])
-        shard_path = output_path / f"{split}-{shard_index:05d}.tar"
-        with tarfile.open(shard_path, mode="w") as archive:
-            for record in shard_records:
-                split_counts[split] += 1
-                sample_key = f"{split_counts[split] - 1:08d}"
-                payload = json.dumps(
-                    _export_record(
-                        record,
-                        contract=ExportContract(
-                            format="webdataset",
-                            row_group_size=records_per_shard,
-                            preserve_raw_windows=True,
-                            preserve_sequence_hashes=True,
-                            preserve_coordinates=True,
+    for split in sorted(split_records):
+        records = split_records[split]
+        split_shard_size = requested_records_per_shard or max(1, len(records))
+        for index in range(0, len(records), split_shard_size):
+            shard_records = records[index : index + split_shard_size]
+            shard_index = len(shard_paths[split])
+            shard_path = output_path / f"{split}-{shard_index:05d}.tar"
+            with tarfile.open(shard_path, mode="w") as archive:
+                for record in shard_records:
+                    split_counts[split] += 1
+                    sample_key = f"{split_counts[split] - 1:08d}"
+                    payload = json.dumps(
+                        _export_record(
+                            record,
+                            contract=ExportContract(
+                                format="webdataset",
+                                row_group_size=split_shard_size,
+                                preserve_raw_windows=True,
+                                preserve_sequence_hashes=True,
+                                preserve_coordinates=True,
+                            ),
                         ),
-                    ),
-                    sort_keys=True,
-                ).encode("utf-8")
-                tar_info = tarfile.TarInfo(name=f"{sample_key}.json")
-                tar_info.size = len(payload)
-                tar_info.mtime = 0
-                tar_info.uid = 0
-                tar_info.gid = 0
-                tar_info.uname = ""
-                tar_info.gname = ""
-                archive.addfile(tar_info, BytesIO(payload))
-        shard_paths[split].append(shard_path)
+                        sort_keys=True,
+                    ).encode("utf-8")
+                    tar_info = tarfile.TarInfo(name=f"{sample_key}.json")
+                    tar_info.size = len(payload)
+                    tar_info.mtime = 0
+                    tar_info.uid = 0
+                    tar_info.gid = 0
+                    tar_info.uname = ""
+                    tar_info.gname = ""
+                    archive.addfile(tar_info, BytesIO(payload))
+            shard_paths[split].append(shard_path)
 
     metadata = {
         "export_format": "webdataset",
-        "records_per_shard": records_per_shard,
+        "records_per_shard": requested_records_per_shard,
         "tokenizer": asdict(DNABERT2_TOKENIZER_PROVENANCE),
         "splits": {
             split: {
-                "record_count": len([item for item in sorted_records if item.window.split == split]),
+                "record_count": len(records),
                 "shards": [path.name for path in paths],
             }
-            for split, paths in sorted(shard_paths.items())
+            for split, records in sorted(split_records.items())
+            for paths in [shard_paths[split]]
         },
         "split_manifest": [asdict(entry) for entry in manifest],
     }
