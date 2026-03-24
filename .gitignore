@@ -215,3 +215,8 @@ reports/generated/*
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+
+# AI dev
+dev_docs
+.intent
