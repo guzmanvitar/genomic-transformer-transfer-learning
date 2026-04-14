@@ -1,4 +1,16 @@
-"""Command-line entry points for the bootstrap scaffold."""
+"""Command-line entry points for the jaguar-geo-assign toolkit.
+
+This module wires every user-facing CLI sub-command to its backend
+implementation.  ``build_parser`` defines the argument grammar while
+``main`` dispatches to the correct pipeline stage.
+
+**Fragility flag – dispatch pattern:**  ``main`` uses an explicit
+``if``-chain rather than a command→callable mapping dict.  This is
+intentional: each branch carries bespoke argument unpacking and
+error-handling that would be obscured by a generic dispatcher.
+Do **not** refactor into a lookup table without first auditing every
+branch's error contract.
+"""
 
 from __future__ import annotations
 
@@ -18,6 +30,23 @@ from .pretrain import format_feline_pretrain_result, run_feline_pretrain_pipelin
 
 
 def build_parser() -> argparse.ArgumentParser:
+    """Construct the top-level argument parser with all sub-commands.
+
+    The parser exposes the following sub-commands:
+
+    * ``pretrain`` – run the feline genomics pretraining data pipeline.
+    * ``fine-tune``, ``evaluate``, ``baseline-evaluate``, ``report`` –
+      scaffold placeholders for later pipeline stages.
+    * ``validate-config`` – validate a bootstrap TOML config.
+    * ``describe-experiment`` – summarise a bootstrap TOML config.
+    * ``validate-feline-config`` – validate a feline pipeline TOML contract.
+    * ``describe-feline-config`` – summarise a feline pipeline TOML contract.
+    * ``check-feline-runtime`` – check external runtime dependencies.
+
+    Returns:
+        A fully-configured :class:`argparse.ArgumentParser` ready for
+        ``parse_args``.
+    """
     parser = argparse.ArgumentParser(prog="jaguar-geo-assign")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
@@ -60,6 +89,19 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
+    """Parse CLI arguments and dispatch to the appropriate pipeline stage.
+
+    Each sub-command branch performs its own argument unpacking and
+    error handling.  The explicit ``if``-chain is deliberate – see the
+    module-level fragility note before refactoring.
+
+    Args:
+        argv: Command-line tokens to parse.  When *None* (the default),
+            ``sys.argv[1:]`` is used via :mod:`argparse`.
+
+    Returns:
+        Exit code: ``0`` on success, ``1`` on handled errors.
+    """
     parser = build_parser()
     args = parser.parse_args(list(argv) if argv is not None else None)
 
