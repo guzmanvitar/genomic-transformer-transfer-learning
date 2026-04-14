@@ -1,4 +1,10 @@
-"""Reporting helpers for genomics diagnostics."""
+"""Reporting layer — genomics diagnostics and EDA payload generation.
+
+Exposes helpers that summarize tokenized corpus records, audit corpus
+integrity, compare consensus-derived diagnostics against a reference-only
+baseline, build missingness heatmaps, and serialise structured EDA payloads
+consumed by the interactive ``notebooks/eda_genomics.py`` workflow.
+"""
 
 from .genomics_diagnostics import (
     audit_corpus_integrity,
