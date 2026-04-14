@@ -1,4 +1,27 @@
-"""Runtime wiring for the fixture-backed feline pretraining data pipeline."""
+"""Runtime wiring for the fixture-backed feline pretraining data pipeline.
+
+Orchestrates the end-to-end feline genome pretraining pipeline: loading a
+YAML config, resolving paths, parsing the sample manifest, generating
+consensus FASTAs via bcftools, tokenizing both consensus and reference
+sequences, exporting tokenized corpora, and producing diagnostics/EDA
+reports.
+
+The module exposes two dependency-injection hooks—``TokenizerLoader`` and
+``ExportWriter``—so callers can swap tokeniser back-ends or serialisation
+formats without touching pipeline logic.
+
+Key fragility flags
+-------------------
+* ``_assert_tokenizer_matches_config`` uses an identity check (``is not``)
+  on ``trust_remote_code`` to reject non-boolean values that would
+  pass an equality test (e.g. ``1 == True``).
+* ``load_feline_sample_manifest`` rejects duplicate ``sample_id`` values
+  to prevent silent overwrites in downstream dict-keyed lookups.
+* ``_resolve_path`` implements a *prefer_cwd* strategy where, for
+  relative paths, the current working directory is tried first when the
+  flag is set, falling back to the config-relative base directory only
+  when the CWD candidate does not exist.
+"""
 
 from __future__ import annotations
 
@@ -27,12 +50,43 @@ from ..data.preprocessor import (
 from ..reporting import build_eda_payload
 
 TokenizerLoader = Callable[[TokenizerProvenance], tuple[object, TokenizerProvenance]]
+"""Dependency-injection hook for tokenizer loading.
+
+A callable that receives a ``TokenizerProvenance`` describing the expected
+tokenizer identity and returns ``(tokenizer_object, actual_provenance)``.
+The default implementation is ``load_dnabert2_tokenizer``.  Swapping this
+callable lets tests or alternative pipelines provide mock or non-HuggingFace
+tokenizers without modifying orchestration logic.
+"""
+
 ExportWriter = Callable[[tuple[TokenizedWindow, ...], Path, FelinePipelineConfig, TokenizerProvenance], Path]
+"""Dependency-injection hook for corpus serialisation.
+
+A callable that persists a tuple of ``TokenizedWindow`` objects to disk and
+returns the resolved output ``Path``.  The default implementation is
+``write_tokenized_corpus``, which delegates to ``write_tokenized_dataset``.
+Replace this to change the on-disk format (e.g. TFRecord, HDF5) without
+altering pipeline orchestration.
+"""
+
 DEFAULT_RUNTIME_DIAGNOSTIC_SAMPLE_LIMIT = 128
 
 
 @dataclass(frozen=True)
 class FelineSampleManifestEntry:
+    """Single row from the feline sample manifest TSV.
+
+    Each entry maps a unique ``sample_id`` to the biological individual and
+    the filesystem path of its VCF file.  The ``vcf_path`` is always
+    resolved to an absolute path at parse time via ``_resolve_path``.
+
+    Attributes:
+        sample_id: Unique identifier for the sample; duplicates are rejected
+            during manifest loading.
+        individual_id: Biological individual this sample belongs to.
+        vcf_path: Absolute, resolved path to the sample's VCF file.
+    """
+
     sample_id: str
     individual_id: str
     vcf_path: Path
@@ -40,6 +94,16 @@ class FelineSampleManifestEntry:
 
 @dataclass(frozen=True)
 class FelinePretrainArtifacts:
+    """Filesystem locations of all artifacts produced by a pretrain run.
+
+    Attributes:
+        consensus_dir: Directory containing per-sample consensus FASTA files.
+        consensus_export: Path to the exported tokenized consensus corpus.
+        baseline_export: Path to the exported tokenized reference corpus.
+        diagnostics_path: Path to the JSON EDA/diagnostics payload.
+        summary_path: Path to the JSON run summary.
+    """
+
     consensus_dir: Path
     consensus_export: Path
     baseline_export: Path
@@ -49,6 +113,20 @@ class FelinePretrainArtifacts:
 
 @dataclass(frozen=True)
 class FelinePretrainRunResult:
+    """Immutable summary returned by ``run_feline_pretrain_pipeline``.
+
+    Attributes:
+        config_name: Human-readable pipeline config name (from YAML).
+        sample_count: Number of samples processed.
+        consensus_window_count: Total tokenized windows from consensus
+            sequences.
+        baseline_window_count: Total tokenized windows from the reference
+            genome.
+        consensus_fastas: Paths to per-sample consensus FASTA files, in
+            manifest order.
+        artifacts: Filesystem artifact locations.
+    """
+
     config_name: str
     sample_count: int
     consensus_window_count: int
@@ -64,6 +142,35 @@ def run_feline_pretrain_pipeline(
     tokenizer_loader: TokenizerLoader | None = None,
     export_writer: ExportWriter | None = None,
 ) -> FelinePretrainRunResult:
+    """Orchestrate the full feline pretraining data pipeline.
+
+    Loads the pipeline YAML config, resolves all filesystem paths using the
+    ``prefer_cwd`` strategy, parses the sample manifest, generates
+    consensus FASTAs via *bcftools*, tokenizes both consensus and reference
+    sequences, writes tokenized corpora, and emits diagnostics and a JSON
+    run summary.
+
+    Args:
+        config_path: Path to the YAML pipeline configuration file.
+        bcftools_executable: Name or path of the ``bcftools`` binary used
+            to generate consensus FASTAs.
+        tokenizer_loader: Optional override for the tokenizer loading
+            callable (see ``TokenizerLoader``).  Defaults to
+            ``load_dnabert2_tokenizer``.
+        export_writer: Optional override for the corpus serialisation
+            callable (see ``ExportWriter``).  Defaults to
+            ``write_tokenized_corpus``.
+
+    Returns:
+        A ``FelinePretrainRunResult`` summarising sample counts, window
+        counts, and artifact paths.
+
+    Raises:
+        RuntimeError: If required input files are missing, the loaded
+            tokenizer does not match the config contract, or no windows
+            survive preprocessing.
+        ValueError: If the sample manifest is malformed.
+    """
     tokenizer_loader = tokenizer_loader or load_dnabert2_tokenizer
     export_writer = export_writer or write_tokenized_corpus
 
@@ -164,6 +271,14 @@ def run_feline_pretrain_pipeline(
 
 
 def format_feline_pretrain_result(result: FelinePretrainRunResult) -> str:
+    """Format a ``FelinePretrainRunResult`` as a human-readable multi-line string.
+
+    Args:
+        result: The run result to format.
+
+    Returns:
+        A newline-joined summary suitable for logging or CLI output.
+    """
     return "\n".join(
         [
             f"Feline pretrain artifact generation finished for '{result.config_name}'.",
@@ -178,6 +293,29 @@ def format_feline_pretrain_result(result: FelinePretrainRunResult) -> str:
 
 
 def load_feline_sample_manifest(path: str | Path) -> tuple[FelineSampleManifestEntry, ...]:
+    """Parse a TSV sample manifest into validated manifest entries.
+
+    Reads a tab-delimited file whose header must contain all columns
+    defined in ``REQUIRED_SAMPLE_MANIFEST_FIELDS``.  Each row is
+    validated for completeness, and **duplicate ``sample_id`` values are
+    rejected** to prevent silent overwrites when downstream code keys
+    dictionaries by sample ID.
+
+    VCF paths are resolved relative to the manifest's parent directory
+    via ``_resolve_path``.
+
+    Args:
+        path: Filesystem path to the TSV manifest file.
+
+    Returns:
+        An ordered tuple of ``FelineSampleManifestEntry`` instances.
+
+    Raises:
+        ValueError: If the header is missing required columns, any row is
+            incomplete, duplicate ``sample_id`` values are found, or the
+            manifest is empty.
+        RuntimeError: If the manifest file does not exist.
+    """
     manifest_path = Path(path)
     _require_existing_file(manifest_path, "sample manifest")
     with manifest_path.open("r", encoding="utf-8", newline="") as handle:
@@ -223,6 +361,20 @@ def write_tokenized_corpus(
     config: FelinePipelineConfig,
     provenance: TokenizerProvenance,
 ) -> Path:
+    """Default ``ExportWriter`` implementation: persist tokenized windows.
+
+    Delegates to ``write_tokenized_dataset`` after building an
+    ``ExportContract`` from the pipeline config.
+
+    Args:
+        tokenized_windows: Windows to serialise.
+        output_path: Target directory or file path for the export.
+        config: Pipeline config used to derive the export contract.
+        provenance: Tokenizer provenance metadata embedded in the export.
+
+    Returns:
+        The resolved ``Path`` where the corpus was written.
+    """
     destination = Path(output_path)
     write_tokenized_dataset(
         tokenized_windows,
@@ -234,12 +386,41 @@ def write_tokenized_corpus(
 
 
 def _require_runtime_boolean(value: object, *, field_name: str) -> bool:
+    """Assert that *value* is a genuine ``bool``, not a truthy surrogate.
+
+    Uses ``type(value) is not bool`` (identity check) so that ``int``
+    values like ``1`` or ``0`` are rejected even though they pass
+    ``== True`` / ``== False``.  This prevents subtle security
+    misconfigurations when deserialised config values are integers.
+
+    Args:
+        value: The value to check.
+        field_name: Human-readable name included in the error message.
+
+    Returns:
+        The validated boolean.
+
+    Raises:
+        RuntimeError: If *value* is not exactly ``True`` or ``False``.
+    """
     if type(value) is not bool:
         raise RuntimeError(f"{field_name} must be an actual boolean, got {value!r} ({type(value).__name__})")
     return value
 
 
 def _build_preprocessing_config(config: FelinePipelineConfig) -> PreprocessingConfig:
+    """Derive a ``PreprocessingConfig`` from the pipeline config.
+
+    Maps windowing and split settings to the preprocessor's expected
+    parameter structure, computing ``window_stride`` from the context
+    window minus the overlap.
+
+    Args:
+        config: The loaded pipeline configuration.
+
+    Returns:
+        A ``PreprocessingConfig`` ready for sequence preparation.
+    """
     return PreprocessingConfig(
         min_sequence_length=config.windowing.context_window if config.windowing.drop_short_sequences else 1,
         max_ambiguity_fraction=config.windowing.max_ambiguous_fraction,
@@ -253,6 +434,14 @@ def _build_preprocessing_config(config: FelinePipelineConfig) -> PreprocessingCo
 
 
 def _build_tokenizer_provenance(config: FelinePipelineConfig) -> TokenizerProvenance:
+    """Build a ``TokenizerProvenance`` from the pipeline config's tokenizer section.
+
+    Args:
+        config: The loaded pipeline configuration.
+
+    Returns:
+        A ``TokenizerProvenance`` capturing the expected tokenizer identity.
+    """
     return TokenizerProvenance(
         identifier=config.tokenizer.identifier,
         revision=config.tokenizer.revision,
@@ -266,6 +455,24 @@ def _build_tokenizer_provenance(config: FelinePipelineConfig) -> TokenizerProven
 def _assert_tokenizer_matches_config(
     config: FelinePipelineConfig, provenance: TokenizerProvenance
 ) -> None:
+    """Validate that the loaded tokenizer's provenance matches the config.
+
+    Checks identifier, revision, alphabet, max_position_embeddings, and
+    unsupported_symbol_policy via equality.  The ``trust_remote_code``
+    field is checked via **identity** (``is not``) after passing through
+    ``_require_runtime_boolean``, which rejects non-bool truthy values
+    (e.g. ``1``).  This is intentional: a deserialised integer ``1``
+    equals ``True`` but is not ``True``, and accepting it could silently
+    enable remote code execution.
+
+    Args:
+        config: Pipeline configuration containing the expected tokenizer
+            contract.
+        provenance: Provenance returned by the tokenizer loader.
+
+    Raises:
+        RuntimeError: If any provenance field does not match the config.
+    """
     if provenance.identifier != config.tokenizer.identifier:
         raise RuntimeError(
             f"Tokenizer loader returned {provenance.identifier}, expected {config.tokenizer.identifier}"
@@ -299,6 +506,14 @@ def _assert_tokenizer_matches_config(
 
 
 def _build_export_contract(config: FelinePipelineConfig) -> ExportContract:
+    """Derive an ``ExportContract`` from the pipeline config's export section.
+
+    Args:
+        config: The loaded pipeline configuration.
+
+    Returns:
+        An ``ExportContract`` controlling serialisation behaviour.
+    """
     return ExportContract(
         format=config.export.format,
         access_pattern=config.export.access_pattern,
@@ -315,6 +530,17 @@ def _build_consensus_sequence_records(
     consensus_results: dict[str, ConsensusResult],
     manifest_entries: tuple[FelineSampleManifestEntry, ...],
 ) -> list[SequenceRecord]:
+    """Eagerly materialise consensus ``SequenceRecord`` objects into a list.
+
+    Convenience wrapper around ``_iter_consensus_sequence_records``.
+
+    Args:
+        consensus_results: Mapping of sample ID to ``ConsensusResult``.
+        manifest_entries: Ordered manifest entries for individual-ID lookup.
+
+    Returns:
+        A list of ``SequenceRecord`` instances for all consensus contigs.
+    """
     return list(_iter_consensus_sequence_records(consensus_results, manifest_entries))
 
 
@@ -322,6 +548,19 @@ def _iter_consensus_sequence_records(
     consensus_results: dict[str, ConsensusResult],
     manifest_entries: tuple[FelineSampleManifestEntry, ...],
 ) -> Iterable[SequenceRecord]:
+    """Lazily yield ``SequenceRecord`` objects from consensus FASTAs.
+
+    Iterates over consensus results in sorted sample-ID order, reads
+    each output FASTA, and attaches per-contig mask spans from the
+    consensus diagnostics.
+
+    Args:
+        consensus_results: Mapping of sample ID to ``ConsensusResult``.
+        manifest_entries: Ordered manifest entries for individual-ID lookup.
+
+    Yields:
+        One ``SequenceRecord`` per contig per sample.
+    """
     individual_by_sample = {entry.sample_id: entry.individual_id for entry in manifest_entries}
     for sample_id, result in sorted(consensus_results.items()):
         mask_spans_by_contig: dict[str, list[tuple[int, int, str]]] = {}
@@ -343,6 +582,19 @@ def _build_reference_sequence_records(
     reference_sequences: dict[str, str],
     manifest_entries: tuple[FelineSampleManifestEntry, ...],
 ) -> list[SequenceRecord]:
+    """Build reference ``SequenceRecord`` objects from pre-loaded sequences.
+
+    Returns an empty list when *manifest_entries* is empty (no samples
+    to compare against).
+
+    Args:
+        reference_sequences: Mapping of contig name to nucleotide string.
+        manifest_entries: Manifest entries; used only to gate the
+            early-return for the empty-manifest case.
+
+    Returns:
+        A list of reference ``SequenceRecord`` instances.
+    """
     if not manifest_entries:
         return []
 
@@ -360,6 +612,18 @@ def _build_reference_sequence_records(
 
 
 def _iter_reference_sequence_records(reference_fasta: str | Path) -> Iterable[SequenceRecord]:
+    """Lazily yield ``SequenceRecord`` objects from the reference FASTA.
+
+    Each contig is emitted as a separate record with ``source="reference"``
+    and a synthetic ``sample_id`` of ``"reference-{contig}"``.
+
+    Args:
+        reference_fasta: Path to the reference genome FASTA (plain or
+            gzip-compressed).
+
+    Yields:
+        One ``SequenceRecord`` per contig in the reference FASTA.
+    """
     for contig, sequence in _iter_fasta_sequences(reference_fasta):
         yield SequenceRecord(
             sample_id=f"reference-{contig}",
@@ -377,6 +641,24 @@ def _tokenize_sequence_records(
     tokenizer: object,
     provenance: TokenizerProvenance,
 ) -> tuple[TokenizedWindow, ...]:
+    """Prepare, window, and tokenize an iterable of sequence records.
+
+    Processes each record individually through the prepare → window →
+    tokenize pipeline.  Records or windows that fail quality filters
+    (ambiguity, minimum length) are silently dropped.
+
+    Args:
+        records: Iterable of ``SequenceRecord`` to process.
+        preprocessing_config: Controls windowing size, stride, and
+            quality thresholds.
+        tokenizer: The tokenizer object (opaque; passed to
+            ``tokenize_windows``).
+        provenance: Tokenizer provenance attached to each output window.
+
+    Returns:
+        A tuple of ``TokenizedWindow`` instances that survived all
+        preprocessing filters.
+    """
     tokenized_windows: list[TokenizedWindow] = []
     for record in records:
         prepared = prepare_sequences([record], preprocessing_config)
@@ -395,6 +677,22 @@ def _build_diagnostics_payload(
     tokenized_baseline: tuple[TokenizedWindow, ...],
     consensus_results: dict[str, ConsensusResult],
 ) -> dict[str, object]:
+    """Assemble the JSON-serialisable EDA / diagnostics payload.
+
+    Combines per-sample consensus generation diagnostics, a
+    baseline-window alignment summary, and the full EDA payload produced
+    by ``build_eda_payload``.
+
+    Args:
+        tokenized_consensus: Tokenized windows from consensus sequences.
+        tokenized_baseline: Tokenized windows from the reference genome.
+        consensus_results: Per-sample consensus generation results.
+
+    Returns:
+        A nested dict suitable for ``json.dumps``; contains keys
+        ``consensus_generation``, ``baseline_window_alignment``, and
+        all keys contributed by ``build_eda_payload``.
+    """
     reference_lookup = {
         _tokenized_window_lookup_key(record): record.window.sequence
         for record in tokenized_baseline
@@ -423,6 +721,14 @@ def _build_diagnostics_payload(
 
 
 def _tokenized_window_lookup_key(record: TokenizedWindow) -> tuple[str, int, int]:
+    """Return a hashable ``(contig, window_start, window_end)`` key for window lookup.
+
+    Args:
+        record: A tokenized window record.
+
+    Returns:
+        A 3-tuple suitable for use as a dictionary key.
+    """
     return record.window.contig, record.window.window_start, record.window.window_end
 
 
@@ -432,6 +738,29 @@ def _tokenized_windows_to_diagnostics_records(
     *,
     allow_unmatched_reference: bool = False,
 ) -> Iterable[dict[str, object]]:
+    """Yield per-window diagnostics dicts for the EDA payload.
+
+    Each dict contains sample metadata, sequence and reference text,
+    variant counts, masking statistics, and token count.  When a
+    matching reference window exists, variant count is computed as the
+    number of non-N positions that differ from the reference.
+
+    Args:
+        tokenized_windows: Windows to report on.
+        reference_lookup: Mapping from ``(contig, start, end)`` to
+            reference sequence strings.
+        allow_unmatched_reference: If ``True``, windows without a
+            reference match use their own sequence as the reference
+            (for consensus diagnostics).  If ``False``, a ``KeyError``
+            is raised on mismatch.
+
+    Yields:
+        One dict per window with keys required by ``build_eda_payload``.
+
+    Raises:
+        KeyError: If *allow_unmatched_reference* is ``False`` and a
+            window has no matching entry in *reference_lookup*.
+    """
     for record in tokenized_windows:
         key = _tokenized_window_lookup_key(record)
         reference_sequence = reference_lookup.get(key)
@@ -470,14 +799,46 @@ def _tokenized_windows_to_diagnostics_records(
 
 
 def _count_callable_bases(sequence: str) -> int:
+    """Count bases in *sequence* that are not ``'N'``.
+
+    Args:
+        sequence: A nucleotide string.
+
+    Returns:
+        The number of non-N characters.
+    """
     return sum(base != "N" for base in sequence)
 
 
 def _load_fasta_sequences(path: str | Path) -> dict[str, str]:
+    """Eagerly load all sequences from a FASTA file into a dict.
+
+    Args:
+        path: Path to a FASTA file (plain or gzip-compressed).
+
+    Returns:
+        A mapping of contig name to nucleotide string.
+    """
     return dict(_iter_fasta_sequences(path))
 
 
 def _iter_fasta_sequences(path: str | Path) -> Iterable[tuple[str, str]]:
+    """Lazily parse a FASTA file, yielding ``(contig_name, sequence)`` pairs.
+
+    Supports both plain-text and gzip-compressed (``.gz``) FASTA files.
+    Contig names are extracted from the first whitespace-delimited token
+    after the ``>`` header marker.  Empty lines are skipped.
+
+    Args:
+        path: Path to the FASTA file.
+
+    Yields:
+        Tuples of ``(contig_name, full_sequence_string)``.
+
+    Raises:
+        ValueError: If sequence data appears before the first header, or
+            the file contains no sequences.
+    """
     fasta_path = Path(path)
     current_name: str | None = None
     current_parts: list[str] = []
@@ -501,10 +862,42 @@ def _iter_fasta_sequences(path: str | Path) -> Iterable[tuple[str, str]]:
 
 
 def _open_maybe_gzip(path: Path):
+    """Open a file for text reading, auto-detecting gzip by ``.gz`` suffix.
+
+    Args:
+        path: Filesystem path to open.
+
+    Returns:
+        A text-mode file handle (UTF-8).
+    """
     return gzip.open(path, "rt", encoding="utf-8") if path.suffix == ".gz" else path.open("r", encoding="utf-8")
 
 
 def _resolve_path(base_dir: Path, path: str | Path, *, prefer_cwd: bool = False) -> Path:
+    """Resolve a potentially relative path against a base directory.
+
+    Absolute paths are returned unchanged.  For relative paths, two
+    candidates are formed: one relative to the current working directory
+    and one relative to *base_dir*.
+
+    **Fragility flag — ``prefer_cwd`` strategy:**
+    When ``prefer_cwd=True``, the CWD candidate is returned if it exists
+    **or** if neither candidate exists (defaulting to CWD).  When
+    ``prefer_cwd=False`` (default), the *base_dir* candidate wins if it
+    exists, otherwise the CWD candidate is returned.  This asymmetry
+    means that pipeline behaviour depends on the caller's working
+    directory, which can cause hard-to-reproduce path resolution in CI
+    vs. local runs.
+
+    Args:
+        base_dir: Directory to resolve relative paths against (typically
+            the config file's parent).
+        path: The path to resolve (absolute or relative).
+        prefer_cwd: If ``True``, prefer the CWD-relative candidate.
+
+    Returns:
+        A resolved absolute ``Path``.
+    """
     candidate = Path(path)
     if candidate.is_absolute():
         return candidate
@@ -516,5 +909,14 @@ def _resolve_path(base_dir: Path, path: str | Path, *, prefer_cwd: bool = False)
 
 
 def _require_existing_file(path: Path, label: str) -> None:
+    """Raise ``RuntimeError`` if *path* does not point to an existing file.
+
+    Args:
+        path: Filesystem path to check.
+        label: Human-readable label included in the error message.
+
+    Raises:
+        RuntimeError: If the path does not exist or is not a regular file.
+    """
     if not path.exists() or not path.is_file():
         raise RuntimeError(f"Missing {label}: {path}")
