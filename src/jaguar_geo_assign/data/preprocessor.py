@@ -1,4 +1,38 @@
-"""Preprocessing, split-safety, tokenization, and export helpers for felid corpora."""
+"""Preprocessing, split-safety, tokenization, and export helpers for felid corpora.
+
+This module implements the full data-preparation pipeline for the feline
+genomics transformer project, covering four stages:
+
+1. **Sequence normalisation** — IUPAC ambiguity resolution and alphabet
+   validation against the post-consensus contract (``A/C/G/T/N``).
+2. **Sliding-window extraction** — locus-block-aligned windowing with
+   deterministic SHA-256-based split assignment that prevents genomic
+   leakage across train/validation folds.
+3. **Tokenisation** — DNABERT-2 BPE tokenisation with contract-enforced
+   provenance pinning (model ID, revision hash, ``trust_remote_code``).
+4. **Export** — Parquet and WebDataset serialisation with an auditable
+   ``ExportContract`` that guarantees coordinate and hash preservation.
+
+Fragility flags
+---------------
+* ``assign_split`` uses SHA-256 deterministic bucketing: changing the
+  ``split_seed`` or the locus-ID format silently reshuffles every split.
+* ``window_sequences`` relies on locus-block alignment so that every
+  window in a block inherits a single split; misaligned blocks break the
+  leakage guarantee.
+* ``_WindowMaskCounter`` is a sweep-line algorithm that assumes
+  ``mask_spans`` are sorted by start position and that ``summarize`` is
+  called with monotonically non-decreasing ``window_start``.
+* ``SplitLeakageError`` is the hard guardrail: it fires from both
+  ``build_split_manifest`` and ``assert_split_safety`` when a locus
+  appears in more than one fold.
+* ``TokenizerProvenance.__post_init__`` enforces that
+  ``trust_remote_code`` is an actual ``bool`` (not a truthy int) via
+  ``_require_boolean_trust_remote_code``.
+* ``ExportContract`` mandates that at least one of raw windows or
+  immutable sequence hashes is preserved, and locks the hash algorithm
+  to SHA-256 for downstream auditability.
+"""
 
 from __future__ import annotations
 
@@ -32,6 +66,12 @@ DEFAULT_SPLITS = (("train", 0.8), ("validation", 0.2))
 
 
 class TokenizerLike(Protocol):
+    """Structural typing protocol for any callable that behaves like a HuggingFace tokenizer.
+
+    Implementations must accept a DNA sequence string and return a dict
+    containing at least ``input_ids`` and optionally ``attention_mask``.
+    """
+
     def __call__(self, sequence: str, **kwargs: Any) -> dict[str, Any]: ...
 
 
@@ -40,15 +80,33 @@ class PreprocessingError(ValueError):
 
 
 class SplitLeakageError(ValueError):
-    """Raised when genomic windows would leak across splits."""
+    """Raised when genomic windows would leak across train/validation splits.
+
+    This is the hard guardrail for split safety.  It fires in two places:
+    ``build_split_manifest`` (when a locus ID maps to multiple splits) and
+    ``assert_split_safety`` (when overlapping windows on the same contig
+    belong to different folds).  Any occurrence indicates a bug in the
+    locus-block alignment or split-assignment logic.
+    """
 
 
 class TokenizerContractError(ValueError):
-    """Raised when tokenizer output violates the export contract."""
+    """Raised when tokenizer output violates the pipeline contract.
+
+    Common triggers include mismatched ``trust_remote_code`` policy,
+    token counts exceeding ``max_position_embeddings``, or missing
+    ``input_ids`` / ``attention_mask`` fields in the tokenizer output.
+    """
 
 
 class ExportContractError(ValueError):
-    """Raised when export settings violate the approved artifact contract."""
+    """Raised when export settings violate the approved artifact contract.
+
+    Guards include: unsupported format, non-positive ``row_group_size``,
+    disabling *both* raw-window and sequence-hash preservation (which
+    would break downstream reproducibility auditing), and hash algorithm
+    changes away from SHA-256.
+    """
 
 
 def _require_boolean_trust_remote_code(
@@ -57,6 +115,24 @@ def _require_boolean_trust_remote_code(
     field_name: str,
     error_type: type[ValueError] = ValueError,
 ) -> bool:
+    """Validate that *value* is an actual ``bool``, not a truthy integer.
+
+    DNABERT-2's HuggingFace loader interprets ``trust_remote_code=1`` as
+    truthy, which would bypass the explicit opt-in safety gate.  This
+    guard rejects anything that is not ``True`` or ``False`` by identity,
+    preventing accidental coercion.
+
+    Args:
+        value: The candidate value to check.
+        field_name: Human-readable label used in error messages.
+        error_type: Exception class to raise on failure.
+
+    Returns:
+        The validated boolean.
+
+    Raises:
+        error_type: If ``type(value)`` is not exactly ``bool``.
+    """
     if type(value) is not bool:
         raise error_type(f"{field_name} must be an actual boolean, got {value!r} ({type(value).__name__})")
     return value
@@ -64,6 +140,27 @@ def _require_boolean_trust_remote_code(
 
 @dataclass(frozen=True)
 class TokenizerProvenance:
+    """Immutable provenance record pinning the exact DNABERT-2 tokenizer version.
+
+    Every field is validated in ``__post_init__`` against the pipeline
+    contract constants.  In particular, ``trust_remote_code`` is checked
+    via ``_require_boolean_trust_remote_code`` to reject truthy-but-not-bool
+    values (e.g. ``1``), since HuggingFace's ``AutoTokenizer`` would silently
+    accept them, bypassing the explicit security opt-in.
+
+    Fragility: changing any default breaks all downstream provenance
+    assertions; update ``pipeline_contract.py`` first.
+
+    Attributes:
+        identifier: HuggingFace model ID; must equal ``DNABERT2_TOKENIZER_NAME``.
+        revision: Immutable Git SHA for reproducible loading.
+        max_position_embeddings: Maximum token-sequence length the model supports.
+        allowed_alphabet: Post-consensus nucleotide alphabet (A/C/G/T/N).
+        unsupported_symbol_policy: ``"reject"`` or ``"normalize_to_n"``.
+        trust_remote_code: Must be an actual ``bool`` matching
+            ``DNABERT2_TRUST_REMOTE_CODE``.
+    """
+
     identifier: str = DNABERT2_TOKENIZER_NAME
     revision: str = DNABERT2_TOKENIZER_REVISION
     max_position_embeddings: int = DNABERT2_MAX_POSITION_EMBEDDINGS
@@ -91,6 +188,32 @@ DNABERT2_TOKENIZER_PROVENANCE = TokenizerProvenance()
 
 @dataclass(frozen=True)
 class PreprocessingConfig:
+    """Validated configuration for the sequence-preparation and windowing stages.
+
+    All invariants are enforced in ``__post_init__``.  Notably,
+    ``locus_block_size`` must be ``>= window_size`` to guarantee that
+    every sliding window fits within a single locus block and therefore
+    inherits exactly one split assignment.
+
+    Attributes:
+        min_sequence_length: Sequences shorter than this (after normalisation)
+            are filtered as ``"short_sequence"``.
+        max_ambiguity_fraction: Maximum fraction of ``N`` bases allowed.
+        window_size: Length of each sliding window in base pairs.
+        window_stride: Step size between consecutive windows.
+        locus_block_size: Size of the genomic locus block used for
+            deterministic split assignment; must be ``>= window_size``.
+        ambiguity_mode: ``"mask"`` replaces ambiguous bases with ``N``;
+            ``"reject"`` raises on any ambiguous base.
+        split_weights: Named fold proportions, e.g.
+            ``(("train", 0.8), ("validation", 0.2))``.
+        split_seed: Salt string for the SHA-256 split hash; changing this
+            silently reshuffles every split assignment.
+        allowed_alphabet: Post-consensus nucleotide alphabet.
+        export_format: ``"parquet"`` or ``"webdataset"``.
+        records_per_shard: Number of records per export shard / row group.
+    """
+
     min_sequence_length: int
     max_ambiguity_fraction: float
     window_size: int
@@ -129,6 +252,19 @@ class PreprocessingConfig:
 
 @dataclass(frozen=True)
 class SequenceRecord:
+    """Raw consensus sequence before normalisation and quality filtering.
+
+    Attributes:
+        sample_id: Unique sample identifier from the manifest.
+        individual_id: Biological individual (may share across samples).
+        contig: Chromosome or scaffold name.
+        sequence: Raw nucleotide string (may contain IUPAC codes).
+        source: Provenance label (default ``"consensus"``).
+        sequence_start: 0-based genomic start coordinate.
+        mask_spans: Sorted ``(start, end, category)`` tuples for masked
+            regions propagated from consensus calling.
+    """
+
     sample_id: str
     individual_id: str
     contig: str
@@ -139,11 +275,30 @@ class SequenceRecord:
 
     @property
     def sequence_end(self) -> int:
+        """Return the exclusive genomic end coordinate after normalisation."""
         return self.sequence_start + len(normalize_sequence(self.sequence, ambiguity_mode="mask"))
 
 
 @dataclass(frozen=True)
 class PreparedSequence:
+    """Normalised and quality-checked sequence ready for windowing.
+
+    Produced by ``prepare_sequences`` after passing the minimum-length
+    and maximum-ambiguity filters.
+
+    Attributes:
+        sample_id: Unique sample identifier.
+        individual_id: Biological individual identifier.
+        contig: Chromosome or scaffold name.
+        source: Provenance label (e.g. ``"consensus"``).
+        sequence_start: 0-based genomic start coordinate.
+        sequence: Normalised nucleotide string (alphabet-validated).
+        gc_fraction: Fraction of G+C among canonical bases.
+        ambiguity_fraction: Fraction of ``N`` bases in the sequence.
+        mask_spans: Sorted ``(start, end, category)`` tuples inherited
+            from the input ``SequenceRecord``.
+    """
+
     sample_id: str
     individual_id: str
     contig: str
@@ -156,11 +311,25 @@ class PreparedSequence:
 
     @property
     def sequence_end(self) -> int:
+        """Return the exclusive genomic end coordinate."""
         return self.sequence_start + len(self.sequence)
 
 
 @dataclass(frozen=True)
 class FilteredSequence:
+    """Metadata for a sequence that was rejected during preparation.
+
+    Attributes:
+        sample_id: Unique sample identifier.
+        individual_id: Biological individual identifier.
+        contig: Chromosome or scaffold name.
+        source: Provenance label.
+        reason: Machine-readable rejection reason (``"short_sequence"``
+            or ``"high_ambiguity"``).
+        sequence_length: Length of the normalised sequence.
+        ambiguity_fraction: Fraction of ``N`` bases.
+    """
+
     sample_id: str
     individual_id: str
     contig: str
@@ -172,6 +341,15 @@ class FilteredSequence:
 
 @dataclass(frozen=True)
 class PreprocessingReport:
+    """Summary of the sequence-preparation stage.
+
+    Attributes:
+        retained: Sequences that passed all quality filters.
+        filtered: Metadata for sequences that were rejected.
+        mean_gc_fraction: Average GC content across retained sequences.
+        mean_ambiguity_fraction: Average ambiguity across retained sequences.
+    """
+
     retained: tuple[PreparedSequence, ...]
     filtered: tuple[FilteredSequence, ...]
     mean_gc_fraction: float
@@ -180,6 +358,38 @@ class PreprocessingReport:
 
 @dataclass(frozen=True)
 class WindowRecord:
+    """A single sliding window extracted from a prepared sequence.
+
+    Each window belongs to exactly one locus block and inherits that
+    block's deterministic split assignment.  The ``sequence_hash``
+    (SHA-256 of the window nucleotide string) provides an immutable
+    fingerprint for downstream reproducibility auditing.
+
+    Attributes:
+        sample_id: Unique sample identifier.
+        individual_id: Biological individual identifier.
+        contig: Chromosome or scaffold name.
+        source: Provenance label.
+        split: Fold name inherited from the parent locus block.
+        locus_id: ``"{contig}:{block_start}-{block_end}"`` identifier.
+        block_start: Genomic start of the enclosing locus block.
+        block_end: Genomic end of the enclosing locus block.
+        window_start: Genomic start coordinate of this window.
+        window_end: Genomic end coordinate of this window.
+        sequence: Normalised nucleotide string for this window.
+        gc_fraction: GC content among canonical bases.
+        ambiguity_fraction: Fraction of ``N`` bases.
+        sequence_hash: SHA-256 hex digest of ``sequence``.
+        unique_masked_bases: Count of uniquely masked bases (de-duplicated
+            across overlapping mask spans).
+        filtered_bases: Bases masked with the ``"filtered"`` category.
+        no_call_bases: Bases masked with the ``"no_call"`` category.
+        other_masked_bases: Bases in mask categories other than
+            ``"filtered"`` and ``"no_call"``.
+        masked_base_counts: Sorted ``(category, count)`` tuples for all
+            mask categories overlapping this window.
+    """
+
     sample_id: str
     individual_id: str
     contig: str
@@ -203,6 +413,16 @@ class WindowRecord:
 
 @dataclass(frozen=True)
 class SplitManifestEntry:
+    """One row of the split manifest mapping a locus block to a fold.
+
+    Attributes:
+        locus_id: ``"{contig}:{block_start}-{block_end}"`` identifier.
+        contig: Chromosome or scaffold name.
+        block_start: Genomic start of the locus block.
+        block_end: Genomic end of the locus block.
+        split: Assigned fold name.
+    """
+
     locus_id: str
     contig: str
     block_start: int
@@ -212,6 +432,17 @@ class SplitManifestEntry:
 
 @dataclass(frozen=True)
 class TokenizedWindow:
+    """A genomic window after DNABERT-2 BPE tokenisation.
+
+    Attributes:
+        window: The source ``WindowRecord``.
+        input_ids: Integer token IDs produced by the tokenizer.
+        attention_mask: Binary mask (``1`` = real token, ``0`` = padding).
+        token_count: Number of tokens (including special tokens).
+        token_to_base_ratio: ``token_count / len(window.sequence)``.
+        tokenizer: Provenance record of the tokenizer used.
+    """
+
     window: WindowRecord
     input_ids: tuple[int, ...]
     attention_mask: tuple[int, ...]
@@ -222,6 +453,29 @@ class TokenizedWindow:
 
 @dataclass(frozen=True)
 class ExportContract:
+    """Immutable contract governing how tokenised windows are serialised.
+
+    The ``__post_init__`` validates that the export configuration is
+    auditable: at least one of ``preserve_raw_windows`` or
+    ``preserve_sequence_hashes`` must be ``True``, and the hash algorithm
+    is locked to SHA-256 so downstream consumers can verify window
+    integrity without access to the original FASTA.
+
+    Fragility: disabling both preservation flags raises
+    ``ExportContractError``; changing ``sequence_hash_algorithm`` away
+    from ``"sha256"`` is also rejected.
+
+    Attributes:
+        format: ``"parquet"`` or ``"webdataset"``.
+        access_pattern: Intended read pattern label.
+        row_group_size: Records per Parquet row group.
+        deterministic_partition_keys: Hive-style partition columns.
+        preserve_raw_windows: Whether to include raw nucleotide strings.
+        preserve_sequence_hashes: Whether to include SHA-256 hashes.
+        preserve_coordinates: Whether to include genomic coordinates.
+        sequence_hash_algorithm: Must remain ``"sha256"``.
+    """
+
     format: str = DEFAULT_EXPORT_FORMAT
     access_pattern: str = DEFAULT_EXPORT_ACCESS_PATTERN
     row_group_size: int = DEFAULT_ROW_GROUP_SIZE
@@ -251,7 +505,28 @@ def normalize_sequence(
     ambiguity_mode: str = "mask",
     allowed_alphabet: tuple[str, ...] = ALLOWED_DNA_ALPHABET,
 ) -> str:
-    """Normalize genomic sequence characters deterministically before tokenization."""
+    """Normalise genomic sequence characters deterministically before tokenisation.
+
+    Upper-cases the input, strips whitespace, maps IUPAC ambiguity codes
+    (and gap/unknown symbols ``-``, ``?``, ``.``) to ``N`` when
+    *ambiguity_mode* is ``"mask"``, and rejects any character outside the
+    allowed alphabet when *ambiguity_mode* is ``"reject"``.
+
+    Args:
+        sequence: Raw nucleotide string (may contain mixed case, whitespace,
+            IUPAC codes).
+        ambiguity_mode: ``"mask"`` converts ambiguous symbols to ``N``;
+            ``"reject"`` raises on any out-of-alphabet character.
+        allowed_alphabet: Post-consensus alphabet to validate against.
+
+    Returns:
+        A normalised string containing only characters in *allowed_alphabet*.
+
+    Raises:
+        ValueError: If *ambiguity_mode* is not ``"mask"`` or ``"reject"``.
+        PreprocessingError: If an unsupported base is encountered in
+            ``"reject"`` mode.
+    """
 
     if ambiguity_mode not in {"mask", "reject"}:
         raise ValueError("ambiguity_mode must be 'mask' or 'reject'")
@@ -274,6 +549,17 @@ def normalize_sequence(
 
 
 def gc_fraction(sequence: str) -> float:
+    """Compute the GC fraction among canonical (A/C/G/T) bases.
+
+    ``N`` bases are excluded from both numerator and denominator,
+    so the result reflects GC content of the informative portion only.
+
+    Args:
+        sequence: Normalised nucleotide string.
+
+    Returns:
+        GC fraction in ``[0.0, 1.0]``, or ``0.0`` if no canonical bases.
+    """
     canonical_bases = sum(1 for base in sequence if base in {"A", "C", "G", "T"})
     if canonical_bases == 0:
         return 0.0
@@ -282,6 +568,14 @@ def gc_fraction(sequence: str) -> float:
 
 
 def ambiguity_fraction(sequence: str) -> float:
+    """Compute the fraction of ambiguous (``N``) bases in *sequence*.
+
+    Args:
+        sequence: Normalised nucleotide string.
+
+    Returns:
+        Fraction in ``[0.0, 1.0]``, or ``0.0`` for an empty string.
+    """
     if not sequence:
         return 0.0
     return sequence.count("N") / len(sequence)
@@ -289,14 +583,47 @@ def ambiguity_fraction(sequence: str) -> float:
 
 @dataclass
 class _WindowMaskCounter:
+    """Sweep-line accumulator for mask-span overlap counts across sliding windows.
+
+    Designed to be called once per window with monotonically non-decreasing
+    ``window_start`` values.  It maintains an ``active_spans`` list that
+    is incrementally pruned (spans whose end ≤ current ``window_start``
+    are dropped) and extended (spans whose start < ``window_end`` are
+    absorbed), amortising the cost over the full sweep.
+
+    Fragility: calling ``summarize`` with non-monotonic ``window_start``
+    values will silently produce incorrect counts because already-discarded
+    spans cannot be recovered.
+
+    Attributes:
+        mask_spans: Sorted ``(start, end, category)`` tuples from the
+            parent ``PreparedSequence``.
+        next_index: Cursor into ``mask_spans`` tracking the next span
+            to absorb.
+        active_spans: Spans currently overlapping the sweep frontier.
+    """
+
     mask_spans: tuple[tuple[int, int, str], ...]
     next_index: int = 0
     active_spans: list[tuple[int, int, str]] | None = None
 
     def __post_init__(self) -> None:
+        """Initialise ``active_spans`` to an empty list."""
         self.active_spans = []
 
     def summarize(self, *, window_start: int, window_end: int) -> tuple[Counter[str], int]:
+        """Count masked bases overlapping the window ``[window_start, window_end)``.
+
+        Args:
+            window_start: Inclusive genomic start of the window.
+            window_end: Exclusive genomic end of the window.
+
+        Returns:
+            A ``(category_counts, unique_masked_bases)`` tuple where
+            *category_counts* maps each mask category to the number of
+            overlapping bases, and *unique_masked_bases* is the
+            de-duplicated total across all categories.
+        """
         assert self.active_spans is not None
         while self.next_index < len(self.mask_spans) and self.mask_spans[self.next_index][0] < window_end:
             self.active_spans.append(self.mask_spans[self.next_index])
@@ -314,6 +641,18 @@ class _WindowMaskCounter:
 
 
 def _count_unique_masked_bases(overlapping_ranges: list[tuple[int, int]]) -> int:
+    """Merge overlapping genomic ranges and return the total covered length.
+
+    Uses a sort-and-sweep merge to de-duplicate base counts when multiple
+    mask categories overlap the same genomic interval.
+
+    Args:
+        overlapping_ranges: ``(start, end)`` pairs clipped to the current
+            window boundaries.
+
+    Returns:
+        Total number of unique bases covered by at least one range.
+    """
     if not overlapping_ranges:
         return 0
 
@@ -331,6 +670,18 @@ def _count_unique_masked_bases(overlapping_ranges: list[tuple[int, int]]) -> int
 
 
 def _count_realized_unique_masked_bases(sequence: str, span_unique_masked_bases: int) -> int:
+    """Return the larger of span-derived and sequence-derived masked-base counts.
+
+    The span-based count may under-count if the normalisation step
+    introduced additional ``N`` bases not tracked by explicit mask spans.
+
+    Args:
+        sequence: The window nucleotide string.
+        span_unique_masked_bases: De-duplicated base count from mask spans.
+
+    Returns:
+        Conservative (higher) estimate of masked bases.
+    """
     return max(span_unique_masked_bases, sequence.count("N"))
 
 
@@ -338,6 +689,22 @@ def prepare_sequences(
     records: list[SequenceRecord],
     config: PreprocessingConfig,
 ) -> PreprocessingReport:
+    """Normalise, filter, and compute quality metrics for raw sequence records.
+
+    Each record is normalised via ``normalize_sequence``, then checked
+    against ``config.min_sequence_length`` and
+    ``config.max_ambiguity_fraction``.  Records that fail either filter
+    are captured in ``PreprocessingReport.filtered`` with a machine-readable
+    ``reason``.
+
+    Args:
+        records: Raw consensus sequences to process.
+        config: Preprocessing thresholds and alphabet settings.
+
+    Returns:
+        A ``PreprocessingReport`` with retained and filtered sequences
+        plus aggregate GC and ambiguity statistics.
+    """
     retained: list[PreparedSequence] = []
     filtered: list[FilteredSequence] = []
 
@@ -401,6 +768,25 @@ def prepare_sequences(
 
 
 def assign_split(locus_id: str, split_weights: tuple[tuple[str, float], ...], split_seed: str) -> str:
+    """Deterministically assign a locus block to a fold using SHA-256 hashing.
+
+    The assignment is computed as
+    ``SHA256("{split_seed}:{locus_id}")[:16]`` → 64-bit bucket →
+    normalised position in ``[0, 1)`` → cumulative-weight lookup.
+
+    Fragility: changing *split_seed* or the locus-ID format
+    (``"{contig}:{block_start}-{block_end}"``) silently reshuffles
+    every split assignment across the entire corpus.
+
+    Args:
+        locus_id: Unique block identifier used as hash input.
+        split_weights: ``(name, weight)`` tuples; weights are normalised
+            to sum to 1.
+        split_seed: Salt string prepended to the hash input.
+
+    Returns:
+        The name of the assigned fold.
+    """
     total = sum(weight for _, weight in split_weights)
     bucket = int(sha256(f"{split_seed}:{locus_id}".encode("utf-8")).hexdigest()[:16], 16)
     position = bucket / float(16**16)
@@ -416,6 +802,36 @@ def window_sequences(
     sequences: list[PreparedSequence],
     config: PreprocessingConfig,
 ) -> tuple[WindowRecord, ...]:
+    """Extract locus-block-aligned sliding windows with deterministic split labels.
+
+    For each prepared sequence the function:
+
+    1. Computes the enclosing locus blocks (aligned to
+       ``config.locus_block_size``).
+    2. Assigns each block to a fold via ``assign_split``.
+    3. Slides a window of ``config.window_size`` with stride
+       ``config.window_stride`` across the block–sequence overlap,
+       skipping windows that exceed ``config.max_ambiguity_fraction``.
+    4. Calls ``assert_split_safety`` at the end to guarantee that no
+       overlapping windows on the same contig belong to different folds.
+
+    Fragility: the locus-block alignment guarantees split safety *only*
+    when ``config.locus_block_size >= config.window_size``.  If that
+    invariant is violated, windows may span block boundaries and the
+    split-safety assertion will fire.
+
+    Args:
+        sequences: Normalised and filtered sequences from
+            ``prepare_sequences``.
+        config: Windowing and split parameters.
+
+    Returns:
+        Tuple of ``WindowRecord`` instances, sorted by extraction order.
+
+    Raises:
+        SplitLeakageError: If ``assert_split_safety`` detects cross-fold
+            overlap.
+    """
     windows: list[WindowRecord] = []
     for sequence in sequences:
         mask_counter = _WindowMaskCounter(sequence.mask_spans)
@@ -486,6 +902,22 @@ def window_sequences(
 
 
 def build_split_manifest(windows: tuple[WindowRecord, ...]) -> tuple[SplitManifestEntry, ...]:
+    """Build a deduplicated manifest mapping each locus block to its fold.
+
+    If a locus ID appears with conflicting split labels, a
+    ``SplitLeakageError`` is raised immediately.
+
+    Args:
+        windows: Window records (typically from ``window_sequences``).
+
+    Returns:
+        Sorted tuple of ``SplitManifestEntry`` instances, one per unique
+        locus block, ordered by ``(contig, block_start, split)``.
+
+    Raises:
+        SplitLeakageError: If any locus ID is assigned to more than one
+            fold.
+    """
     manifest: dict[str, SplitManifestEntry] = {}
     for window in windows:
         current = manifest.get(window.locus_id)
@@ -503,6 +935,22 @@ def build_split_manifest(windows: tuple[WindowRecord, ...]) -> tuple[SplitManife
 
 
 def assert_split_safety(windows: tuple[WindowRecord, ...]) -> None:
+    """Verify that no genomic leakage exists across train/validation folds.
+
+    Performs two checks:
+
+    1. **Locus-level**: every locus ID maps to exactly one split.
+    2. **Overlap-level**: on each contig, no pair of overlapping windows
+       belongs to different splits.  This uses a sweep-line algorithm
+       that sorts windows by ``(window_start, window_end)`` and
+       maintains an active set of unexpired windows.
+
+    Args:
+        windows: Window records to validate.
+
+    Raises:
+        SplitLeakageError: If either check fails.
+    """
     per_locus_split: dict[str, str] = {}
     for window in windows:
         existing = per_locus_split.setdefault(window.locus_id, window.split)
@@ -531,6 +979,23 @@ def assert_split_safety(windows: tuple[WindowRecord, ...]) -> None:
 def load_dnabert2_tokenizer(
     provenance: TokenizerProvenance = DNABERT2_TOKENIZER_PROVENANCE,
 ) -> tuple[TokenizerLike, TokenizerProvenance]:
+    """Load the pinned DNABERT-2 tokenizer from HuggingFace.
+
+    Before loading, the ``trust_remote_code`` flag is validated against
+    the pipeline contract via ``_assert_approved_dnabert2_trust_policy``.
+
+    Args:
+        provenance: Tokenizer pinning record; defaults to the module-level
+            ``DNABERT2_TOKENIZER_PROVENANCE``.
+
+    Returns:
+        ``(tokenizer, provenance)`` tuple.
+
+    Raises:
+        TokenizerContractError: If ``trust_remote_code`` does not match the
+            approved pipeline contract value.
+        RuntimeError: If the ``transformers`` package is not installed.
+    """
     _assert_approved_dnabert2_trust_policy(provenance.trust_remote_code)
     try:
         from transformers import AutoTokenizer
@@ -549,6 +1014,17 @@ def load_dnabert2_tokenizer(
 
 
 def _assert_approved_dnabert2_trust_policy(trust_remote_code: bool) -> None:
+    """Guard that *trust_remote_code* is a real bool matching the contract.
+
+    Combines the ``_require_boolean_trust_remote_code`` type check with
+    an identity comparison against ``DNABERT2_TRUST_REMOTE_CODE``.
+
+    Args:
+        trust_remote_code: Value to validate.
+
+    Raises:
+        TokenizerContractError: On type mismatch or value mismatch.
+    """
     trust_remote_code = _require_boolean_trust_remote_code(
         trust_remote_code,
         field_name="DNABERT-2 trust_remote_code policy",
@@ -567,6 +1043,23 @@ def _resolve_export_tokenizer_provenance(
     *,
     provenance: TokenizerProvenance | None,
 ) -> TokenizerProvenance:
+    """Resolve and validate the tokenizer provenance for an export batch.
+
+    If *tokenized_windows* is non-empty, the provenance is extracted from
+    the first record and verified to be uniform across all records.  An
+    explicit *provenance* argument, if given, must match.  If
+    *tokenized_windows* is empty, *provenance* must be provided.
+
+    Args:
+        tokenized_windows: Records to export (may be empty).
+        provenance: Optional explicit provenance override.
+
+    Returns:
+        The validated ``TokenizerProvenance``.
+
+    Raises:
+        ExportContractError: On provenance mismatch or missing provenance.
+    """
     if tokenized_windows:
         resolved = tokenized_windows[0].tokenizer
         _assert_approved_dnabert2_trust_policy(resolved.trust_remote_code)
@@ -590,6 +1083,26 @@ def tokenize_windows(
     tokenizer: TokenizerLike,
     provenance: TokenizerProvenance = DNABERT2_TOKENIZER_PROVENANCE,
 ) -> tuple[TokenizedWindow, ...]:
+    """Tokenise genomic windows with a DNABERT-2-compatible tokenizer.
+
+    Each window is first re-normalised against the provenance alphabet
+    via ``_prepare_window_for_tokenization``, then tokenised.  The
+    function enforces that token counts do not exceed
+    ``provenance.max_position_embeddings`` and that ``input_ids`` and
+    ``attention_mask`` are aligned.
+
+    Args:
+        windows: Genomic windows to tokenise.
+        tokenizer: A callable conforming to ``TokenizerLike``.
+        provenance: Tokenizer provenance for contract validation.
+
+    Returns:
+        Tuple of ``TokenizedWindow`` instances.
+
+    Raises:
+        TokenizerContractError: On missing fields, length mismatches,
+            or token counts exceeding ``max_position_embeddings``.
+    """
     tokenized: list[TokenizedWindow] = []
     for window in windows:
         tokenization_window = _prepare_window_for_tokenization(window, provenance)
@@ -626,6 +1139,29 @@ def write_tokenized_dataset(
     contract: ExportContract = DEFAULT_PARQUET_EXPORT_CONTRACT,
     provenance: TokenizerProvenance | None = None,
 ) -> dict[str, list[Path]]:
+    """Write tokenised windows to a Hive-partitioned Parquet dataset.
+
+    Records are sorted by ``(split, contig, block_start, window_start,
+    sample_id, source)`` and partitioned by the keys in
+    ``contract.deterministic_partition_keys``.  A ``metadata.json``
+    sidecar is written alongside the Parquet files for downstream
+    auditability.
+
+    Args:
+        tokenized_windows: Records to serialise.
+        output_dir: Root directory for the Parquet dataset.
+        contract: Export settings governing format, partitioning, and
+            preservation flags.
+        provenance: Optional explicit tokenizer provenance; inferred
+            from *tokenized_windows* if ``None``.
+
+    Returns:
+        Mapping from split name to the list of written Parquet file paths.
+
+    Raises:
+        ExportContractError: If ``contract.format`` is not ``"parquet"``
+            or provenance validation fails.
+    """
     if contract.format != "parquet":
         raise ExportContractError(
             "write_tokenized_dataset only supports parquet contracts; "
@@ -704,6 +1240,26 @@ def write_webdataset_shards(
     records_per_shard: int | None = None,
     provenance: TokenizerProvenance | None = None,
 ) -> dict[str, list[Path]]:
+    """Write tokenised windows as WebDataset ``.tar`` shards.
+
+    Each shard contains JSON records with deterministic tar metadata
+    (``mtime=0``, ``uid=0``, ``gid=0``) for reproducibility.  A
+    ``metadata.json`` sidecar is written alongside the shards.
+
+    Args:
+        tokenized_windows: Records to serialise.
+        output_dir: Root directory for the shard files.
+        records_per_shard: Maximum records per ``.tar`` file; if ``None``,
+            all records for a split are written to a single shard.
+        provenance: Optional explicit tokenizer provenance.
+
+    Returns:
+        Mapping from split name to the list of written shard paths.
+
+    Raises:
+        ValueError: If *records_per_shard* is non-positive.
+        ExportContractError: On provenance validation failure.
+    """
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
 
@@ -787,6 +1343,22 @@ def write_webdataset_shards(
 
 
 def _coerce_int_tuple(value: Any, *, field_name: str) -> tuple[int, ...]:
+    """Coerce tokenizer output to a flat ``tuple[int, ...]``.
+
+    Handles NumPy arrays (via ``.tolist()``), nested single-element
+    batches (``[[1, 2, 3]]``), and plain lists.
+
+    Args:
+        value: Raw tokenizer output for a single field.
+        field_name: Human-readable label for error messages.
+
+    Returns:
+        A flat tuple of integers.
+
+    Raises:
+        TokenizerContractError: If *value* is ``None``, not coercible
+            to a flat int list, or contains non-integer elements.
+    """
     if value is None:
         raise TokenizerContractError(f"Tokenizer output is missing {field_name}")
     if hasattr(value, "tolist"):
@@ -802,6 +1374,21 @@ def _prepare_window_for_tokenization(
     window: WindowRecord,
     provenance: TokenizerProvenance,
 ) -> WindowRecord:
+    """Re-normalise a window's sequence against the tokenizer's alphabet.
+
+    If the normalised sequence differs from the original, a new
+    ``WindowRecord`` is returned with updated sequence, GC fraction,
+    ambiguity fraction, and sequence hash.
+
+    Args:
+        window: The window to prepare.
+        provenance: Tokenizer provenance controlling the alphabet and
+            unsupported-symbol policy.
+
+    Returns:
+        The original *window* if no changes were needed, or a new
+        ``WindowRecord`` with the re-normalised sequence.
+    """
     normalized_sequence = _normalize_tokenizer_sequence(window.sequence, provenance)
     if normalized_sequence == window.sequence:
         return window
@@ -829,6 +1416,14 @@ def _prepare_window_for_tokenization(
 
 
 def _format_window_context(window: WindowRecord) -> str:
+    """Format window metadata as a human-readable string for error messages.
+
+    Args:
+        window: The window to describe.
+
+    Returns:
+        Comma-separated key=value summary.
+    """
     return (
         f"sample_id={window.sample_id}, "
         f"individual_id={window.individual_id}, "
@@ -840,6 +1435,22 @@ def _format_window_context(window: WindowRecord) -> str:
 
 
 def _normalize_tokenizer_sequence(sequence: str, provenance: TokenizerProvenance) -> str:
+    """Re-normalise *sequence* using the tokenizer's alphabet policy.
+
+    Translates ``provenance.unsupported_symbol_policy`` into the
+    ``ambiguity_mode`` parameter expected by ``normalize_sequence``,
+    and wraps ``PreprocessingError`` in ``TokenizerContractError``.
+
+    Args:
+        sequence: Nucleotide string to normalise.
+        provenance: Tokenizer provenance supplying the alphabet and policy.
+
+    Returns:
+        Normalised sequence.
+
+    Raises:
+        TokenizerContractError: If the sequence contains unsupported bases.
+    """
     ambiguity_mode = "reject" if provenance.unsupported_symbol_policy == "reject" else "mask"
     try:
         return normalize_sequence(
@@ -852,10 +1463,26 @@ def _normalize_tokenizer_sequence(sequence: str, provenance: TokenizerProvenance
 
 
 def _partition_tuple(window: WindowRecord) -> tuple[str, str, str]:
+    """Extract the Hive-partition key ``(split, contig, block_id)`` for a window.
+
+    Args:
+        window: The window record.
+
+    Returns:
+        Three-element tuple used as a dictionary key for partitioned export.
+    """
     return window.split, window.contig, f"{window.block_start}-{window.block_end}"
 
 
 def _load_pyarrow_parquet() -> tuple[Any, Any]:
+    """Lazily import ``pyarrow`` and ``pyarrow.parquet``.
+
+    Returns:
+        ``(pyarrow, pyarrow.parquet)`` module tuple.
+
+    Raises:
+        ExportContractError: If PyArrow is not installed.
+    """
     try:
         import pyarrow
         import pyarrow.parquet
@@ -867,6 +1494,15 @@ def _load_pyarrow_parquet() -> tuple[Any, Any]:
 
 
 def _export_record(record: TokenizedWindow, *, contract: ExportContract) -> dict[str, Any]:
+    """Serialise a ``TokenizedWindow`` into a flat export dictionary.
+
+    Args:
+        record: The tokenised window to export.
+        contract: Export settings controlling which fields are preserved.
+
+    Returns:
+        Dictionary suitable for Parquet row or WebDataset JSON payload.
+    """
     return {
         "attention_mask": list(record.attention_mask),
         "input_ids": list(record.input_ids),
@@ -878,6 +1514,18 @@ def _export_record(record: TokenizedWindow, *, contract: ExportContract) -> dict
 
 
 def _export_window(window: WindowRecord, *, contract: ExportContract) -> dict[str, Any]:
+    """Serialise a ``WindowRecord`` into a dictionary respecting *contract*.
+
+    Conditionally includes coordinates, raw sequence, and sequence hash
+    based on the ``ExportContract`` preservation flags.
+
+    Args:
+        window: The window to serialise.
+        contract: Export settings.
+
+    Returns:
+        Dictionary of window metadata and (optionally) sequence data.
+    """
     payload: dict[str, Any] = {
         "ambiguity_fraction": window.ambiguity_fraction,
         "gc_fraction": window.gc_fraction,
