@@ -1,4 +1,27 @@
-"""Bootstrap config loading and validation helpers."""
+"""Bootstrap config loading and validation helpers.
+
+This module owns the contract-enforcement boundary between raw TOML
+configuration files and the typed, frozen dataclass configs consumed by
+every downstream pipeline stage.  Every loader function (**load_experiment_config**,
+**load_feline_pipeline_config**) must reject configs that violate the
+approved scientific or engineering contracts *before* any pipeline work
+begins.
+
+Design invariants:
+
+* All dataclasses are ``frozen=True`` — once loaded and validated, a config
+  object is immutable and safe to share across threads or stages.
+* Boolean fields are guarded by :func:`_require_boolean_field`, which uses
+  ``type(value) is not bool`` (identity check against the ``bool`` type)
+  rather than ``isinstance``.  This is intentional: TOML distinguishes
+  ``true``/``false`` from integers ``1``/``0``, but Python's ``isinstance``
+  treats ``bool`` as a subclass of ``int``.  The strict ``type()`` check
+  ensures TOML-spec compliance so that ``1`` is never silently accepted
+  where ``true`` is required.
+* Contract constants (approved assemblies, tokenizer pins, split strategies,
+  etc.) are imported from ``data.pipeline_contract`` and ``baselines``; this
+  module never hard-codes those values inline.
+"""
 
 from __future__ import annotations
 
@@ -32,6 +55,35 @@ REQUIRED_STAGES = ("evaluate", BASELINE_EVALUATION_STAGE, "report")
 
 @dataclass(frozen=True)
 class ExperimentConfig:
+    """Immutable, validated snapshot of a bootstrap experiment TOML.
+
+    Every field has already passed the contract checks enforced by
+    :func:`load_experiment_config`; downstream stages may rely on the
+    values without re-validation.
+
+    Attributes:
+        name: Human-readable experiment identifier.
+        description: Free-text purpose or hypothesis.
+        requires_private_data: Whether the experiment depends on data that
+            must not be committed to the public repository.
+        primary_task: Task kind (must be ``coordinate_regression``).
+        primary_metric: Evaluation metric (must be
+            ``median_geodesic_error_km``).
+        split_unit: Granularity of train/test splitting (``sample_id``
+            or ``individual_id``).
+        jaguar_metadata_fields: Ordered tuple that must exactly match
+            :pydata:`data.contracts.JAGUAR_METADATA_FIELDS`.
+        stages: Ordered pipeline stage names; guaranteed non-empty,
+            unique, and containing all :pydata:`REQUIRED_STAGES`.
+        baseline_stage: Must equal
+            :pydata:`baselines.BASELINE_EVALUATION_STAGE`.
+        baseline_provider: Must equal
+            :pydata:`baselines.DEFERRED_BASELINE_PROVIDER`.
+        baseline_enabled: Must be ``False`` in bootstrap configs.
+        baseline_extension_point: Must equal
+            :pydata:`baselines.SHARED_BASELINE_EXTENSION_POINT`.
+    """
+
     name: str
     description: str
     requires_private_data: bool
@@ -48,6 +100,23 @@ class ExperimentConfig:
 
 @dataclass(frozen=True)
 class PipelinePathsConfig:
+    """Filesystem paths required by the feline genome pipeline.
+
+    All paths are stored as :class:`pathlib.Path` instances.  The loader
+    does **not** verify that the paths exist on disk — that responsibility
+    belongs to the stage that first accesses them.
+
+    Attributes:
+        reference_fasta: Reference genome FASTA file.
+        sample_manifest: CSV/TSV manifest mapping sample IDs to metadata.
+        source_vcf: Multi-sample VCF used as the variant source.
+        raw_dir: Root directory for raw (pre-consensus) intermediate files.
+        processed_dir: Root directory for post-consensus processed outputs.
+        baseline_dir: Directory for baseline model artifacts.
+        artifact_dir: General artifact storage (models, checkpoints).
+        report_dir: Directory where final evaluation reports are written.
+    """
+
     reference_fasta: Path
     sample_manifest: Path
     source_vcf: Path
@@ -60,6 +129,29 @@ class PipelinePathsConfig:
 
 @dataclass(frozen=True)
 class ConsensusConfig:
+    """VCF-to-consensus-sequence conversion parameters.
+
+    The loader enforces that ``assembly`` matches the approved reference,
+    that both mismatch-guard booleans are ``True``, and that every genotype
+    policy string belongs to :pydata:`pipeline_contract.EXPLICIT_CONSENSUS_POLICIES`.
+
+    Attributes:
+        assembly: Reference assembly identifier (e.g. ``felCat9``).
+        require_assembly_match: Must be ``True``; fail-fast guard against
+            assembly mismatches between the VCF and the reference.
+        require_contig_match: Must be ``True``; fail-fast guard against
+            contig name mismatches.
+        mask_symbol: Character used for ambiguous or masked positions
+            (must be ``N``).
+        homozygous_reference: Consensus policy for 0/0 genotypes.
+        homozygous_alternate: Consensus policy for 1/1 genotypes.
+        heterozygous: Consensus policy for 0/1 genotypes.
+        multiallelic: Consensus policy for multi-allelic sites.
+        filtered: Consensus policy for filtered sites.
+        missing: Consensus policy for missing genotypes (``./.``).
+        indel: Consensus policy for insertion/deletion variants.
+    """
+
     assembly: str
     require_assembly_match: bool
     require_contig_match: bool
@@ -75,6 +167,20 @@ class ConsensusConfig:
 
 @dataclass(frozen=True)
 class WindowingConfig:
+    """Sliding-window parameters for slicing consensus sequences.
+
+    Attributes:
+        context_window: Window width in base pairs; must be positive.
+        window_overlap: Number of overlapping base pairs between
+            consecutive windows; must be ``>= 0`` and strictly less than
+            ``context_window``.
+        max_ambiguous_fraction: Maximum fraction of ambiguous (``N``)
+            bases allowed per window before the window is discarded;
+            must be in ``[0, 1]``.
+        drop_short_sequences: Whether to discard windows shorter than
+            ``context_window`` (e.g. at contig boundaries).
+    """
+
     context_window: int
     window_overlap: int
     max_ambiguous_fraction: float
@@ -83,6 +189,28 @@ class WindowingConfig:
 
 @dataclass(frozen=True)
 class SplitConfig:
+    """Train/test split strategy enforcing locus-safe data leakage prevention.
+
+    The loader validates that the strategy matches
+    :pydata:`pipeline_contract.GLOBAL_LOCUS_SPLIT_STRATEGY`, key fields are
+    ``('contig', 'block_id')``, and block size is at least as large as the
+    context window.
+
+    Attributes:
+        strategy: Split algorithm name (must match the global locus-safe
+            contract).
+        locus_key_fields: Fields that define a unique genomic locus for
+            split assignment; must be ``('contig', 'block_id')``.
+        locus_block_size: Size of contiguous genomic blocks assigned to
+            a single split; must be ``>= context_window`` to prevent
+            data leakage across split boundaries.
+        assignment_stage: Pipeline stage at which locus split assignments
+            are computed (must be ``pre_window``).
+        evaluation_target: Which split partition is used for evaluation.
+        baseline_policy: How the baseline corpus reuses locus assignments
+            (must match :pydata:`pipeline_contract.REFERENCE_BASELINE_POLICY`).
+    """
+
     strategy: str
     locus_key_fields: tuple[str, ...]
     locus_block_size: int
@@ -93,6 +221,28 @@ class SplitConfig:
 
 @dataclass(frozen=True)
 class TokenizerConfig:
+    """DNABERT-2 tokenizer pinning and alphabet contract.
+
+    The loader pins the tokenizer to an exact HuggingFace model ID and
+    immutable revision, and validates that the allowed alphabet matches
+    the post-consensus contract.
+
+    Attributes:
+        identifier: HuggingFace model identifier (must be
+            ``zhihan1996/DNABERT-2-117M``).
+        revision: Immutable Git revision hash for reproducibility.
+        allowed_alphabet: Tuple of single-character strings representing
+            valid nucleotide symbols after consensus building; must
+            exactly match :pydata:`pipeline_contract.POST_CONSENSUS_ALLOWED_ALPHABET`.
+        unsupported_symbol_policy: Action when an out-of-alphabet symbol
+            is encountered (``reject`` or ``normalize_to_n``).
+        max_position_embeddings: Maximum sequence length the tokenizer
+            supports; must be ``>= context_window``.
+        trust_remote_code: Whether to allow execution of model-hub code;
+            validated via :func:`_require_boolean_field` and must match
+            :pydata:`pipeline_contract.DNABERT2_TRUST_REMOTE_CODE`.
+    """
+
     identifier: str
     revision: str
     allowed_alphabet: tuple[str, ...]
@@ -103,6 +253,29 @@ class TokenizerConfig:
 
 @dataclass(frozen=True)
 class ExportConfig:
+    """Parquet export settings with auditability guarantees.
+
+    The loader enforces that the format is ``parquet``, coordinates are
+    preserved, and at least one of raw windows or sequence hashes is
+    retained for reproducibility auditing.
+
+    Attributes:
+        format: Serialisation format (must be ``parquet``).
+        access_pattern: Hint for downstream readers (e.g. ``row_group``).
+        row_group_size: Number of rows per Parquet row group; must be
+            positive.
+        deterministic_partition_keys: Column names used for deterministic
+            partitioning of output files.
+        preserve_raw_windows: Whether raw consensus windows are stored
+            alongside tokenized outputs.
+        preserve_sequence_hashes: Whether immutable SHA-256 hashes of
+            each window are stored for integrity verification.
+        preserve_coordinates: Must be ``True`` for auditability — every
+            exported row must carry its genomic coordinates.
+        sequence_hash_algorithm: Hash algorithm for sequence integrity
+            checks (must be ``sha256``).
+    """
+
     format: str
     access_pattern: str
     row_group_size: int
@@ -115,11 +288,40 @@ class ExportConfig:
 
 @dataclass(frozen=True)
 class RuntimeConfig:
+    """Runtime dependency declarations.
+
+    Attributes:
+        external_tools: Tuple of CLI tool names (e.g. ``bcftools``) that
+            must be available on ``$PATH`` before the pipeline starts.
+            Validated against
+            :pydata:`pipeline_contract.REQUIRED_EXTERNAL_TOOLS`.
+    """
+
     external_tools: tuple[str, ...]
 
 
 @dataclass(frozen=True)
 class FelinePipelineConfig:
+    """Top-level validated configuration for the feline genome pipeline.
+
+    Composed of section-specific frozen dataclasses, each independently
+    validated by :func:`load_feline_pipeline_config`.  This object is the
+    single source of truth passed to every pipeline stage.
+
+    Attributes:
+        name: Human-readable pipeline name.
+        description: Free-text description of the pipeline run.
+        project_accession: NCBI BioProject accession; must match
+            :pydata:`pipeline_contract.APPROVED_BIOPROJECT_ACCESSION`.
+        paths: Filesystem paths (:class:`PipelinePathsConfig`).
+        consensus: VCF-to-consensus parameters (:class:`ConsensusConfig`).
+        windowing: Sliding-window parameters (:class:`WindowingConfig`).
+        split: Train/test split strategy (:class:`SplitConfig`).
+        tokenizer: DNABERT-2 tokenizer pinning (:class:`TokenizerConfig`).
+        export: Parquet export settings (:class:`ExportConfig`).
+        runtime: External tool requirements (:class:`RuntimeConfig`).
+    """
+
     name: str
     description: str
     project_accession: str
@@ -138,6 +340,30 @@ def _require_boolean_field(
     field_name: str,
     contract_description: str | None = None,
 ) -> bool:
+    """Validate that *value* is a native Python ``bool``, not a truthy int.
+
+    This function deliberately uses ``type(value) is not bool`` instead of
+    ``isinstance(value, bool)``.  The reason is TOML-spec compliance:
+    TOML distinguishes ``true``/``false`` from integers ``1``/``0``, but
+    in Python ``bool`` is a subclass of ``int``, so ``isinstance(1, bool)``
+    returns ``False`` while ``isinstance(True, int)`` returns ``True``.
+    Using the identity check against the ``bool`` type ensures that an
+    integer ``1`` parsed from a TOML value is never silently accepted
+    where a boolean ``true`` is required.
+
+    Args:
+        value: The raw value parsed from the TOML config file.
+        field_name: Dotted config key name used in error messages
+            (e.g. ``"consensus.require_assembly_match"``).
+        contract_description: Optional human-readable description of the
+            contract being enforced, appended to the error message.
+
+    Returns:
+        The validated ``bool`` value, unchanged.
+
+    Raises:
+        ValueError: If *value* is not exactly of type ``bool``.
+    """
     if type(value) is not bool:
         contract_suffix = ""
         if contract_description is not None:
@@ -150,6 +376,28 @@ def _require_boolean_field(
 
 
 def load_experiment_config(path: str | Path) -> ExperimentConfig:
+    """Load and validate a bootstrap experiment TOML file.
+
+    Enforces every contract defined by the bootstrap specification:
+
+    * ``jaguar_metadata_fields`` must exactly match the canonical list.
+    * Primary task must be ``coordinate_regression`` with metric
+      ``median_geodesic_error_km``.
+    * ``split_unit`` must be ``sample_id`` or ``individual_id``.
+    * Stage ordering must be non-empty, unique, and include all
+      :pydata:`REQUIRED_STAGES`.
+    * Baseline settings must match the deferred-legacy extension contract.
+
+    Args:
+        path: Filesystem path to a TOML experiment config file.
+
+    Returns:
+        A fully validated, frozen :class:`ExperimentConfig`.
+
+    Raises:
+        ValueError: If any contract check fails.
+        KeyError: If a required TOML section or key is missing.
+    """
     raw = tomllib.loads(Path(path).read_text(encoding="utf-8"))
     experiment = raw["experiment"]
     data = raw["data"]
@@ -199,6 +447,33 @@ def load_experiment_config(path: str | Path) -> ExperimentConfig:
 
 
 def load_feline_pipeline_config(path: str | Path) -> FelinePipelineConfig:
+    """Load and validate a feline genome pipeline TOML config.
+
+    Performs exhaustive contract enforcement across all eight required
+    sections (``pipeline``, ``paths``, ``consensus``, ``windowing``,
+    ``split``, ``tokenizer``, ``export``, ``runtime``).  Key validations
+    include:
+
+    * BioProject accession and reference assembly pinning.
+    * Consensus mismatch-guard booleans (via :func:`_require_boolean_field`).
+    * Genotype policy strings against the explicit consensus policy set.
+    * Windowing arithmetic (positive window, valid overlap, ambiguity
+      fraction in ``[0, 1]``).
+    * Locus-safe split strategy and block-size >= context-window guard.
+    * DNABERT-2 tokenizer identity, revision, and alphabet pinning.
+    * Parquet export auditability (coordinates preserved, hash algorithm).
+    * External tool manifest matching the required set.
+
+    Args:
+        path: Filesystem path to a TOML pipeline config file.
+
+    Returns:
+        A fully validated, frozen :class:`FelinePipelineConfig`.
+
+    Raises:
+        ValueError: If any contract check fails or a required section /
+            field is missing.
+    """
     raw = tomllib.loads(Path(path).read_text(encoding="utf-8"))
     required_sections = (
         "pipeline",
@@ -386,12 +661,43 @@ def load_feline_pipeline_config(path: str | Path) -> FelinePipelineConfig:
 
 
 def check_feline_pipeline_runtime(path: str | Path) -> FelinePipelineConfig:
+    """Load, validate, and verify runtime dependencies for the feline pipeline.
+
+    This is the preferred entry point when you need both config validation
+    **and** confirmation that all required external tools (e.g. ``bcftools``)
+    are available on ``$PATH``.
+
+    Args:
+        path: Filesystem path to a TOML pipeline config file.
+
+    Returns:
+        A fully validated :class:`FelinePipelineConfig` (same as
+        :func:`load_feline_pipeline_config`).
+
+    Raises:
+        ValueError: If any config contract check fails.
+        RuntimeError: If a required external tool is not found on
+            ``$PATH``.
+    """
     config = load_feline_pipeline_config(path)
     assert_external_tools_available(config.runtime.external_tools)
     return config
 
 
 def describe_experiment(path: str | Path) -> str:
+    """Return a human-readable multi-line summary of an experiment config.
+
+    Loads and validates the config via :func:`load_experiment_config`,
+    then formats the key fields into a newline-separated string suitable
+    for logging or CLI output.
+
+    Args:
+        path: Filesystem path to a TOML experiment config file.
+
+    Returns:
+        Multi-line string summarising experiment name, task, metric,
+        stages, and baseline settings.
+    """
     config = load_experiment_config(path)
     return "\n".join(
         [
@@ -412,6 +718,19 @@ def describe_experiment(path: str | Path) -> str:
 
 
 def describe_feline_pipeline(path: str | Path) -> str:
+    """Return a human-readable multi-line summary of a feline pipeline config.
+
+    Loads and validates the config via :func:`load_feline_pipeline_config`,
+    then formats the key fields — accession, consensus assembly, split
+    contract, tokenizer pin, export settings, and runtime tools — into a
+    newline-separated string suitable for logging or CLI output.
+
+    Args:
+        path: Filesystem path to a TOML pipeline config file.
+
+    Returns:
+        Multi-line string summarising the pipeline configuration.
+    """
     config = load_feline_pipeline_config(path)
     return "\n".join(
         [
