@@ -119,6 +119,31 @@ def test_window_sequences_track_unique_masked_bases_across_overlapping_spans() -
     assert windows[1].masked_base_counts == (("filtered", 4), ("no_call", 4))
 
 
+def test_window_sequences_count_realized_n_coverage_without_mask_spans() -> None:
+    config = PreprocessingConfig(
+        min_sequence_length=6,
+        max_ambiguity_fraction=1.0,
+        window_size=6,
+        window_stride=6,
+        locus_block_size=6,
+    )
+
+    report = prepare_sequences(
+        [SequenceRecord("ref-1", "reference", "chr1", "ACGNAA", source="reference")],
+        config,
+    )
+
+    windows = window_sequences(list(report.retained), config)
+
+    assert len(windows) == 1
+    assert windows[0].sequence == "ACGNAA"
+    assert windows[0].unique_masked_bases == 1
+    assert windows[0].filtered_bases == 0
+    assert windows[0].no_call_bases == 0
+    assert windows[0].other_masked_bases == 0
+    assert windows[0].masked_base_counts == ()
+
+
 def test_window_sequences_drop_high_ambiguity_windows_from_retained_sequence() -> None:
     config = PreprocessingConfig(
         min_sequence_length=8,

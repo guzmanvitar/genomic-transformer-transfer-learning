@@ -9,6 +9,7 @@ import textwrap
 import pytest
 
 from jaguar_geo_assign.data.acquisition import (
+    AcquisitionError,
     ContigMismatchError,
     MalformedGenotypeError,
     MissingToolError,
@@ -188,6 +189,46 @@ def test_generate_consensus_fasta_fails_fast_on_malformed_gt_tokens(tmp_path: Pa
             output_fasta=tmp_path / "cat_1.fa",
             bcftools_executable=str(fake_bcftools),
         )
+
+
+def test_generate_consensus_fasta_fails_fast_on_truncated_vcf_record_with_actionable_context(tmp_path: Path) -> None:
+    reference = tmp_path / "reference.fa"
+    reference.write_text(
+        ">chr1 GCF_000181335.3 Felis_catus_9.0\nAACCAA\n",
+        encoding="utf-8",
+    )
+    vcf = tmp_path / "cat_1.vcf"
+    vcf.write_text(
+        textwrap.dedent(
+            """\
+            ##fileformat=VCFv4.2
+            ##reference=GCF_000181335.3_Felis_catus_9.0
+            ##contig=<ID=chr1,length=6>
+            #CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tcat_1
+            chr1\t2\t.\tA\tT\t.\tPASS\t.
+            """
+        ),
+        encoding="utf-8",
+    )
+    fake_bcftools = _write_fake_bcftools(tmp_path)
+
+    with pytest.raises(AcquisitionError) as exc_info:
+        generate_consensus_fasta(
+            sample_id="cat_1",
+            reference_fasta=reference,
+            sample_vcf=vcf,
+            output_fasta=tmp_path / "cat_1.fa",
+            bcftools_executable=str(fake_bcftools),
+        )
+
+    message = str(exc_info.value)
+    assert "Malformed VCF record" in message
+    assert str(vcf) in message
+    assert "sample 'cat_1'" in message
+    assert "line 5" in message
+    assert "expected at least 10 tab-delimited columns" in message
+    assert "found 8" in message
+    assert "not enough values to unpack" not in message
 
 
 @pytest.mark.parametrize(

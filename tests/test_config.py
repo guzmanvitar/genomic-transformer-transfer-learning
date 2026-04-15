@@ -116,3 +116,33 @@ def test_load_feline_pipeline_config_rejects_non_boolean_trust_remote_code(
         load_feline_pipeline_config(invalid_config)
 
     assert expected_fragment in str(exc_info.value)
+
+
+@pytest.mark.parametrize("field_name", ["require_assembly_match", "require_contig_match"])
+@pytest.mark.parametrize(
+    ("replacement", "expected_fragment"),
+    [("1", "1 (int)"), ('"true"', "'true' (str)")],
+)
+def test_load_feline_pipeline_config_rejects_non_boolean_consensus_mismatch_guards(
+    tmp_path: Path,
+    field_name: str,
+    replacement: str,
+    expected_fragment: str,
+) -> None:
+    invalid_config = tmp_path / f"invalid_{field_name}_type.toml"
+    invalid_config.write_text(
+        Path("configs/examples/feline_pretrain.toml").read_text(encoding="utf-8").replace(
+            f"{field_name} = true",
+            f"{field_name} = {replacement}",
+            1,
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(
+        ValueError,
+        match=rf"consensus\.{field_name} must be a TOML boolean true/false",
+    ) as exc_info:
+        load_feline_pipeline_config(invalid_config)
+
+    assert expected_fragment in str(exc_info.value)
