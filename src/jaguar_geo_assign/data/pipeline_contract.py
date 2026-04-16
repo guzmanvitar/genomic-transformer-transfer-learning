@@ -60,9 +60,6 @@ REQUIRED_EXTERNAL_TOOLS = ("bcftools",)
 # Mandatory columns in the sample manifest CSV/TSV.
 REQUIRED_SAMPLE_MANIFEST_FIELDS = ("sample_id", "individual_id", "vcf_path")
 
-# Human-readable install command shown when the PyArrow dependency is missing.
-PYARROW_INSTALL_HINT = 'uv add "pyarrow>=16,<20"'
-
 # Consensus-calling policy whitelist
 
 # Exhaustive set of allowed policies for resolving heterozygous or
