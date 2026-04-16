@@ -65,23 +65,20 @@ class ExperimentConfig:
         name: Human-readable experiment identifier.
         description: Free-text purpose or hypothesis.
         requires_private_data: Whether the experiment depends on data that
-            must not be committed to the public repository.
-        primary_task: Task kind (must be ``coordinate_regression``).
-        primary_metric: Evaluation metric (must be
-            ``median_geodesic_error_km``).
+            should not be committed to the public repository.
+        primary_task: Task kind name.
+        primary_metric: Evaluation metric name.
         split_unit: Granularity of train/test splitting (``sample_id``
             or ``individual_id``).
-        jaguar_metadata_fields: Ordered tuple that must exactly match
-            :pydata:`data.contracts.JAGUAR_METADATA_FIELDS`.
-        stages: Ordered pipeline stage names; guaranteed non-empty,
-            unique, and containing all :pydata:`REQUIRED_STAGES`.
-        baseline_stage: Must equal
-            :pydata:`baselines.BASELINE_EVALUATION_STAGE`.
-        baseline_provider: Must equal
-            :pydata:`baselines.DEFERRED_BASELINE_PROVIDER`.
-        baseline_enabled: Must be ``False`` in bootstrap configs.
-        baseline_extension_point: Must equal
-            :pydata:`baselines.SHARED_BASELINE_EXTENSION_POINT`.
+        jaguar_metadata_fields: Ordered tuple of metadata field names.
+        stages: Ordered pipeline stage names.
+        baseline_stage: Pipeline stage at which baseline evaluation runs.
+        baseline_provider: Identifier for the baseline provider
+            implementation.
+        baseline_enabled: Whether baseline execution is enabled for this
+            run.
+        baseline_extension_point: Name of the shared baseline extension
+            point.
     """
 
     name: str
@@ -137,12 +134,11 @@ class ConsensusConfig:
 
     Attributes:
         assembly: Reference assembly identifier (e.g. ``felCat9``).
-        require_assembly_match: Must be ``True``; fail-fast guard against
-            assembly mismatches between the VCF and the reference.
-        require_contig_match: Must be ``True``; fail-fast guard against
-            contig name mismatches.
-        mask_symbol: Character used for ambiguous or masked positions
-            (must be ``N``).
+        require_assembly_match: Fail-fast guard against assembly
+            mismatches between the VCF and the reference.
+        require_contig_match: Fail-fast guard against contig name
+            mismatches.
+        mask_symbol: Character used for ambiguous or masked positions.
         homozygous_reference: Consensus policy for 0/0 genotypes.
         homozygous_alternate: Consensus policy for 1/1 genotypes.
         heterozygous: Consensus policy for 0/1 genotypes.
@@ -170,13 +166,11 @@ class WindowingConfig:
     """Sliding-window parameters for slicing consensus sequences.
 
     Attributes:
-        context_window: Window width in base pairs; must be positive.
+        context_window: Window width in base pairs.
         window_overlap: Number of overlapping base pairs between
-            consecutive windows; must be ``>= 0`` and strictly less than
-            ``context_window``.
+            consecutive windows.
         max_ambiguous_fraction: Maximum fraction of ambiguous (``N``)
-            bases allowed per window before the window is discarded;
-            must be in ``[0, 1]``.
+            bases allowed per window before the window is discarded.
         drop_short_sequences: Whether to discard windows shorter than
             ``context_window`` (e.g. at contig boundaries).
     """
@@ -197,18 +191,15 @@ class SplitConfig:
     context window.
 
     Attributes:
-        strategy: Split algorithm name (must match the global locus-safe
-            contract).
+        strategy: Split algorithm name.
         locus_key_fields: Fields that define a unique genomic locus for
-            split assignment; must be ``('contig', 'block_id')``.
+            split assignment.
         locus_block_size: Size of contiguous genomic blocks assigned to
-            a single split; must be ``>= context_window`` to prevent
-            data leakage across split boundaries.
+            a single split.
         assignment_stage: Pipeline stage at which locus split assignments
-            are computed (must be ``pre_window``).
+            are computed.
         evaluation_target: Which split partition is used for evaluation.
-        baseline_policy: How the baseline corpus reuses locus assignments
-            (must match :pydata:`pipeline_contract.REFERENCE_BASELINE_POLICY`).
+        baseline_policy: How the baseline corpus reuses locus assignments.
     """
 
     strategy: str
@@ -228,19 +219,15 @@ class TokenizerConfig:
     the post-consensus contract.
 
     Attributes:
-        identifier: HuggingFace model identifier (must be
-            ``zhihan1996/DNABERT-2-117M``).
+        identifier: HuggingFace model identifier on the HuggingFace Hub.
         revision: Immutable Git revision hash for reproducibility.
         allowed_alphabet: Tuple of single-character strings representing
-            valid nucleotide symbols after consensus building; must
-            exactly match :pydata:`pipeline_contract.POST_CONSENSUS_ALLOWED_ALPHABET`.
+            valid nucleotide symbols after consensus building.
         unsupported_symbol_policy: Action when an out-of-alphabet symbol
             is encountered (``reject`` or ``normalize_to_n``).
         max_position_embeddings: Maximum sequence length the tokenizer
-            supports; must be ``>= context_window``.
-        trust_remote_code: Whether to allow execution of model-hub code;
-            validated via :func:`_require_boolean_field` and must match
-            :pydata:`pipeline_contract.DNABERT2_TRUST_REMOTE_CODE`.
+            supports.
+        trust_remote_code: Whether to allow execution of model-hub code.
     """
 
     identifier: str
@@ -260,20 +247,19 @@ class ExportConfig:
     retained for reproducibility auditing.
 
     Attributes:
-        format: Serialisation format (must be ``parquet``).
+        format: Serialisation format.
         access_pattern: Hint for downstream readers (e.g. ``row_group``).
-        row_group_size: Number of rows per Parquet row group; must be
-            positive.
+        row_group_size: Number of rows per Parquet row group.
         deterministic_partition_keys: Column names used for deterministic
             partitioning of output files.
         preserve_raw_windows: Whether raw consensus windows are stored
             alongside tokenized outputs.
         preserve_sequence_hashes: Whether immutable SHA-256 hashes of
             each window are stored for integrity verification.
-        preserve_coordinates: Must be ``True`` for auditability — every
-            exported row must carry its genomic coordinates.
+        preserve_coordinates: Whether exported rows carry their genomic
+            coordinates.
         sequence_hash_algorithm: Hash algorithm for sequence integrity
-            checks (must be ``sha256``).
+            checks.
     """
 
     format: str
@@ -291,10 +277,8 @@ class RuntimeConfig:
     """Runtime dependency declarations.
 
     Attributes:
-        external_tools: Tuple of CLI tool names (e.g. ``bcftools``) that
-            must be available on ``$PATH`` before the pipeline starts.
-            Validated against
-            :pydata:`pipeline_contract.REQUIRED_EXTERNAL_TOOLS`.
+        external_tools: Tuple of CLI tool names (e.g. ``bcftools``)
+            required on ``$PATH`` before the pipeline starts.
     """
 
     external_tools: tuple[str, ...]
@@ -311,8 +295,7 @@ class FelinePipelineConfig:
     Attributes:
         name: Human-readable pipeline name.
         description: Free-text description of the pipeline run.
-        project_accession: NCBI BioProject accession; must match
-            :pydata:`pipeline_contract.APPROVED_BIOPROJECT_ACCESSION`.
+        project_accession: NCBI BioProject accession.
         paths: Filesystem paths (:class:`PipelinePathsConfig`).
         consensus: VCF-to-consensus parameters (:class:`ConsensusConfig`).
         windowing: Sliding-window parameters (:class:`WindowingConfig`).
