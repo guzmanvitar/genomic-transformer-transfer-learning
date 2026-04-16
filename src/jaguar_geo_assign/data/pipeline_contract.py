@@ -13,7 +13,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import shutil
 
-# -- Data-provenance contracts ------------------------------------------------
+# Data-provenance contracts
 
 # NCBI BioProject accession that all input VCFs must originate from.
 APPROVED_BIOPROJECT_ACCESSION = "PRJNA308208"
@@ -21,7 +21,7 @@ APPROVED_BIOPROJECT_ACCESSION = "PRJNA308208"
 # NCBI reference assembly used for variant calling and coordinate mapping.
 APPROVED_REFERENCE_ASSEMBLY = "Felis_catus_9.0"
 
-# -- DNABERT-2 tokenizer pinned coordinates -----------------------------------
+# DNABERT-2 tokenizer pinned coordinates
 
 # Hugging Face model identifier for the pre-trained DNABERT-2 tokenizer.
 DNABERT2_TOKENIZER_ID = "zhihan1996/DNABERT-2-117M"
@@ -32,13 +32,13 @@ DNABERT2_TOKENIZER_REVISION = "7bce263b15377fc15361f52cfab88f8b586abda0"
 # DNABERT-2 requires custom tokenizer code; this flag authorises it.
 DNABERT2_TRUST_REMOTE_CODE = True
 
-# -- Consensus-sequence contracts ---------------------------------------------
+# Consensus-sequence contracts
 
 # Only these five characters may appear after consensus resolution.
 # Any base outside this alphabet indicates a pipeline bug.
 POST_CONSENSUS_ALLOWED_ALPHABET = ("A", "C", "G", "T", "N")
 
-# -- Train / validation / test split contracts --------------------------------
+# Train / validation / test split contracts
 
 # Split strategy that assigns entire locus blocks to a single fold,
 # preventing data leakage from overlapping genomic windows.
@@ -52,7 +52,7 @@ PRE_WINDOW_ASSIGNMENT_STAGE = "before_windowing"
 # fold assignments rather than re-splitting at the window level.
 REFERENCE_BASELINE_POLICY = "reuse_locus_assignments"
 
-# -- External-tool and manifest contracts -------------------------------------
+# External-tool and manifest contracts
 
 # CLI tools that must be on $PATH before any pipeline stage executes.
 REQUIRED_EXTERNAL_TOOLS = ("bcftools",)
@@ -63,7 +63,7 @@ REQUIRED_SAMPLE_MANIFEST_FIELDS = ("sample_id", "individual_id", "vcf_path")
 # Human-readable install command shown when the PyArrow dependency is missing.
 PYARROW_INSTALL_HINT = 'uv add "pyarrow>=16,<20"'
 
-# -- Consensus-calling policy whitelist ---------------------------------------
+# Consensus-calling policy whitelist
 
 # Exhaustive set of allowed policies for resolving heterozygous or
 # multi-allelic sites during consensus-sequence construction.
