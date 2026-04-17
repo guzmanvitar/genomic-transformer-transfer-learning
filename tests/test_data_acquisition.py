@@ -1,3 +1,12 @@
+"""Tests for resilient dataset download behavior.
+
+These tests guard the contract that ``download_with_retry`` must resume
+partially downloaded files via HTTP Range requests, verify payload integrity
+against a pinned checksum, retry only on transient network errors, and fail
+fast on deterministic acquisition errors. Together they ensure the data
+acquisition layer is both bandwidth-efficient and forensically reproducible.
+"""
+
 from __future__ import annotations
 
 import hashlib
@@ -40,6 +49,7 @@ class _FakeOpener:
 
 
 def test_download_with_retry_resumes_partial_file_and_verifies_checksum(tmp_path: Path) -> None:
+    """Resuming from a partial file issues a Range header and still passes checksum verification."""
     destination = tmp_path / "cat.vcf.gz"
     partial = destination.with_name(f"{destination.name}.part")
     partial.write_bytes(b"ACGT")
@@ -60,6 +70,7 @@ def test_download_with_retry_resumes_partial_file_and_verifies_checksum(tmp_path
 
 
 def test_download_with_retry_retries_after_transient_failure(tmp_path: Path) -> None:
+    """Transient network errors (e.g. TimeoutError) are retried until the download succeeds."""
     destination = tmp_path / "cat.vcf.gz"
     opener = _FakeOpener([TimeoutError("try again"), _FakeResponse(b"content")])
 
@@ -75,6 +86,7 @@ def test_download_with_retry_retries_after_transient_failure(tmp_path: Path) -> 
 
 
 def test_download_with_retry_fails_on_checksum_mismatch(tmp_path: Path) -> None:
+    """A checksum mismatch aborts without retry and leaves no partial or final artifact behind."""
     destination = tmp_path / "cat.vcf.gz"
     opener = _FakeOpener([_FakeResponse(b"wrong")])
 
@@ -98,6 +110,7 @@ def test_download_with_retry_fails_on_checksum_mismatch(tmp_path: Path) -> None:
 def test_download_with_retry_does_not_retry_non_transient_acquisition_errors(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """Deterministic AcquisitionError is raised immediately without consuming retry budget."""
     destination = tmp_path / "cat.vcf.gz"
     attempts = 0
 

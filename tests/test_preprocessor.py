@@ -1,3 +1,14 @@
+"""Tests for sequence preprocessing, normalization, and window accounting.
+
+These tests protect the contracts that short or overly ambiguous sequences
+are filtered with auditable reasons, IUPAC ambiguity codes are deterministically
+masked to ``N``, mask-span provenance (filtered / no_call / heterozygous)
+is preserved and deduplicated across overlapping spans, and windowing
+accurately re-accounts both declared masks and realized ``N`` coverage.
+Together they prevent silent data contamination and maintain traceability
+for downstream model-quality diagnostics.
+"""
+
 from jaguar_geo_assign.data.preprocessor import (
     PreprocessingConfig,
     SequenceRecord,
@@ -8,6 +19,7 @@ from jaguar_geo_assign.data.preprocessor import (
 
 
 def test_prepare_sequences_filters_short_and_ambiguous_records() -> None:
+    """Records below length or above ambiguity thresholds are filtered with labeled reasons."""
     config = PreprocessingConfig(
         min_sequence_length=6,
         max_ambiguity_fraction=0.34,
@@ -32,10 +44,12 @@ def test_prepare_sequences_filters_short_and_ambiguous_records() -> None:
 
 
 def test_normalize_sequence_masks_iupac_codes_deterministically() -> None:
+    """IUPAC ambiguity codes and gaps collapse to ``N`` under the default masking policy."""
     assert normalize_sequence("acgtRysw?-") == "ACGTNNNNNN"
 
 
 def test_normalize_sequence_rejects_unsupported_bases_when_requested() -> None:
+    """In ``reject`` ambiguity mode, unsupported bases raise instead of being silently masked."""
     config = PreprocessingConfig(
         min_sequence_length=4,
         max_ambiguity_fraction=1.0,
@@ -54,6 +68,7 @@ def test_normalize_sequence_rejects_unsupported_bases_when_requested() -> None:
 
 
 def test_window_sequences_preserve_mask_provenance_counts() -> None:
+    """Each window reports per-reason mask counts that match the originating mask spans."""
     config = PreprocessingConfig(
         min_sequence_length=8,
         max_ambiguity_fraction=1.0,
@@ -90,6 +105,7 @@ def test_window_sequences_preserve_mask_provenance_counts() -> None:
 
 
 def test_window_sequences_track_unique_masked_bases_across_overlapping_spans() -> None:
+    """Overlapping spans with different reasons don't double-count unique masked positions."""
     config = PreprocessingConfig(
         min_sequence_length=8,
         max_ambiguity_fraction=1.0,
@@ -120,6 +136,7 @@ def test_window_sequences_track_unique_masked_bases_across_overlapping_spans() -
 
 
 def test_window_sequences_count_realized_n_coverage_without_mask_spans() -> None:
+    """Reference inputs without declared mask spans still report ``N`` bases as unique masked coverage."""
     config = PreprocessingConfig(
         min_sequence_length=6,
         max_ambiguity_fraction=1.0,
@@ -145,6 +162,7 @@ def test_window_sequences_count_realized_n_coverage_without_mask_spans() -> None
 
 
 def test_window_sequences_drop_high_ambiguity_windows_from_retained_sequence() -> None:
+    """A retained sequence can still shed individual windows that exceed the per-window ambiguity cap."""
     config = PreprocessingConfig(
         min_sequence_length=8,
         max_ambiguity_fraction=0.25,

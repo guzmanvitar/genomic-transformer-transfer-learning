@@ -1,3 +1,14 @@
+"""Tests for experiment and feline pipeline configuration loaders.
+
+These tests defend the scientific and supply-chain contracts encoded in
+project TOML configs: jaguar metadata fields must match the bootstrap
+contract, feline pretraining must stay pinned to the approved BioProject,
+reference assembly, DNABERT-2 revision, and ``trust_remote_code`` policy,
+and every boolean-valued safety guard must be a real TOML boolean rather
+than a truthy-coercible string or integer. Together they ensure misconfigured
+runs fail loudly at load time instead of silently producing invalid science.
+"""
+
 from pathlib import Path
 
 import pytest
@@ -12,6 +23,7 @@ from jaguar_geo_assign.data.pipeline_contract import (
 
 
 def test_load_experiment_config_preserves_metadata_contract() -> None:
+    """An experiment config round-trips the jaguar metadata fields and baseline stage wiring intact."""
     config = load_experiment_config("configs/examples/regression_transfer.toml")
 
     assert config.jaguar_metadata_fields == JAGUAR_METADATA_FIELDS
@@ -21,6 +33,7 @@ def test_load_experiment_config_preserves_metadata_contract() -> None:
 
 
 def test_load_experiment_config_rejects_extra_metadata_fields(tmp_path: Path) -> None:
+    """Adding fields outside the bootstrap metadata contract fails config loading."""
     invalid_config = tmp_path / "invalid.toml"
     invalid_config.write_text(
         Path("configs/examples/fine_tune.toml").read_text(encoding="utf-8").replace(
@@ -35,6 +48,7 @@ def test_load_experiment_config_rejects_extra_metadata_fields(tmp_path: Path) ->
 
 
 def test_load_feline_pipeline_config_preserves_scientific_contracts() -> None:
+    """The feline pipeline config exposes the approved accession, assembly, tokenizer revision, and split strategy."""
     config = load_feline_pipeline_config("configs/examples/feline_pretrain.toml")
 
     assert config.project_accession == APPROVED_BIOPROJECT_ACCESSION
@@ -48,6 +62,7 @@ def test_load_feline_pipeline_config_preserves_scientific_contracts() -> None:
 
 
 def test_load_feline_pipeline_config_rejects_unpinned_tokenizer_revision(tmp_path: Path) -> None:
+    """A mutable tokenizer revision (e.g. ``main``) is rejected to prevent silent upstream drift."""
     invalid_config = tmp_path / "invalid_feline.toml"
     invalid_config.write_text(
         Path("configs/examples/feline_pretrain.toml").read_text(encoding="utf-8").replace(
@@ -62,6 +77,7 @@ def test_load_feline_pipeline_config_rejects_unpinned_tokenizer_revision(tmp_pat
 
 
 def test_load_feline_pipeline_config_reports_missing_required_sections(tmp_path: Path) -> None:
+    """Omitting required top-level sections produces an explicit error listing what is missing."""
     invalid_config = tmp_path / "invalid_sections.toml"
     invalid_config.write_text("[experiment]\nname = 'wrong'\n", encoding="utf-8")
 
@@ -70,6 +86,7 @@ def test_load_feline_pipeline_config_reports_missing_required_sections(tmp_path:
 
 
 def test_load_feline_pipeline_config_requires_explicit_trust_remote_code(tmp_path: Path) -> None:
+    """The security-critical ``trust_remote_code`` field must be declared, not defaulted."""
     invalid_config = tmp_path / "missing_trust_remote_code.toml"
     invalid_config.write_text(
         Path("configs/examples/feline_pretrain.toml").read_text(encoding="utf-8").replace(
@@ -83,6 +100,7 @@ def test_load_feline_pipeline_config_requires_explicit_trust_remote_code(tmp_pat
 
 
 def test_load_feline_pipeline_config_rejects_trust_remote_code_mismatch(tmp_path: Path) -> None:
+    """Loader refuses any ``trust_remote_code`` value that diverges from the approved policy."""
     invalid_config = tmp_path / "invalid_trust_remote_code.toml"
     invalid_config.write_text(
         Path("configs/examples/feline_pretrain.toml").read_text(encoding="utf-8").replace(
@@ -103,6 +121,7 @@ def test_load_feline_pipeline_config_rejects_trust_remote_code_mismatch(tmp_path
 def test_load_feline_pipeline_config_rejects_non_boolean_trust_remote_code(
     tmp_path: Path, replacement: str, expected_fragment: str
 ) -> None:
+    """Truthy strings/ints cannot stand in for a TOML boolean on ``trust_remote_code``."""
     invalid_config = tmp_path / "invalid_trust_remote_code_type.toml"
     invalid_config.write_text(
         Path("configs/examples/feline_pretrain.toml").read_text(encoding="utf-8").replace(
@@ -129,6 +148,7 @@ def test_load_feline_pipeline_config_rejects_non_boolean_consensus_mismatch_guar
     replacement: str,
     expected_fragment: str,
 ) -> None:
+    """Consensus mismatch guards (assembly/contig) must be real booleans to prevent silent bypass."""
     invalid_config = tmp_path / f"invalid_{field_name}_type.toml"
     invalid_config.write_text(
         Path("configs/examples/feline_pretrain.toml").read_text(encoding="utf-8").replace(

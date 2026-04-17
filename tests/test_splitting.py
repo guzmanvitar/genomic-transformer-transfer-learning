@@ -1,3 +1,13 @@
+"""Tests for global locus-block splitting and leakage safety.
+
+These tests protect the invariant that every window derived from the same
+locus block is assigned to a single split (train/validation/test) regardless
+of individual or consensus-vs-reference provenance, and that any overlap of
+genomic coordinates across splits is rejected. Together they guard against
+look-ahead / positional leakage that would silently inflate downstream
+model-evaluation metrics.
+"""
+
 import pytest
 
 from jaguar_geo_assign.data.preprocessor import (
@@ -12,6 +22,7 @@ from jaguar_geo_assign.data.preprocessor import (
 
 
 def test_window_sequences_reuse_global_locus_split_across_individuals_and_baseline() -> None:
+    """All windows covering the same locus block share one split across individuals and baselines."""
     config = PreprocessingConfig(
         min_sequence_length=8,
         max_ambiguity_fraction=0.5,
@@ -34,6 +45,7 @@ def test_window_sequences_reuse_global_locus_split_across_individuals_and_baseli
 
 
 def test_window_sequences_apply_window_ambiguity_filter_to_consensus_and_baseline() -> None:
+    """Per-window ambiguity filtering applies uniformly to consensus and reference windows."""
     config = PreprocessingConfig(
         min_sequence_length=8,
         max_ambiguity_fraction=0.25,
@@ -57,6 +69,7 @@ def test_window_sequences_apply_window_ambiguity_filter_to_consensus_and_baselin
 
 
 def test_assert_split_safety_rejects_cross_split_overlap() -> None:
+    """Windows from different splits that share genomic coordinates raise SplitLeakageError."""
     train_window = WindowRecord(
         sample_id="sample-1",
         individual_id="cat-1",
