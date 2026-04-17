@@ -1,3 +1,15 @@
+"""End-to-end tests for the ``jaguar_geo_assign`` command-line interface.
+
+These tests exercise the CLI entry points that operators use to validate
+configs, describe experiments, probe runtime dependencies, and run the
+feline pretraining pipeline. They protect the user-facing contract: that
+invalid configs are rejected with actionable errors (no raw tracebacks),
+that the smoke pipeline produces the expected consensus FASTA, tokenized
+Parquet shards, and diagnostics payload, and that the runtime diagnostics
+aggregator stays bounded, streaming-friendly, and faithful to the
+underlying mask-category and baseline-alignment bookkeeping.
+"""
+
 from dataclasses import replace
 import gzip
 from pathlib import Path
@@ -15,6 +27,7 @@ from jaguar_geo_assign.pretrain import pipeline as pretrain_pipeline
 
 
 def test_validate_config_reports_success(capsys) -> None:
+    """Verify ``validate-config`` exits 0 and reports success on a well-formed example config."""
     exit_code = main(["validate-config", "configs/examples/fine_tune.toml"])
 
     captured = capsys.readouterr()
@@ -23,6 +36,7 @@ def test_validate_config_reports_success(capsys) -> None:
 
 
 def test_describe_experiment_reports_deferred_baseline(capsys) -> None:
+    """Check that ``describe-experiment`` surfaces the deferred-baseline stage wiring to operators."""
     exit_code = main(["describe-experiment", "configs/examples/regression_transfer.toml"])
 
     captured = capsys.readouterr()
@@ -31,6 +45,7 @@ def test_describe_experiment_reports_deferred_baseline(capsys) -> None:
 
 
 def test_stage_entry_points_accept_optional_config(capsys) -> None:
+    """Guard that stage scaffolds accept ``--config`` and echo the loaded experiment name."""
     config_path = Path("configs/examples/regression_transfer.toml")
 
     exit_code = main(["baseline-evaluate", "--config", str(config_path)])
@@ -43,6 +58,7 @@ def test_stage_entry_points_accept_optional_config(capsys) -> None:
 
 
 def test_validate_feline_config_reports_success(capsys) -> None:
+    """Verify the approved feline pretrain config passes the strict validator."""
     exit_code = main(["validate-feline-config", "configs/examples/feline_pretrain.toml"])
 
     captured = capsys.readouterr()
@@ -53,6 +69,7 @@ def test_validate_feline_config_reports_success(capsys) -> None:
 def test_validate_feline_config_rejects_non_boolean_trust_remote_code(
     tmp_path: Path, capsys
 ) -> None:
+    """Reject truthy int values for ``trust_remote_code`` to prevent silent TOML type coercion."""
     invalid_config = tmp_path / "invalid_trust_remote_code.toml"
     invalid_config.write_text(
         Path("configs/examples/feline_pretrain.toml").read_text(encoding="utf-8").replace(
@@ -76,6 +93,7 @@ def test_validate_feline_config_rejects_non_boolean_trust_remote_code(
 def test_validate_feline_config_rejects_non_boolean_consensus_mismatch_guards(
     tmp_path: Path, capsys, field_name: str
 ) -> None:
+    """Guard that assembly/contig-match flags must be TOML booleans rather than truthy ints."""
     invalid_config = tmp_path / f"invalid_{field_name}.toml"
     invalid_config.write_text(
         Path("configs/examples/feline_pretrain.toml").read_text(encoding="utf-8").replace(
@@ -97,6 +115,7 @@ def test_validate_feline_config_rejects_non_boolean_consensus_mismatch_guards(
 
 
 def test_describe_feline_config_reports_split_contract(capsys) -> None:
+    """Check the describe command surfaces the split contract and pinned tokenizer revision."""
     exit_code = main(["describe-feline-config", "configs/examples/feline_pretrain.toml"])
 
     captured = capsys.readouterr()
@@ -108,6 +127,7 @@ def test_describe_feline_config_reports_split_contract(capsys) -> None:
 def test_check_feline_runtime_reports_missing_tool(
     monkeypatch: pytest.MonkeyPatch, capsys
 ) -> None:
+    """Ensure the runtime probe fails with an actionable message when external tools are absent."""
     monkeypatch.setattr("shutil.which", lambda _: None)
 
     exit_code = main(["check-feline-runtime", "configs/examples/feline_pretrain.toml"])
@@ -124,6 +144,7 @@ def test_check_feline_runtime_reports_missing_tool(
 def test_feline_cli_inspection_commands_report_actionable_config_errors(
     command: str, capsys
 ) -> None:
+    """Guard that every feline inspection command rejects a non-feline config without a traceback."""
     exit_code = main([command, "configs/examples/fine_tune.toml"])
 
     captured = capsys.readouterr()
@@ -136,6 +157,7 @@ def test_feline_cli_inspection_commands_report_actionable_config_errors(
 def test_pretrain_cli_smoke_path_runs_fixture_pipeline(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys
 ) -> None:
+    """Smoke-test the full pretrain CLI against fixture inputs and verify artifacts + diagnostics."""
     reference = tmp_path / "reference.fa"
     reference.write_text(
         ">chr1 GCF_000181335.3 Felis_catus_9.0\nAACCAA\n",
@@ -310,6 +332,7 @@ def test_pretrain_cli_smoke_path_runs_fixture_pipeline(
 
 
 def test_build_reference_sequence_records_deduplicates_identical_baseline_sequences() -> None:
+    """Verify baseline reference records are keyed by contig so identical samples do not double-count."""
     records = pretrain_pipeline._build_reference_sequence_records(
         {"chr1": "AACCAA", "chr2": "TTGGCC"},
         (
@@ -339,6 +362,7 @@ def test_pretrain_pipeline_does_not_inflate_identical_reference_baseline_counts(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
+    """Guard that the baseline corpus is deduped per contig even across many samples sharing references."""
     reference = tmp_path / "reference.fa"
     reference.write_text(
         ">chr1 GCF_000181335.3 Felis_catus_9.0\nAACCAA\n",
@@ -501,6 +525,7 @@ def test_pretrain_pipeline_streams_fasta_records_and_prunes_only_non_emittable_b
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
+    """Verify FASTA records stream one-at-a-time and only sub-window-sized contigs are pruned from baseline."""
     reference = tmp_path / "reference.fa"
     reference.write_text(
         ">chr1 GCF_000181335.3 Felis_catus_9.0\nAACCAA\n"
@@ -680,6 +705,7 @@ def test_pretrain_pipeline_streams_fasta_records_and_prunes_only_non_emittable_b
 def test_pretrain_cli_smoke_path_accepts_gzip_fasta_inputs(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys
 ) -> None:
+    """Ensure the CLI transparently consumes gzip-compressed reference FASTAs end-to-end."""
     reference = tmp_path / "reference.fasta.gz"
     with gzip.open(reference, "wt", encoding="utf-8") as handle:
         handle.write(">chr1 GCF_000181335.3 Felis_catus_9.0\nAACCAA\n")
@@ -823,6 +849,7 @@ def test_pretrain_cli_smoke_path_accepts_gzip_fasta_inputs(
 
 
 def test_runtime_diagnostics_payload_is_bounded_and_provenance_faithful() -> None:
+    """Check the runtime payload caps preview size while keeping corpus-wide mask tallies faithful."""
     consensus_windows = tuple(_synthetic_tokenized_window(index=index, source="consensus") for index in range(192))
     baseline_windows = tuple(_synthetic_tokenized_window(index=index, source="reference") for index in range(192))
 
@@ -887,6 +914,7 @@ def test_runtime_diagnostics_payload_is_bounded_and_provenance_faithful() -> Non
 def test_runtime_diagnostics_passes_streaming_records_into_aggregation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """Guard that aggregated records are passed as generators so memory stays bounded on large corpora."""
     captured_types: dict[str, str] = {}
 
     def fake_build_eda_payload(consensus_records, baseline_records, **_: object) -> dict[str, object]:
@@ -920,6 +948,7 @@ def test_runtime_diagnostics_passes_streaming_records_into_aggregation(
 
 
 def test_runtime_diagnostics_records_unmatched_consensus_windows_without_crashing() -> None:
+    """Ensure consensus windows with no baseline match are counted and annotated rather than raising."""
     unmatched_consensus = replace(
         _synthetic_tokenized_window(index=2, source="consensus"),
         window=replace(
@@ -950,6 +979,7 @@ def test_runtime_diagnostics_records_unmatched_consensus_windows_without_crashin
 
 
 def test_runtime_diagnostics_handles_overlapping_mask_categories_without_callable_underflow() -> None:
+    """Verify overlapping mask tallies do not drive the callable-base counter below zero in the payload."""
     overlapping_mask_window = replace(
         _synthetic_tokenized_window(index=0, source="consensus"),
         window=replace(
@@ -981,6 +1011,7 @@ def test_runtime_diagnostics_handles_overlapping_mask_categories_without_callabl
 
 
 def test_runtime_diagnostics_accepts_retained_reference_window_with_realized_n_coverage() -> None:
+    """Check retained reference windows whose sequences already contain ``N`` do not register as shape issues."""
     config = preprocessor_module.PreprocessingConfig(
         min_sequence_length=6,
         max_ambiguity_fraction=1.0,
@@ -1031,6 +1062,7 @@ def test_runtime_diagnostics_accepts_retained_reference_window_with_realized_n_c
 
 
 def test_runtime_diagnostics_flags_inconsistent_unique_masked_coverage() -> None:
+    """Guard that callable + unique-masked totals shorter than the sequence are reported as shape issues."""
     malformed_window = replace(
         _synthetic_tokenized_window(index=0, source="consensus"),
         window=replace(
@@ -1058,6 +1090,7 @@ def test_runtime_diagnostics_flags_inconsistent_unique_masked_coverage() -> None
 
 
 def test_pretrain_cli_reports_actionable_config_error(capsys) -> None:
+    """Ensure ``pretrain`` rejects a non-feline config with an operator-readable message (no traceback)."""
     exit_code = main(["pretrain", "--config", "configs/examples/fine_tune.toml"])
 
     captured = capsys.readouterr()
@@ -1068,6 +1101,7 @@ def test_pretrain_cli_reports_actionable_config_error(capsys) -> None:
 def test_pretrain_cli_reports_actionable_parquet_dependency_error(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys
 ) -> None:
+    """Verify a missing pyarrow backend surfaces the ``uv add pyarrow`` hint rather than an import error."""
     reference = tmp_path / "reference.fa"
     reference.write_text(">chr1 GCF_000181335.3 Felis_catus_9.0\nAACCAA\n", encoding="utf-8")
     sample_vcf = tmp_path / "cat_1.vcf"

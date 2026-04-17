@@ -1,3 +1,14 @@
+"""Contract tests for windowed-sequence tokenization and export.
+
+These tests enforce the boundary between raw genomic windows and the
+tokenized/exported artifacts consumed by downstream training. They protect
+the invariants that (a) the pinned DNABERT-2 tokenizer provenance travels
+with every record, (b) over-length or unsupported inputs fail loudly instead
+of being silently dropped, and (c) Parquet and WebDataset shards preserve
+per-split purity, sequence hashes, and tokenizer metadata needed to
+reproduce or re-tokenize a corpus.
+"""
+
 from dataclasses import replace
 import json
 import tarfile
@@ -100,6 +111,7 @@ def _read_webdataset_records(shard_path) -> list[dict[str, object]]:
 
 
 def test_tokenize_windows_pins_tokenizer_provenance() -> None:
+    """Ensure every tokenized window carries the exact DNABERT-2 identifier and revision hash."""
     window = _window()
 
     tokenized = tokenize_windows((window,), FakeTokenizer())
@@ -112,6 +124,7 @@ def test_tokenize_windows_pins_tokenizer_provenance() -> None:
 
 
 def test_tokenize_windows_enforces_max_position_embeddings() -> None:
+    """Reject windows that tokenize past ``max_position_embeddings`` with a diagnosable error."""
     window = _window()
 
     with pytest.raises(TokenizerContractError, match="Retained genomic window tokenized beyond max_position_embeddings") as exc_info:
@@ -129,6 +142,7 @@ def test_tokenize_windows_enforces_max_position_embeddings() -> None:
 
 
 def test_tokenize_windows_fail_fast_instead_of_silently_skipping_over_length_window() -> None:
+    """Guard that a later over-length window aborts the whole batch rather than being silently dropped."""
     retained_window = _window(sequence="ACGT", sequence_hash="retained")
     offending_window = replace(
         _window(sequence="AACCGG", sequence_hash="offending"),
@@ -147,11 +161,13 @@ def test_tokenize_windows_fail_fast_instead_of_silently_skipping_over_length_win
 
 
 def test_tokenize_windows_rejects_unsupported_symbols_at_tokenizer_boundary() -> None:
+    """Block IUPAC/ambiguity symbols outside ``ACGTN`` before they reach the tokenizer."""
     with pytest.raises(TokenizerContractError, match="Unsupported base"):
         tokenize_windows((_window(sequence="ACGRTN"),), FakeTokenizer())
 
 
 def test_tokenize_windows_can_normalize_unsupported_symbols_to_n() -> None:
+    """Verify the opt-in ``normalize_to_n`` policy rewrites the sequence and refreshes its hash."""
     tokenizer = CapturingTokenizer()
 
     tokenized = tokenize_windows(
@@ -168,6 +184,7 @@ def test_tokenize_windows_can_normalize_unsupported_symbols_to_n() -> None:
 def test_write_tokenized_dataset_requires_pyarrow_for_parquet(
     tmp_path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """Surface an actionable install hint when Parquet export is requested without pyarrow."""
     def missing_backend() -> None:
         raise ExportContractError("Parquet export requires pyarrow. Install with: uv add pyarrow")
 
@@ -216,6 +233,7 @@ def test_write_tokenized_dataset_requires_pyarrow_for_parquet(
 
 
 def test_write_tokenized_dataset_emits_real_parquet_artifact_and_schema(tmp_path) -> None:
+    """Check that the written Parquet file has the expected schema and drops raw sequence bytes."""
     pytest.importorskip("pyarrow")
     pyarrow_parquet = pytest.importorskip("pyarrow.parquet")
 
@@ -290,6 +308,7 @@ def test_write_tokenized_dataset_emits_real_parquet_artifact_and_schema(tmp_path
 
 
 def test_write_tokenized_dataset_requires_explicit_provenance_for_empty_export(tmp_path) -> None:
+    """Reject empty exports that would otherwise produce metadata without a pinned tokenizer."""
     with pytest.raises(ExportContractError, match="explicit tokenizer provenance"):
         write_tokenized_dataset(
             (),
@@ -305,6 +324,7 @@ def test_write_tokenized_dataset_requires_explicit_provenance_for_empty_export(t
 
 
 def test_write_webdataset_shards_persists_retokenization_provenance(tmp_path) -> None:
+    """Verify WebDataset shards retain sequence, hash, and tokenizer revision for retokenization."""
     tokenized = _tokenized_window(
         source="reference",
         split="validation",
@@ -333,6 +353,7 @@ def test_write_webdataset_shards_persists_retokenization_provenance(tmp_path) ->
 
 
 def test_write_webdataset_shards_default_sizing_stays_split_pure(tmp_path) -> None:
+    """Guard that default shard sizing never co-mingles train and validation records in one tar."""
     tokenized = (
         _tokenized_window(
             sample_id="train-sample",
@@ -366,6 +387,7 @@ def test_write_webdataset_shards_default_sizing_stays_split_pure(tmp_path) -> No
 
 
 def test_write_webdataset_shards_oversize_shard_request_stays_within_split(tmp_path) -> None:
+    """Check that a ``records_per_shard`` larger than a split still emits one shard per split."""
     tokenized = (
         _tokenized_window(sample_id="train-1", individual_id="cat-train-1", split="train", sequence_hash="train-1"),
         _tokenized_window(
@@ -398,6 +420,7 @@ def test_write_webdataset_shards_oversize_shard_request_stays_within_split(tmp_p
 
 
 def test_write_webdataset_shards_does_not_bridge_train_validation_boundary(tmp_path) -> None:
+    """Guard against a full train shard spilling validation records into the same tarball."""
     tokenized = (
         _tokenized_window(sample_id="train-1", individual_id="cat-train-1", split="train", sequence_hash="train-1"),
         _tokenized_window(

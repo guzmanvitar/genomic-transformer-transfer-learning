@@ -1,3 +1,14 @@
+"""Contract tests for the VCF→FASTA consensus generation pipeline.
+
+These tests pin down the data integrity guarantees of
+``jaguar_geo_assign.data.acquisition.generate_consensus_fasta`` and its
+site-level classifier. They protect the invariants that make downstream
+genomic training safe: homozygous-reference calls preserve the reference,
+unsupported or ambiguous calls are masked with ``N`` rather than silently
+propagated, and any malformed or reference-mismatched input fails loudly
+with an actionable error instead of producing a silently corrupted FASTA.
+"""
+
 from __future__ import annotations
 
 import multiprocessing
@@ -42,6 +53,7 @@ def test_classify_consensus_site_covers_explicit_contract(
     expected_action: str,
     expected_category: str,
 ) -> None:
+    """Verify each allele/filter combination maps to its documented action and category."""
     decision = classify_consensus_site(ref, alts, genotype, filter_value=filter_value)
 
     assert decision.action == expected_action
@@ -58,6 +70,7 @@ def test_classify_consensus_site_raises_actionable_error_on_malformed_gt(
     genotype: str,
     filter_value: str,
 ) -> None:
+    """Ensure malformed GT tokens raise with sample/contig/position context for debugging."""
     with pytest.raises(MalformedGenotypeError, match=r"GT='.*'.*sample 'cat_1'.*chr1:4"):
         classify_consensus_site(
             "A",
@@ -74,6 +87,7 @@ def test_classify_consensus_site_raises_actionable_error_on_malformed_gt(
 def test_generate_consensus_fasta_preserves_reference_and_masks_multiallelic_indel_and_ambiguous_calls(
     tmp_path: Path,
 ) -> None:
+    """Check end-to-end that applied homozygous ALTs coexist with ``N``-masked problem sites."""
     reference = tmp_path / "reference.fa"
     reference.write_text(
         ">chr1 GCF_000181335.3 Felis_catus_9.0\nAACCGGAA\n",
@@ -121,6 +135,7 @@ def test_generate_consensus_fasta_preserves_reference_and_masks_multiallelic_ind
 
 
 def test_generate_consensus_fasta_treats_alt_dot_as_no_alt_site(tmp_path: Path) -> None:
+    """Guard that ALT='.' sites are masked rather than treated as a real alternate allele."""
     reference = tmp_path / "reference.fa"
     reference.write_text(
         ">chr1 GCF_000181335.3 Felis_catus_9.0\nAACCAA\n",
@@ -161,6 +176,7 @@ def test_generate_consensus_fasta_treats_alt_dot_as_no_alt_site(tmp_path: Path) 
 
 @pytest.mark.parametrize("genotype", ["*/*", "?/?"])
 def test_generate_consensus_fasta_fails_fast_on_malformed_gt_tokens(tmp_path: Path, genotype: str) -> None:
+    """Ensure the end-to-end pipeline refuses malformed GT tokens instead of silently dropping them."""
     reference = tmp_path / "reference.fa"
     reference.write_text(
         ">chr1 GCF_000181335.3 Felis_catus_9.0\nAACCAA\n",
@@ -192,6 +208,7 @@ def test_generate_consensus_fasta_fails_fast_on_malformed_gt_tokens(tmp_path: Pa
 
 
 def test_generate_consensus_fasta_fails_fast_on_truncated_vcf_record_with_actionable_context(tmp_path: Path) -> None:
+    """Verify truncated VCF records raise with file/line/column context instead of a cryptic unpack error."""
     reference = tmp_path / "reference.fa"
     reference.write_text(
         ">chr1 GCF_000181335.3 Felis_catus_9.0\nAACCAA\n",
@@ -246,6 +263,7 @@ def test_generate_consensus_fasta_requires_explicit_matching_reference_metadata(
     reference_header: str | None,
     match: str,
 ) -> None:
+    """Reject VCFs whose ``##reference`` header is missing, partial, or points at a different build."""
     reference = tmp_path / "reference.fa"
     reference.write_text(
         ">chr1 GCF_000181335.3 Felis_catus_9.0\nAACCAA\n",
@@ -285,6 +303,7 @@ def test_generate_consensus_fasta_rejects_partial_or_inconsistent_fasta_build_ev
     reference_name: str,
     reference_header: str,
 ) -> None:
+    """Reject reference FASTAs whose filename/header does not jointly pin the expected build."""
     reference = tmp_path / reference_name
     reference.write_text(reference_header, encoding="utf-8")
     vcf = tmp_path / "cat_1.vcf"
@@ -313,6 +332,7 @@ def test_generate_consensus_fasta_rejects_partial_or_inconsistent_fasta_build_ev
 
 
 def test_generate_consensus_fasta_fails_fast_on_contig_mismatch(tmp_path: Path) -> None:
+    """Ensure a VCF referencing contigs absent from the reference raises before any consensus is emitted."""
     reference = tmp_path / "reference.fa"
     reference.write_text(
         ">chr1 GCF_000181335.3 Felis_catus_9.0\nAACCAA\n",
@@ -344,11 +364,13 @@ def test_generate_consensus_fasta_fails_fast_on_contig_mismatch(tmp_path: Path) 
 
 
 def test_ensure_bcftools_available_raises_actionable_error() -> None:
+    """Guard that a missing ``bcftools`` binary surfaces an install hint instead of a raw OSError."""
     with pytest.raises(MissingToolError, match="install bcftools"):
         ensure_bcftools_available("bcftools-does-not-exist")
 
 
 def test_generate_consensus_fasta_handles_stderr_heavy_subprocess_without_hanging(tmp_path: Path) -> None:
+    """Prevent regression where a chatty bcftools stderr would deadlock the subprocess pipes."""
     sequence = "A" * 262_144
     reference = tmp_path / "reference.fa"
     reference.write_text(f">chr1 GCF_000181335.3 Felis_catus_9.0\n{sequence}\n", encoding="utf-8")

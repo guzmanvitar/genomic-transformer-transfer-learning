@@ -1,3 +1,14 @@
+"""Tests for genomics EDA/observability diagnostics.
+
+These tests pin down the reporting surface used to audit a pretraining
+corpus before training starts. They protect the invariants that per-sample
+summaries expose the observability metrics (GC, ambiguity, callable,
+token-to-base ratio) needed to catch data drift, that corpus-level audits
+flag split conflicts and shape inconsistencies rather than silently
+aggregating, and that the EDA payload stays bounded and mask-category
+faithful even when the corpus grows beyond the preview sample limit.
+"""
+
 import json
 
 import pytest
@@ -128,6 +139,7 @@ def baseline_records() -> list[dict[str, object]]:
 
 
 def test_summarize_sample_records_reports_observability_metrics(consensus_records) -> None:
+    """Verify per-sample summaries expose the GC/ambiguity/callable metrics used for drift monitoring."""
     summary = summarize_sample_records(consensus_records[:1])[0]
 
     assert summary["sample_id"] == "cat-1"
@@ -140,12 +152,14 @@ def test_summarize_sample_records_reports_observability_metrics(consensus_record
 
 
 def test_missingness_heatmap_tracks_n_burden_by_relative_position(consensus_records) -> None:
+    """Check that the positional ``N``-density heatmap localizes masking within each window."""
     heatmap = build_missingness_heatmap(consensus_records[:1], bins=4)
 
     assert heatmap == [0.0, 0.0, 0.5, 0.0]
 
 
 def test_summarize_corpus_records_tracks_duplicates_and_near_duplicates(consensus_records) -> None:
+    """Ensure corpus summaries surface duplicate and near-duplicate counts that inflate effective sample size."""
     summary = summarize_corpus_records(consensus_records)
 
     assert summary["retained_window_count"] == 3
@@ -167,6 +181,7 @@ def test_summarize_corpus_records_tracks_duplicates_and_near_duplicates(consensu
 def test_compare_reference_baseline_reports_corpus_level_deltas(
     consensus_records, baseline_records
 ) -> None:
+    """Verify the baseline comparator emits the deltas needed to reason about consensus drift."""
     comparison = compare_reference_baseline(consensus_records, baseline_records)
 
     assert comparison["deltas"]["retained_window_count"] == 1
@@ -178,6 +193,7 @@ def test_compare_reference_baseline_reports_corpus_level_deltas(
 
 
 def test_audit_corpus_integrity_flags_split_conflicts_and_shape_issues(consensus_records) -> None:
+    """Guard that the auditor reports locus-level split leakage and zero-token shape anomalies."""
     issues = audit_corpus_integrity(
         [
             consensus_records[0],
@@ -204,6 +220,7 @@ def test_audit_corpus_integrity_flags_split_conflicts_and_shape_issues(consensus
 
 
 def test_overlap_aware_integrity_accepts_overlapping_mask_tallies() -> None:
+    """Ensure overlapping mask categories summing past sequence length are not mis-flagged."""
     overlapping_record = {
         "sample_id": "cat-overlap",
         "locus_id": "chr2:block-overlap",
@@ -230,6 +247,7 @@ def test_overlap_aware_integrity_accepts_overlapping_mask_tallies() -> None:
 
 
 def test_overlap_aware_integrity_still_flags_unique_callable_coverage_mismatches() -> None:
+    """Verify the auditor still catches callable + unique-masked totals that cannot cover the sequence."""
     malformed_record = {
         "sample_id": "cat-malformed",
         "locus_id": "chr2:block-malformed",
@@ -263,6 +281,7 @@ def test_overlap_aware_integrity_still_flags_unique_callable_coverage_mismatches
 def test_build_eda_payload_collects_sample_and_baseline_views(
     consensus_records, baseline_records
 ) -> None:
+    """Check the aggregated EDA payload contains sample preview, corpus stats, and baseline comparison."""
     payload = build_eda_payload(consensus_records, baseline_records)
 
     assert len(payload["consensus_samples"]) == 3
@@ -279,11 +298,13 @@ def test_build_eda_payload_collects_sample_and_baseline_views(
 
 
 def test_summarize_sample_records_rejects_missing_required_fields() -> None:
+    """Fail loudly when a record is missing diagnostic fields rather than emitting silent zeros."""
     with pytest.raises(ValueError, match="required fields"):
         summarize_sample_records([{"sample_id": "cat-1", "sequence": "ACGT"}])
 
 
 def test_summarize_corpus_records_samples_near_duplicate_analysis_for_large_corpus() -> None:
+    """Ensure near-duplicate analysis switches to sampled mode and reports analyzed vs total counts."""
     realistic_consensus = _build_realistic_records(total=640, source="consensus")
 
     summary = summarize_corpus_records(realistic_consensus, near_duplicate_sample_limit=64)
@@ -306,6 +327,7 @@ def test_summarize_corpus_records_samples_near_duplicate_analysis_for_large_corp
 
 
 def test_summarize_corpus_records_caps_near_duplicate_work_to_sample_limit(monkeypatch) -> None:
+    """Guard that the quadratic near-duplicate scan never sees more sequences than the limit."""
     realistic_consensus = _build_realistic_records(total=640, source="consensus")
     observed: dict[str, int] = {}
 
@@ -324,6 +346,7 @@ def test_summarize_corpus_records_caps_near_duplicate_work_to_sample_limit(monke
 
 
 def test_summarize_corpus_records_handles_tied_sampling_keys_deterministically(monkeypatch) -> None:
+    """Verify tie-breaking preserves insertion order so sampled near-duplicate sets stay reproducible."""
     tied_records = _build_realistic_records(total=3, source="consensus")
     observed: dict[str, list[str]] = {}
 
@@ -351,6 +374,7 @@ def test_summarize_corpus_records_handles_tied_sampling_keys_deterministically(m
 
 
 def test_build_eda_payload_bounds_consensus_sample_preview_for_large_corpus() -> None:
+    """Check the per-sample preview is capped so payloads stay bounded on large corpora."""
     payload = build_eda_payload(
         _build_realistic_records(total=640, source="consensus"),
         _build_realistic_records(total=128, source="reference"),
@@ -370,6 +394,7 @@ def test_build_eda_payload_bounds_consensus_sample_preview_for_large_corpus() ->
 
 
 def test_build_eda_payload_preserves_full_corpus_mask_totals_beyond_preview_truncation() -> None:
+    """Ensure corpus-level mask category counts reflect every record even when the preview is truncated."""
     def consensus_records():
         reference = "AACCAA"
         for index in range(160):
@@ -468,6 +493,7 @@ def test_build_eda_payload_preserves_full_corpus_mask_totals_beyond_preview_trun
 
 
 def test_write_eda_payload_json_persists_report_payload(tmp_path, consensus_records, baseline_records) -> None:
+    """Verify the EDA payload round-trips to JSON on disk for downstream reporting consumers."""
     output_path = tmp_path / "reports" / "diagnostics_payload.json"
 
     written_path = write_eda_payload_json(consensus_records, baseline_records, output_path)
