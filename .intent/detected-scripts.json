@@ -1,0 +1,14 @@
+{
+  "version": 1,
+  "detectedAt": "2026-03-17T13:30:49.972Z",
+  "packageManager": "npm",
+  "manifestHash": "2131561261cc62a96791e14b93b559adeb5df9c45acd1301f7b2f8374b25c34a",
+  "scripts": [
+    {
+      "name": "test",
+      "command": "pytest",
+      "category": "test",
+      "mode": "command"
+    }
+  ]
+}

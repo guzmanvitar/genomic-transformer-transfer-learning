@@ -580,111 +580,6 @@ def ambiguity_fraction(sequence: str) -> float:
         return 0.0
     return sequence.count("N") / len(sequence)
 
-
-@dataclass
-class _WindowMaskCounter:
-    """Sweep-line accumulator for mask-span overlap counts across sliding windows.
-
-    Designed to be called once per window with monotonically non-decreasing
-    ``window_start`` values.  It maintains an ``active_spans`` list that
-    is incrementally pruned (spans whose end ≤ current ``window_start``
-    are dropped) and extended (spans whose start < ``window_end`` are
-    absorbed), amortising the cost over the full sweep.
-
-    Fragility: calling ``summarize`` with non-monotonic ``window_start``
-    values will silently produce incorrect counts because already-discarded
-    spans cannot be recovered.
-
-    Attributes:
-        mask_spans: Sorted ``(start, end, category)`` tuples from the
-            parent ``PreparedSequence``.
-        next_index: Cursor into ``mask_spans`` tracking the next span
-            to absorb.
-        active_spans: Spans currently overlapping the sweep frontier.
-    """
-
-    mask_spans: tuple[tuple[int, int, str], ...]
-    next_index: int = 0
-    active_spans: list[tuple[int, int, str]] | None = None
-
-    def __post_init__(self) -> None:
-        """Initialise ``active_spans`` to an empty list."""
-        self.active_spans = []
-
-    def summarize(self, *, window_start: int, window_end: int) -> tuple[Counter[str], int]:
-        """Count masked bases overlapping the window ``[window_start, window_end)``.
-
-        Args:
-            window_start: Inclusive genomic start of the window.
-            window_end: Exclusive genomic end of the window.
-
-        Returns:
-            A ``(category_counts, unique_masked_bases)`` tuple where
-            *category_counts* maps each mask category to the number of
-            overlapping bases, and *unique_masked_bases* is the
-            de-duplicated total across all categories.
-        """
-        assert self.active_spans is not None
-        while self.next_index < len(self.mask_spans) and self.mask_spans[self.next_index][0] < window_end:
-            self.active_spans.append(self.mask_spans[self.next_index])
-            self.next_index += 1
-        self.active_spans = [span for span in self.active_spans if span[1] > window_start]
-
-        counts: Counter[str] = Counter()
-        overlapping_ranges: list[tuple[int, int]] = []
-        for span_start, span_end, category in self.active_spans:
-            overlap = min(window_end, span_end) - max(window_start, span_start)
-            if overlap > 0:
-                counts[category] += overlap
-                overlapping_ranges.append((max(window_start, span_start), min(window_end, span_end)))
-        return counts, _count_unique_masked_bases(overlapping_ranges)
-
-
-def _count_unique_masked_bases(overlapping_ranges: list[tuple[int, int]]) -> int:
-    """Merge overlapping genomic ranges and return the total covered length.
-
-    Uses a sort-and-sweep merge to de-duplicate base counts when multiple
-    mask categories overlap the same genomic interval.
-
-    Args:
-        overlapping_ranges: ``(start, end)`` pairs clipped to the current
-            window boundaries.
-
-    Returns:
-        Total number of unique bases covered by at least one range.
-    """
-    if not overlapping_ranges:
-        return 0
-
-    merged_ranges = sorted(overlapping_ranges)
-    merged_total = 0
-    current_start, current_end = merged_ranges[0]
-    for span_start, span_end in merged_ranges[1:]:
-        if span_start > current_end:
-            merged_total += current_end - current_start
-            current_start, current_end = span_start, span_end
-            continue
-        current_end = max(current_end, span_end)
-
-    return merged_total + (current_end - current_start)
-
-
-def _count_realized_unique_masked_bases(sequence: str, span_unique_masked_bases: int) -> int:
-    """Return the larger of span-derived and sequence-derived masked-base counts.
-
-    The span-based count may under-count if the normalisation step
-    introduced additional ``N`` bases not tracked by explicit mask spans.
-
-    Args:
-        sequence: The window nucleotide string.
-        span_unique_masked_bases: De-duplicated base count from mask spans.
-
-    Returns:
-        Conservative (higher) estimate of masked bases.
-    """
-    return max(span_unique_masked_bases, sequence.count("N"))
-
-
 def prepare_sequences(
     records: list[SequenceRecord],
     config: PreprocessingConfig,
@@ -796,6 +691,110 @@ def assign_split(locus_id: str, split_weights: tuple[tuple[str, float], ...], sp
         if position < cumulative:
             return split_name
     return split_weights[-1][0]
+
+
+@dataclass
+class _WindowMaskCounter:
+    """Sweep-line accumulator for mask-span overlap counts across sliding windows.
+
+    Designed to be called once per window with monotonically non-decreasing
+    ``window_start`` values.  It maintains an ``active_spans`` list that
+    is incrementally pruned (spans whose end ≤ current ``window_start``
+    are dropped) and extended (spans whose start < ``window_end`` are
+    absorbed), amortising the cost over the full sweep.
+
+    Fragility: calling ``summarize`` with non-monotonic ``window_start``
+    values will silently produce incorrect counts because already-discarded
+    spans cannot be recovered.
+
+    Attributes:
+        mask_spans: Sorted ``(start, end, category)`` tuples from the
+            parent ``PreparedSequence``.
+        next_index: Cursor into ``mask_spans`` tracking the next span
+            to absorb.
+        active_spans: Spans currently overlapping the sweep frontier.
+    """
+
+    mask_spans: tuple[tuple[int, int, str], ...]
+    next_index: int = 0
+    active_spans: list[tuple[int, int, str]] | None = None
+
+    def __post_init__(self) -> None:
+        """Initialise ``active_spans`` to an empty list."""
+        self.active_spans = []
+
+    def summarize(self, *, window_start: int, window_end: int) -> tuple[Counter[str], int]:
+        """Count masked bases overlapping the window ``[window_start, window_end)``.
+
+        Args:
+            window_start: Inclusive genomic start of the window.
+            window_end: Exclusive genomic end of the window.
+
+        Returns:
+            A ``(category_counts, unique_masked_bases)`` tuple where
+            *category_counts* maps each mask category to the number of
+            overlapping bases, and *unique_masked_bases* is the
+            de-duplicated total across all categories.
+        """
+        assert self.active_spans is not None
+        while self.next_index < len(self.mask_spans) and self.mask_spans[self.next_index][0] < window_end:
+            self.active_spans.append(self.mask_spans[self.next_index])
+            self.next_index += 1
+        self.active_spans = [span for span in self.active_spans if span[1] > window_start]
+
+        counts: Counter[str] = Counter()
+        overlapping_ranges: list[tuple[int, int]] = []
+        for span_start, span_end, category in self.active_spans:
+            overlap = min(window_end, span_end) - max(window_start, span_start)
+            if overlap > 0:
+                counts[category] += overlap
+                overlapping_ranges.append((max(window_start, span_start), min(window_end, span_end)))
+        return counts, _count_unique_masked_bases(overlapping_ranges)
+
+
+def _count_unique_masked_bases(overlapping_ranges: list[tuple[int, int]]) -> int:
+    """Merge overlapping genomic ranges and return the total covered length.
+
+    Uses a sort-and-sweep merge to de-duplicate base counts when multiple
+    mask categories overlap the same genomic interval.
+
+    Args:
+        overlapping_ranges: ``(start, end)`` pairs clipped to the current
+            window boundaries.
+
+    Returns:
+        Total number of unique bases covered by at least one range.
+    """
+    if not overlapping_ranges:
+        return 0
+
+    merged_ranges = sorted(overlapping_ranges)
+    merged_total = 0
+    current_start, current_end = merged_ranges[0]
+    for span_start, span_end in merged_ranges[1:]:
+        if span_start > current_end:
+            merged_total += current_end - current_start
+            current_start, current_end = span_start, span_end
+            continue
+        current_end = max(current_end, span_end)
+
+    return merged_total + (current_end - current_start)
+
+
+def _count_realized_unique_masked_bases(sequence: str, span_unique_masked_bases: int) -> int:
+    """Return the larger of span-derived and sequence-derived masked-base counts.
+
+    The span-based count may under-count if the normalisation step
+    introduced additional ``N`` bases not tracked by explicit mask spans.
+
+    Args:
+        sequence: The window nucleotide string.
+        span_unique_masked_bases: De-duplicated base count from mask spans.
+
+    Returns:
+        Conservative (higher) estimate of masked bases.
+    """
+    return max(span_unique_masked_bases, sequence.count("N"))
 
 
 def window_sequences(

@@ -4,7 +4,9 @@ version = "0.1.0"
 description = "Leakage-safe transfer learning scaffold for jaguar geographic assignment."
 readme = "README.md"
 requires-python = ">=3.11,<3.12"
-dependencies = []
+dependencies = [
+    "pyarrow>=16,<20",
+]
 
 [project.scripts]
 jaguar-geo-assign = "jaguar_geo_assign.cli:main"
