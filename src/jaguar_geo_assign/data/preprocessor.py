@@ -61,6 +61,7 @@ from dataclasses import asdict, dataclass
 from hashlib import sha256
 from io import BytesIO
 import json
+import os
 from pathlib import Path
 import sqlite3
 import tarfile
@@ -1506,11 +1507,13 @@ class TokenizedCorpusWriter:
         corpus ``metadata.json`` sidecar by streaming ``split_manifest``
         rows from the SQLite sidecar ordered by
         ``(contig, block_start, split)``. On an exception, delete any
-        Parquet files that were already written during this session so
-        the output directory never contains half-written partitions
-        that would corrupt a downstream train loader. Empty partition
-        directories and the output root are left in place; only the
-        Parquet artifacts are removed.
+        Parquet files that were already written during this session,
+        then conservatively prune any empty partition subdirectories
+        and the output root itself so a failed run leaves no "phantom"
+        corpus tree for downstream autodiscovery tooling to pick up.
+        Directories that still contain files (including any artefacts
+        the writer did not create) are left intact — pruning relies on
+        ``os.rmdir`` semantics, which refuse non-empty directories.
 
         The SQLite sidecar is unconditionally closed and deleted on
         every exit path (success, internal failure, caller exception)
@@ -1534,6 +1537,8 @@ class TokenizedCorpusWriter:
             return None
         finally:
             self._teardown_sqlite_sidecar()
+            if exc_type is not None:
+                self._prune_empty_output_tree()
 
     def _teardown_sqlite_sidecar(self) -> None:
         """Close the SQLite connection and remove the sidecar file.
@@ -1555,6 +1560,36 @@ class TokenizedCorpusWriter:
             except FileNotFoundError:
                 pass
             self._sqlite_path = None
+
+    def _prune_empty_output_tree(self) -> None:
+        """Conservatively remove empty partition dirs and the output root.
+
+        Intent: when the writer's ``with`` block raises, ``__exit__``
+        has already unlinked every Parquet file this writer created
+        and the SQLite sidecar, but the Hive-style
+        ``split=/contig=/block_id=/`` partition tree created during
+        partitioning remains as empty directories. Leaving that empty
+        tree (and the corpus root) on disk surfaces as a phantom
+        dataset to downstream autodiscovery tools. Pruning relies on
+        ``os.rmdir`` — which refuses to remove non-empty directories —
+        so any file the writer did not create (a stray artefact from
+        a concurrent process, a user-dropped note) preserves its
+        enclosing directory and therefore the whole tree above it.
+        ``topdown=False`` ensures leaves are visited first, so each
+        parent is attempted only after its children had a chance to
+        drain.
+        """
+        if not self._output_path.exists():
+            return
+        for dirpath, _dirnames, filenames in os.walk(
+            self._output_path, topdown=False
+        ):
+            if filenames:
+                continue
+            try:
+                os.rmdir(dirpath)
+            except OSError:
+                pass
 
     def _write_metadata_json(self) -> None:
         """Write ``metadata.json`` with a streamed ``split_manifest`` array.
