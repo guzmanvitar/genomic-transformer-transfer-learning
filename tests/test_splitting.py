@@ -21,8 +21,14 @@ from jaguar_geo_assign.data.preprocessor import (
 )
 
 
-def test_window_sequences_reuse_global_locus_split_across_individuals_and_baseline() -> None:
-    """All windows covering the same locus block share one split across individuals and baselines."""
+def test_window_sequences_reuse_global_locus_split_across_individuals_and_references() -> None:
+    """All windows covering the same locus block share one split across individuals and approved references.
+
+    The approved emitted producer source set is exactly
+    ``{"consensus", "reference"}``; this regression covers the direct-entry
+    surface where callers construct ``PreparedSequence`` values and mix both
+    approved provenance labels on a shared locus block.
+    """
     config = PreprocessingConfig(
         min_sequence_length=8,
         max_ambiguity_fraction=0.5,
@@ -44,7 +50,7 @@ def test_window_sequences_reuse_global_locus_split_across_individuals_and_baseli
     assert manifest[0].split == windows[0].split
 
 
-def test_window_sequences_apply_window_ambiguity_filter_to_consensus_and_baseline() -> None:
+def test_window_sequences_apply_window_ambiguity_filter_to_consensus_and_reference() -> None:
     """Per-window ambiguity filtering applies uniformly to consensus and reference windows."""
     config = PreprocessingConfig(
         min_sequence_length=8,

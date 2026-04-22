@@ -12,6 +12,7 @@ for downstream model-quality diagnostics.
 import pytest
 
 from jaguar_geo_assign.data.preprocessor import (
+    PreparedSequence,
     PreprocessingConfig,
     PreprocessingError,
     SequenceRecord,
@@ -167,7 +168,7 @@ def test_window_sequences_count_realized_n_coverage_without_mask_spans() -> None
 def test_window_sequences_preserve_consensus_provenance_without_sequence_fallback() -> None:
     """Consensus windows report span-derived masked coverage verbatim so silent ``N`` bases remain auditable.
 
-    The reference/baseline fallback that folds in ``sequence.count("N")``
+    The ``source="reference"`` fallback that folds in ``sequence.count("N")``
     must not apply to consensus-sourced windows; otherwise a consensus
     record with an ``N`` base unaccounted for by any mask span would be
     silently reconciled and the downstream coverage invariant could no
@@ -355,3 +356,76 @@ def test_prepare_sequences_rejects_unknown_source_label_on_high_ambiguity_record
             [SequenceRecord("cat-1", "cat-1", "chr1", "NNNN", source="consensus_typo")],
             config,
         )
+
+
+def test_window_sequences_rejects_unknown_source_label_on_direct_entry() -> None:
+    """Regression: direct ``PreparedSequence`` callers cannot bypass source validation.
+
+    Wave 6d closes the remaining direct-entry provenance bypass: callers
+    that construct ``PreparedSequence`` values themselves (instead of going
+    through ``prepare_sequences``) must still be rejected by
+    ``window_sequences`` if the ``source`` label lies outside the approved
+    producer set ``{"consensus", "reference"}``. The check runs before any
+    per-block or per-window filter so the failure is loud even for inputs
+    that would otherwise yield windows.
+    """
+    config = PreprocessingConfig(
+        min_sequence_length=6,
+        max_ambiguity_fraction=0.5,
+        window_size=6,
+        window_stride=6,
+        locus_block_size=6,
+    )
+    prepared = [
+        PreparedSequence("cat-1", "cat-1", "chr1", "consensus_typo", 0, "ACGTAC", 0.5, 0.0),
+    ]
+
+    with pytest.raises(PreprocessingError, match=r"Unknown source label 'consensus_typo'"):
+        window_sequences(prepared, config)
+
+
+def test_window_sequences_rejects_unknown_source_label_when_all_windows_would_be_length_filtered() -> None:
+    """Regression: invalid direct-entry source raises even when the block overlap is too short for any window.
+
+    Without the up-front source validation, a ``PreparedSequence`` shorter
+    than ``window_size`` would cause ``window_sequences`` to silently
+    return an empty tuple and the malformed provenance would disappear as
+    a missing-record statistic. The contract requires the provenance
+    defect to surface as the primary failure.
+    """
+    config = PreprocessingConfig(
+        min_sequence_length=2,
+        max_ambiguity_fraction=1.0,
+        window_size=6,
+        window_stride=6,
+        locus_block_size=6,
+    )
+    prepared = [
+        PreparedSequence("cat-1", "cat-1", "chr1", "consensus_typo", 0, "ACG", 0.5, 0.0),
+    ]
+
+    with pytest.raises(PreprocessingError, match=r"Unknown source label 'consensus_typo'"):
+        window_sequences(prepared, config)
+
+
+def test_window_sequences_rejects_unknown_source_label_when_all_windows_would_be_ambiguity_filtered() -> None:
+    """Regression: invalid direct-entry source raises even when every candidate window exceeds the ambiguity cap.
+
+    A high-``N`` direct-entry sequence whose only candidate window would
+    be dropped by the per-window ambiguity filter must not let an
+    unapproved ``source`` label slip through as an empty-windows result;
+    the provenance defect must fail loudly before the filter runs.
+    """
+    config = PreprocessingConfig(
+        min_sequence_length=6,
+        max_ambiguity_fraction=0.25,
+        window_size=6,
+        window_stride=6,
+        locus_block_size=6,
+    )
+    prepared = [
+        PreparedSequence("cat-1", "cat-1", "chr1", "consensus_typo", 0, "NNNNNN", 0.0, 1.0),
+    ]
+
+    with pytest.raises(PreprocessingError, match=r"Unknown source label 'consensus_typo'"):
+        window_sequences(prepared, config)

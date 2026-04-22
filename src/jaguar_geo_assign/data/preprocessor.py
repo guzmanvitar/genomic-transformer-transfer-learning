@@ -891,11 +891,18 @@ def window_sequences(
         Tuple of ``WindowRecord`` instances, sorted by extraction order.
 
     Raises:
+        PreprocessingError: If any ``PreparedSequence.source`` lies outside
+            the approved producer set ``{"consensus", "reference"}``. The
+            check runs *before* any per-block overlap/length filter or
+            per-window ambiguity filter so direct callers that bypass
+            ``prepare_sequences`` cannot let a malformed label disappear
+            into an empty-windows result.
         SplitLeakageError: If ``assert_split_safety`` detects cross-fold
             overlap.
     """
     windows: list[WindowRecord] = []
     for sequence in sequences:
+        _require_approved_source_label(sequence.source)
         mask_counter = _WindowMaskCounter(sequence.mask_spans)
         genomic_start = sequence.sequence_start
         genomic_end = sequence.sequence_end
