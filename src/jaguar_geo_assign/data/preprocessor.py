@@ -62,6 +62,7 @@ from hashlib import sha256
 from io import BytesIO
 import json
 from pathlib import Path
+import sqlite3
 import tarfile
 from typing import Any, Protocol
 
@@ -1313,19 +1314,43 @@ class TokenizedCorpusWriter:
         self._written_files: list[Path] = []
         self._split_paths: dict[str, list[Path]] = defaultdict(list)
         self._split_record_counts: dict[str, int] = defaultdict(int)
-        self._manifest_entries: dict[str, SplitManifestEntry] = {}
+        self._sqlite_path: Path | None = None
+        self._sqlite_conn: sqlite3.Connection | None = None
         self._parquet_backend: tuple[Any, Any] | None = None
         self._opened = False
         self._closed = False
 
     def __enter__(self) -> "TokenizedCorpusWriter":
-        """Validate the contract, create the output directory, open the writer."""
+        """Validate the contract, create the output directory, open the writer.
+
+        The locus manifest is stored in a SQLite sidecar at
+        ``{output_dir}/.locus_manifest.sqlite`` rather than an in-memory
+        dict. Intent: prevent the previous O(total-windows) Python heap
+        pressure (~2–4 GB on the full felid corpus) that contradicted
+        the "peak RAM ≈ O(largest single species)" spec claim. The
+        sidecar is scratch: it is created here and removed unconditionally
+        by ``__exit__`` so it never appears in the deliverable tree.
+        """
         if self._contract.format != "parquet":
             raise ExportContractError(
                 "TokenizedCorpusWriter only supports parquet contracts; "
                 "use write_webdataset_shards for webdataset exports"
             )
         self._output_path.mkdir(parents=True, exist_ok=True)
+        sidecar_path = self._output_path / ".locus_manifest.sqlite"
+        if sidecar_path.exists():
+            sidecar_path.unlink()
+        self._sqlite_path = sidecar_path
+        self._sqlite_conn = sqlite3.connect(sidecar_path)
+        self._sqlite_conn.execute(
+            "CREATE TABLE locus_entries ("
+            "locus_id TEXT PRIMARY KEY, "
+            "contig TEXT NOT NULL, "
+            "block_start INTEGER NOT NULL, "
+            "block_end INTEGER NOT NULL, "
+            "split TEXT NOT NULL)"
+        )
+        self._sqlite_conn.commit()
         self._opened = True
         return self
 
@@ -1389,21 +1414,44 @@ class TokenizedCorpusWriter:
             ),
         )
 
+        batch_entries: dict[str, tuple[str, int, int, str]] = {}
         for record in sorted_batch:
             window = record.window
-            entry = SplitManifestEntry(
-                locus_id=window.locus_id,
-                contig=window.contig,
-                block_start=window.block_start,
-                block_end=window.block_end,
-                split=window.split,
-            )
-            current = self._manifest_entries.get(window.locus_id)
-            if current is not None and current.split != entry.split:
+            row = (window.contig, window.block_start, window.block_end, window.split)
+            existing = batch_entries.get(window.locus_id)
+            if existing is not None and existing[3] != window.split:
                 raise SplitLeakageError(
                     f"Locus {window.locus_id} is assigned to multiple splits"
                 )
-            self._manifest_entries[window.locus_id] = entry
+            batch_entries[window.locus_id] = row
+
+        assert self._sqlite_conn is not None
+        conn = self._sqlite_conn
+        locus_ids = list(batch_entries.keys())
+        chunk_size = 500
+        for start in range(0, len(locus_ids), chunk_size):
+            chunk = locus_ids[start : start + chunk_size]
+            placeholders = ",".join("?" * len(chunk))
+            cursor = conn.execute(
+                f"SELECT locus_id, split FROM locus_entries WHERE locus_id IN ({placeholders})",
+                chunk,
+            )
+            for locus_id, prior_split in cursor.fetchall():
+                batch_split = batch_entries[locus_id][3]
+                if prior_split != batch_split:
+                    raise SplitLeakageError(
+                        f"Locus {locus_id} is assigned to multiple splits"
+                    )
+        conn.executemany(
+            "INSERT OR IGNORE INTO locus_entries "
+            "(locus_id, contig, block_start, block_end, split) "
+            "VALUES (?, ?, ?, ?, ?)",
+            [
+                (locus_id, contig, block_start, block_end, split)
+                for locus_id, (contig, block_start, block_end, split) in batch_entries.items()
+            ],
+        )
+        conn.commit()
 
         partitioned: dict[tuple[str, str, str], list[TokenizedWindow]] = defaultdict(list)
         for record in sorted_batch:
@@ -1455,12 +1503,18 @@ class TokenizedCorpusWriter:
         """Flush and close the writer.
 
         On a clean close (no exception in the ``with`` block), emit the
-        corpus ``metadata.json`` sidecar. On an exception, delete any
+        corpus ``metadata.json`` sidecar by streaming ``split_manifest``
+        rows from the SQLite sidecar ordered by
+        ``(contig, block_start, split)``. On an exception, delete any
         Parquet files that were already written during this session so
         the output directory never contains half-written partitions
         that would corrupt a downstream train loader. Empty partition
         directories and the output root are left in place; only the
         Parquet artifacts are removed.
+
+        The SQLite sidecar is unconditionally closed and deleted on
+        every exit path (success, internal failure, caller exception)
+        so it never leaks into the deliverable tree.
 
         Args:
             exc_type: Type of the propagating exception, or ``None``.
@@ -1468,22 +1522,55 @@ class TokenizedCorpusWriter:
             exc_tb: Traceback of the propagating exception, or ``None``.
         """
         self._closed = True
-        if exc_type is not None:
-            for path in self._written_files:
-                try:
-                    path.unlink()
-                except FileNotFoundError:
-                    pass
+        try:
+            if exc_type is not None:
+                for path in self._written_files:
+                    try:
+                        path.unlink()
+                    except FileNotFoundError:
+                        pass
+                return None
+            self._write_metadata_json()
             return None
+        finally:
+            self._teardown_sqlite_sidecar()
 
+    def _teardown_sqlite_sidecar(self) -> None:
+        """Close the SQLite connection and remove the sidecar file.
+
+        Intent: ensure the scratch database never leaks into the
+        output tree regardless of which exit path triggered teardown,
+        so downstream packagers and auditors see only the canonical
+        Parquet + ``metadata.json`` deliverable.
+        """
+        if self._sqlite_conn is not None:
+            try:
+                self._sqlite_conn.close()
+            except sqlite3.Error:
+                pass
+            self._sqlite_conn = None
+        if self._sqlite_path is not None:
+            try:
+                self._sqlite_path.unlink()
+            except FileNotFoundError:
+                pass
+            self._sqlite_path = None
+
+    def _write_metadata_json(self) -> None:
+        """Write ``metadata.json`` with a streamed ``split_manifest`` array.
+
+        Intent: avoid materialising the full manifest as a Python list
+        (~O(total-windows)) to keep peak RAM at close near the SQLite
+        row-factory buffer rather than the full 7M-locus dict. The
+        non-manifest head is serialised with ``json.dumps(sort_keys=True,
+        indent=2)`` so top-level key order is byte-identical to the prior
+        implementation; ``split_manifest`` is spliced in immediately
+        before ``"splits"`` (its lexicographic successor) by streaming
+        rows from the SQLite sidecar in
+        ``(contig, block_start, split)`` order.
+        """
         metadata_provenance = self._resolve_final_provenance()
-        manifest = tuple(
-            sorted(
-                self._manifest_entries.values(),
-                key=lambda item: (item.contig, item.block_start, item.split),
-            )
-        )
-        metadata = {
+        metadata_head = {
             "access_pattern": self._contract.access_pattern,
             "deterministic_partition_keys": list(
                 self._contract.deterministic_partition_keys
@@ -1504,13 +1591,57 @@ class TokenizedCorpusWriter:
                 }
                 for split, paths in sorted(self._split_paths.items())
             },
-            "split_manifest": [asdict(entry) for entry in manifest],
         }
-        (self._output_path / "metadata.json").write_text(
-            json.dumps(metadata, indent=2, sort_keys=True),
-            encoding="utf-8",
+        head_serialized = json.dumps(metadata_head, indent=2, sort_keys=True)
+        splice_marker = '\n  "splits":'
+        splice_index = head_serialized.index(splice_marker)
+        prefix = head_serialized[:splice_index]
+        suffix = head_serialized[splice_index:]
+
+        assert self._sqlite_conn is not None
+        cursor = self._sqlite_conn.execute(
+            "SELECT locus_id, contig, block_start, block_end, split "
+            "FROM locus_entries "
+            "ORDER BY contig, block_start, split"
         )
-        return None
+        count_cursor = self._sqlite_conn.execute(
+            "SELECT COUNT(*) FROM locus_entries"
+        )
+        total_rows = count_cursor.fetchone()[0]
+
+        metadata_path = self._output_path / "metadata.json"
+        with metadata_path.open("w", encoding="utf-8") as handle:
+            handle.write(prefix)
+            handle.write("\n")
+            if total_rows == 0:
+                handle.write('  "split_manifest": []')
+            else:
+                handle.write('  "split_manifest": [\n')
+                fetch_chunk = 500
+                emitted = 0
+                while True:
+                    rows = cursor.fetchmany(fetch_chunk)
+                    if not rows:
+                        break
+                    for locus_id, contig, block_start, block_end, split in rows:
+                        entry = {
+                            "block_end": block_end,
+                            "block_start": block_start,
+                            "contig": contig,
+                            "locus_id": locus_id,
+                            "split": split,
+                        }
+                        body = json.dumps(entry, indent=2, sort_keys=True)
+                        indented = "\n".join("    " + line for line in body.splitlines())
+                        handle.write(indented)
+                        emitted += 1
+                        if emitted < total_rows:
+                            handle.write(",\n")
+                        else:
+                            handle.write("\n")
+                handle.write("  ]")
+            handle.write(",")
+            handle.write(suffix)
 
     @property
     def split_paths(self) -> dict[str, list[Path]]:

@@ -782,3 +782,67 @@ def test_streaming_writer_shim_parity_identical_records_and_manifest(tmp_path) -
     shim_manifest = _json.loads((shim_dir / "metadata.json").read_text(encoding="utf-8"))
     direct_manifest = _json.loads((direct_dir / "metadata.json").read_text(encoding="utf-8"))
     assert shim_manifest == direct_manifest
+
+
+def test_tokenized_corpus_writer_bounded_manifest_memory(tmp_path) -> None:
+    """Writer retains no in-memory manifest dict across batches.
+
+    Intent: the full felid corpus has ~7M loci, so an in-memory
+    ``{locus_id: SplitManifestEntry}`` dict at close would add
+    ~2\u20134 GB of Python heap pressure and violate the spec's
+    "peak RAM \u2248 O(largest single species)" claim. The refactor
+    stores per-locus manifest rows in a SQLite sidecar and streams
+    them into ``metadata.json`` at close. This test verifies two
+    contracts:
+
+    1. The offending attribute ``_manifest_entries`` no longer exists
+       on the writer after the ``with`` block, so any accidental
+       reintroduction during future edits trips this test.
+    2. The streamed ``metadata.json`` still round-trips every locus
+       across multiple batches in ``(contig, block_start, split)``
+       order, so callers never see a truncated manifest.
+
+    A regression in either clause breaks the memory-bound guarantee
+    surfaced to multi-species callers.
+    """
+    pytest.importorskip("pyarrow")
+    batches: list[tuple[TokenizedWindow, ...]] = []
+    all_locus_ids: list[str] = []
+    for batch_idx in range(3):
+        batch_records: list[TokenizedWindow] = []
+        for window_idx in range(5):
+            start = batch_idx * 1000 + window_idx * 8
+            end = start + 8
+            locus_id = f"chr1:{start}-{end}"
+            all_locus_ids.append(locus_id)
+            batch_records.append(
+                _streaming_tokenized(
+                    sample_id=f"b{batch_idx}-w{window_idx}",
+                    locus_id=locus_id,
+                    block_start=start,
+                    block_end=end,
+                    window_start=start,
+                    window_end=start + 6,
+                    sequence_hash=f"h-{batch_idx}-{window_idx}",
+                )
+            )
+        batches.append(tuple(batch_records))
+
+    with TokenizedCorpusWriter(tmp_path) as writer:
+        for batch in batches:
+            writer.write_batch(batch)
+
+    assert not hasattr(writer, "_manifest_entries"), (
+        "writer must not retain an in-memory manifest dict after the SQLite refactor"
+    )
+    assert not (tmp_path / ".locus_manifest.sqlite").exists(), (
+        "SQLite sidecar is scratch; it must be removed on clean exit"
+    )
+
+    metadata = _json.loads((tmp_path / "metadata.json").read_text(encoding="utf-8"))
+    manifest_locus_ids = [entry["locus_id"] for entry in metadata["split_manifest"]]
+    assert sorted(manifest_locus_ids) == sorted(all_locus_ids)
+    block_starts = [entry["block_start"] for entry in metadata["split_manifest"]]
+    assert block_starts == sorted(block_starts), (
+        "split_manifest must be streamed in (contig, block_start, split) order"
+    )
