@@ -1,0 +1,518 @@
+"""Contract tests for the VCF→FASTA consensus generation pipeline.
+
+These tests pin down the data integrity guarantees of
+``jaguar_geo_assign.data.acquisition.generate_consensus_fasta`` and its
+site-level classifier. They protect the invariants that make downstream
+genomic training safe: homozygous-reference calls preserve the reference,
+unsupported or ambiguous calls are masked with ``N`` rather than silently
+propagated, and any malformed or reference-mismatched input fails loudly
+with an actionable error instead of producing a silently corrupted FASTA.
+"""
+
+from __future__ import annotations
+
+import multiprocessing
+import queue
+from pathlib import Path
+import stat
+import textwrap
+
+import pytest
+
+from jaguar_geo_assign.data.acquisition import (
+    AcquisitionError,
+    ContigMismatchError,
+    MalformedGenotypeError,
+    MissingToolError,
+    ReferenceMismatchError,
+    classify_consensus_site,
+    ensure_bcftools_available,
+    generate_consensus_fasta,
+)
+
+
+@pytest.mark.parametrize(
+    ("ref", "alts", "genotype", "filter_value", "expected_action", "expected_category"),
+    [
+        ("A", ["T"], "0/0", "PASS", "reference", "homozygous_reference"),
+        ("A", ["T"], "1/1", "PASS", "apply_alt", "homozygous_alternate"),
+        ("A", ["."], "1/1", "PASS", "mask", "invalid_alt_index"),
+        ("A", ["AT"], "1/1", "PASS", "mask", "indel"),
+        ("A", ["T"], "0/1", "PASS", "mask", "heterozygous"),
+        ("A", ["T", "G"], "1/2", "PASS", "mask", "multiallelic"),
+        ("A", ["T", "G"], "1/1", "PASS", "mask", "multiallelic"),
+        ("A", ["T"], "./.", "PASS", "mask", "no_call"),
+        ("A", ["T"], "1/1", "LowQual", "mask", "filtered"),
+    ],
+)
+def test_classify_consensus_site_covers_explicit_contract(
+    ref: str,
+    alts: list[str],
+    genotype: str,
+    filter_value: str,
+    expected_action: str,
+    expected_category: str,
+) -> None:
+    """Verify each allele/filter combination maps to its documented action and category."""
+    decision = classify_consensus_site(ref, alts, genotype, filter_value=filter_value)
+
+    assert decision.action == expected_action
+    assert decision.category == expected_category
+    if alts == ["."]:
+        assert decision.replacement is None
+
+
+@pytest.mark.parametrize(
+    ("genotype", "filter_value"),
+    [("*/*", "PASS"), ("?/?", "LowQual"), ("1/?", "PASS")],
+)
+def test_classify_consensus_site_raises_actionable_error_on_malformed_gt(
+    genotype: str,
+    filter_value: str,
+) -> None:
+    """Ensure malformed GT tokens raise with sample/contig/position context for debugging."""
+    with pytest.raises(MalformedGenotypeError, match=r"GT='.*'.*sample 'cat_1'.*chr1:4"):
+        classify_consensus_site(
+            "A",
+            ["T"],
+            genotype,
+            filter_value=filter_value,
+            sample_id="cat_1",
+            contig="chr1",
+            position=4,
+            vcf_path=Path("fixture.vcf"),
+        )
+
+
+def test_generate_consensus_fasta_preserves_reference_and_masks_multiallelic_indel_and_ambiguous_calls(
+    tmp_path: Path,
+) -> None:
+    """Check end-to-end that applied homozygous ALTs coexist with ``N``-masked problem sites."""
+    reference = tmp_path / "reference.fa"
+    reference.write_text(
+        ">chr1 GCF_000181335.3 Felis_catus_9.0\nAACCGGAA\n",
+        encoding="utf-8",
+    )
+    vcf = tmp_path / "cat_1.vcf"
+    vcf.write_text(
+        textwrap.dedent(
+            """\
+            ##fileformat=VCFv4.2
+            ##reference=GCF_000181335.3_Felis_catus_9.0
+            ##contig=<ID=chr1,length=8>
+            #CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tcat_1
+            chr1\t2\t.\tA\tT\t.\tPASS\t.\tGT\t1/1
+            chr1\t4\t.\tC\tG\t.\tPASS\t.\tGT\t0/0
+            chr1\t5\t.\tG\tA,C\t.\tPASS\t.\tGT\t1/1
+            chr1\t6\t.\tG\tGA\t.\tPASS\t.\tGT\t1/1
+            chr1\t8\t.\tA\tG\t.\tPASS\t.\tGT\t./.
+            """
+        ),
+        encoding="utf-8",
+    )
+    fake_bcftools = _write_fake_bcftools(tmp_path)
+
+    result = generate_consensus_fasta(
+        sample_id="cat_1",
+        reference_fasta=reference,
+        sample_vcf=vcf,
+        output_fasta=tmp_path / "cat_1.fa",
+        bcftools_executable=str(fake_bcftools),
+    )
+
+    assert result.output_fasta.read_text(encoding="utf-8") == ">chr1\nATCCNNAN\n"
+    assert result.diagnostics.applied_variant_count == 1
+    assert result.diagnostics.masked_site_count == 3
+    assert result.diagnostics.filtered_or_nocall_count == 1
+    assert result.diagnostics.callable_records == 2
+    assert result.diagnostics.identical_to_reference_calls == 1
+    assert result.diagnostics.indel_count == 1
+    assert [(span.start, span.end, span.category) for span in result.mask_spans] == [
+        (4, 5, "multiallelic"),
+        (5, 6, "indel"),
+        (7, 8, "no_call"),
+    ]
+
+
+def test_generate_consensus_fasta_treats_alt_dot_as_no_alt_site(tmp_path: Path) -> None:
+    """Guard that ALT='.' sites are masked rather than treated as a real alternate allele."""
+    reference = tmp_path / "reference.fa"
+    reference.write_text(
+        ">chr1 GCF_000181335.3 Felis_catus_9.0\nAACCAA\n",
+        encoding="utf-8",
+    )
+    vcf = tmp_path / "cat_1.vcf"
+    vcf.write_text(
+        textwrap.dedent(
+            """\
+            ##fileformat=VCFv4.2
+            ##reference=GCF_000181335.3_Felis_catus_9.0
+            ##contig=<ID=chr1,length=6>
+            #CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tcat_1
+            chr1\t2\t.\tA\t.\t.\tPASS\t.\tGT\t1/1
+            """
+        ),
+        encoding="utf-8",
+    )
+    fake_bcftools = _write_fake_bcftools(tmp_path)
+
+    result = generate_consensus_fasta(
+        sample_id="cat_1",
+        reference_fasta=reference,
+        sample_vcf=vcf,
+        output_fasta=tmp_path / "cat_1.fa",
+        bcftools_executable=str(fake_bcftools),
+    )
+
+    assert result.output_fasta.read_text(encoding="utf-8") == ">chr1\nANCCAA\n"
+    assert "." not in result.output_fasta.read_text(encoding="utf-8")
+    assert result.diagnostics.applied_variant_count == 0
+    assert result.diagnostics.masked_site_count == 1
+    assert result.diagnostics.callable_records == 0
+    assert [(span.start, span.end, span.category) for span in result.mask_spans] == [
+        (1, 2, "invalid_alt_index"),
+    ]
+
+
+@pytest.mark.parametrize("genotype", ["*/*", "?/?"])
+def test_generate_consensus_fasta_fails_fast_on_malformed_gt_tokens(tmp_path: Path, genotype: str) -> None:
+    """Ensure the end-to-end pipeline refuses malformed GT tokens instead of silently dropping them."""
+    reference = tmp_path / "reference.fa"
+    reference.write_text(
+        ">chr1 GCF_000181335.3 Felis_catus_9.0\nAACCAA\n",
+        encoding="utf-8",
+    )
+    vcf = tmp_path / "cat_1.vcf"
+    vcf.write_text(
+        textwrap.dedent(
+            f"""\
+            ##fileformat=VCFv4.2
+            ##reference=GCF_000181335.3_Felis_catus_9.0
+            ##contig=<ID=chr1,length=6>
+            #CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tcat_1
+            chr1\t2\t.\tA\tT\t.\tPASS\t.\tGT\t{genotype}
+            """
+        ),
+        encoding="utf-8",
+    )
+    fake_bcftools = _write_fake_bcftools(tmp_path)
+
+    with pytest.raises(MalformedGenotypeError, match=r"GT='.*'.*sample 'cat_1'.*chr1:2"):
+        generate_consensus_fasta(
+            sample_id="cat_1",
+            reference_fasta=reference,
+            sample_vcf=vcf,
+            output_fasta=tmp_path / "cat_1.fa",
+            bcftools_executable=str(fake_bcftools),
+        )
+
+
+def test_generate_consensus_fasta_fails_fast_on_truncated_vcf_record_with_actionable_context(tmp_path: Path) -> None:
+    """Verify truncated VCF records raise with file/line/column context instead of a cryptic unpack error."""
+    reference = tmp_path / "reference.fa"
+    reference.write_text(
+        ">chr1 GCF_000181335.3 Felis_catus_9.0\nAACCAA\n",
+        encoding="utf-8",
+    )
+    vcf = tmp_path / "cat_1.vcf"
+    vcf.write_text(
+        textwrap.dedent(
+            """\
+            ##fileformat=VCFv4.2
+            ##reference=GCF_000181335.3_Felis_catus_9.0
+            ##contig=<ID=chr1,length=6>
+            #CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tcat_1
+            chr1\t2\t.\tA\tT\t.\tPASS\t.
+            """
+        ),
+        encoding="utf-8",
+    )
+    fake_bcftools = _write_fake_bcftools(tmp_path)
+
+    with pytest.raises(AcquisitionError) as exc_info:
+        generate_consensus_fasta(
+            sample_id="cat_1",
+            reference_fasta=reference,
+            sample_vcf=vcf,
+            output_fasta=tmp_path / "cat_1.fa",
+            bcftools_executable=str(fake_bcftools),
+        )
+
+    message = str(exc_info.value)
+    assert "Malformed VCF record" in message
+    assert str(vcf) in message
+    assert "sample 'cat_1'" in message
+    assert "line 5" in message
+    assert "expected at least 10 tab-delimited columns" in message
+    assert "found 8" in message
+    assert "not enough values to unpack" not in message
+
+
+@pytest.mark.parametrize(
+    ("reference_header", "match"),
+    [
+        (None, "missing explicit reference/build metadata"),
+        ("##reference=GCF_000181335.3", "does not canonically match expected build evidence"),
+        ("##reference=Felis_catus_9.0", "does not canonically match expected build evidence"),
+        ("##reference=GCF_000181335.3_GRCh38", "does not canonically match expected build evidence"),
+        ("##reference=GRCh38", "does not canonically match expected build evidence"),
+    ],
+)
+def test_generate_consensus_fasta_requires_explicit_matching_reference_metadata(
+    tmp_path: Path,
+    reference_header: str | None,
+    match: str,
+) -> None:
+    """Reject VCFs whose ``##reference`` header is missing, partial, or points at a different build."""
+    reference = tmp_path / "reference.fa"
+    reference.write_text(
+        ">chr1 GCF_000181335.3 Felis_catus_9.0\nAACCAA\n",
+        encoding="utf-8",
+    )
+    vcf = tmp_path / "cat_1.vcf"
+    header_lines = [
+        "##fileformat=VCFv4.2",
+        *( [reference_header] if reference_header is not None else [] ),
+        "##contig=<ID=chr1,length=6>",
+        "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tcat_1",
+        "chr1\t2\t.\tA\tT\t.\tPASS\t.\tGT\t1/1",
+    ]
+    vcf.write_text("\n".join(header_lines) + "\n", encoding="utf-8")
+    fake_bcftools = _write_fake_bcftools(tmp_path)
+
+    with pytest.raises(ReferenceMismatchError, match=match):
+        generate_consensus_fasta(
+            sample_id="cat_1",
+            reference_fasta=reference,
+            sample_vcf=vcf,
+            output_fasta=tmp_path / "cat_1.fa",
+            bcftools_executable=str(fake_bcftools),
+        )
+
+
+@pytest.mark.parametrize(
+    ("reference_name", "reference_header"),
+    [
+        ("GCF_000181335.3_only.fa", ">chr1\nunrelated\nAACCAA\n"),
+        ("reference.fa", ">chr1 Felis_catus_9.0\nAACCAA\n"),
+        ("reference.fa", ">chr1 GCF_000181335.3 Felis_catus_8.0\nAACCAA\n"),
+    ],
+)
+def test_generate_consensus_fasta_rejects_partial_or_inconsistent_fasta_build_evidence(
+    tmp_path: Path,
+    reference_name: str,
+    reference_header: str,
+) -> None:
+    """Reject reference FASTAs whose filename/header does not jointly pin the expected build."""
+    reference = tmp_path / reference_name
+    reference.write_text(reference_header, encoding="utf-8")
+    vcf = tmp_path / "cat_1.vcf"
+    vcf.write_text(
+        textwrap.dedent(
+            """\
+            ##fileformat=VCFv4.2
+            ##reference=GCF_000181335.3_Felis_catus_9.0
+            ##contig=<ID=chr1,length=6>
+            #CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tcat_1
+            chr1\t2\t.\tA\tT\t.\tPASS\t.\tGT\t1/1
+            """
+        ),
+        encoding="utf-8",
+    )
+    fake_bcftools = _write_fake_bcftools(tmp_path)
+
+    with pytest.raises(ReferenceMismatchError, match="does not canonically match expected build evidence"):
+        generate_consensus_fasta(
+            sample_id="cat_1",
+            reference_fasta=reference,
+            sample_vcf=vcf,
+            output_fasta=tmp_path / "cat_1.fa",
+            bcftools_executable=str(fake_bcftools),
+        )
+
+
+def test_generate_consensus_fasta_fails_fast_on_contig_mismatch(tmp_path: Path) -> None:
+    """Ensure a VCF referencing contigs absent from the reference raises before any consensus is emitted."""
+    reference = tmp_path / "reference.fa"
+    reference.write_text(
+        ">chr1 GCF_000181335.3 Felis_catus_9.0\nAACCAA\n",
+        encoding="utf-8",
+    )
+    vcf = tmp_path / "cat_1.vcf"
+    vcf.write_text(
+        textwrap.dedent(
+            """\
+            ##fileformat=VCFv4.2
+            ##reference=GCF_000181335.3_Felis_catus_9.0
+            ##contig=<ID=chr2,length=6>
+            #CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tcat_1
+            chr2\t2\t.\tA\tT\t.\tPASS\t.\tGT\t1/1
+            """
+        ),
+        encoding="utf-8",
+    )
+    fake_bcftools = _write_fake_bcftools(tmp_path)
+
+    with pytest.raises(ContigMismatchError, match="contigs absent"):
+        generate_consensus_fasta(
+            sample_id="cat_1",
+            reference_fasta=reference,
+            sample_vcf=vcf,
+            output_fasta=tmp_path / "cat_1.fa",
+            bcftools_executable=str(fake_bcftools),
+        )
+
+
+def test_ensure_bcftools_available_raises_actionable_error() -> None:
+    """Guard that a missing ``bcftools`` binary surfaces an install hint instead of a raw OSError."""
+    with pytest.raises(MissingToolError, match="install bcftools"):
+        ensure_bcftools_available("bcftools-does-not-exist")
+
+
+def test_generate_consensus_fasta_handles_stderr_heavy_subprocess_without_hanging(tmp_path: Path) -> None:
+    """Prevent regression where a chatty bcftools stderr would deadlock the subprocess pipes."""
+    sequence = "A" * 262_144
+    reference = tmp_path / "reference.fa"
+    reference.write_text(f">chr1 GCF_000181335.3 Felis_catus_9.0\n{sequence}\n", encoding="utf-8")
+    vcf = tmp_path / "cat_1.vcf"
+    vcf.write_text(
+        textwrap.dedent(
+            """\
+            ##fileformat=VCFv4.2
+            ##reference=GCF_000181335.3_Felis_catus_9.0
+            ##contig=<ID=chr1,length=262144>
+            #CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tcat_1
+            chr1\t2\t.\tA\tT\t.\tPASS\t.\tGT\t0/0
+            """
+        ),
+        encoding="utf-8",
+    )
+    fake_bcftools = _write_fake_bcftools(tmp_path, emit_stderr_before_stdin_bytes=262_144)
+    output_fasta = tmp_path / "cat_1.fa"
+    ctx = multiprocessing.get_context("spawn")
+    result_queue = ctx.Queue()
+    process = ctx.Process(
+        target=_run_generate_consensus_fasta,
+        args=(result_queue, reference, vcf, output_fasta, fake_bcftools),
+    )
+
+    process.start()
+    process.join(timeout=5)
+    if process.is_alive():
+        process.terminate()
+        process.join(timeout=1)
+        pytest.fail("generate_consensus_fasta hung when bcftools emitted stderr before consuming stdin")
+
+    try:
+        result = result_queue.get(timeout=1)
+    except queue.Empty as exc:
+        raise AssertionError(
+            f"consensus subprocess exited without a result payload (exit code {process.exitcode})"
+        ) from exc
+
+    assert process.exitcode == 0
+    assert result["ok"] is True, result.get("error")
+    assert result["applied_variant_count"] == 0
+    assert result["sequence_length"] == len(sequence)
+
+
+def _run_generate_consensus_fasta(result_queue, reference: Path, vcf: Path, output_fasta: Path, fake_bcftools: Path) -> None:  # noqa: ANN001
+    try:
+        result = generate_consensus_fasta(
+            sample_id="cat_1",
+            reference_fasta=reference,
+            sample_vcf=vcf,
+            output_fasta=output_fasta,
+            bcftools_executable=str(fake_bcftools),
+        )
+    except Exception as exc:  # noqa: BLE001
+        result_queue.put({"ok": False, "error": f"{type(exc).__name__}: {exc}"})
+        return
+
+    sequence = output_fasta.read_text(encoding="utf-8").splitlines()[1]
+    result_queue.put(
+        {
+            "ok": True,
+            "applied_variant_count": result.diagnostics.applied_variant_count,
+            "sequence_length": len(sequence),
+        }
+    )
+
+
+def _write_fake_bcftools(tmp_path: Path, *, emit_stderr_before_stdin_bytes: int = 0) -> Path:
+    script = tmp_path / "fake_bcftools.py"
+    stderr_preamble = (
+        f"sys.stderr.write('E' * {emit_stderr_before_stdin_bytes})\n"
+        "sys.stderr.flush()\n"
+        if emit_stderr_before_stdin_bytes
+        else ""
+    )
+    script.write_text(
+        (
+            "#!/usr/bin/env python3\n"
+            "import sys\n"
+            "from pathlib import Path\n\n"
+            "def read_fasta(text: str):\n"
+            "    name = None\n"
+            "    seq = []\n"
+            "    out = {}\n"
+            "    for line in text.splitlines():\n"
+            "        if line.startswith('>'):\n"
+            "            if name is not None:\n"
+            "                out[name] = list(''.join(seq))\n"
+            "            name = line[1:].split()[0]\n"
+            "            seq = []\n"
+            "        else:\n"
+            "            seq.append(line.strip())\n"
+            "    if name is not None:\n"
+            "        out[name] = list(''.join(seq))\n"
+            "    return out\n\n"
+            "args = sys.argv[1:]\n"
+            "if not args or args[0] != 'consensus':\n"
+            "    sys.stderr.write('expected consensus command')\n"
+            "    sys.exit(2)\n"
+            "sample = None\n"
+            "mask_path = None\n"
+            "header = None\n"
+            "index = 1\n"
+            "while index < len(args) - 1:\n"
+            "    if args[index] == '-s':\n"
+            "        sample = args[index + 1]\n"
+            "        index += 2\n"
+            "        continue\n"
+            "    if args[index] == '-m':\n"
+            "        mask_path = Path(args[index + 1])\n"
+            "        index += 2\n"
+            "        continue\n"
+            "    index += 1\n"
+            "vcf_path = Path(args[-1])\n"
+            f"{stderr_preamble}"
+            "sequences = read_fasta(sys.stdin.read())\n"
+            "if mask_path and mask_path.exists():\n"
+            "    for line in mask_path.read_text(encoding='utf-8').splitlines():\n"
+            "        chrom, start, end = line.split('\\t')\n"
+            "        for position in range(int(start), int(end)):\n"
+            "            sequences[chrom][position] = 'N'\n"
+            "for line in vcf_path.read_text(encoding='utf-8').splitlines():\n"
+            "    if line.startswith('#'):\n"
+            "        header = line.split('\\t') if line.startswith('#CHROM') else header\n"
+            "        continue\n"
+            "    fields = line.split('\\t')\n"
+            "    chrom, pos, _id, ref, alt_field, _qual, filt, _info, fmt = fields[:9]\n"
+            "    sample_fields = dict(zip(fmt.split(':'), fields[header.index(sample)].split(':'), strict=False))\n"
+            "    gt = sample_fields.get('GT')\n"
+            "    if filt not in {'PASS', '.'} or gt is None:\n"
+            "        continue\n"
+            "    alleles = gt.replace('|', '/').split('/')\n"
+            "    if len(set(alleles)) != 1 or alleles[0] in {'0', '.'}:\n"
+            "        continue\n"
+            "    alt = alt_field.split(',')[int(alleles[0]) - 1]\n"
+            "    position = int(pos) - 1\n"
+            "    sequences[chrom][position : position + len(ref)] = list(alt)\n"
+            "for chrom, seq in sequences.items():\n"
+            "    sys.stdout.write('>' + chrom + '\\n' + ''.join(seq) + '\\n')\n"
+        ),
+        encoding="utf-8",
+    )
+    script.chmod(script.stat().st_mode | stat.S_IEXEC)
+    return script
