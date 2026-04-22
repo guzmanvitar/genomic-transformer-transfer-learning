@@ -6,7 +6,7 @@ readme = "README.md"
 requires-python = ">=3.11,<3.12"
 dependencies = [
     "pyarrow>=16,<20",
-    "transformers>=5.6.0",
+    "transformers>=5.6,<6",
 ]
 
 [project.scripts]
