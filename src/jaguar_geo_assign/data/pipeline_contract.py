@@ -60,6 +60,25 @@ REQUIRED_EXTERNAL_TOOLS = ("bcftools",)
 # Mandatory columns in the sample manifest CSV/TSV.
 REQUIRED_SAMPLE_MANIFEST_FIELDS = ("sample_id", "individual_id", "vcf_path")
 
+# Felid foundation corpus contracts.
+#
+# Intent: the felid-foundation pretraining path mixes six reference assemblies
+# into a single tokenized corpus. Pinning the *set* of approved accessions at
+# contract level (rather than taking the list directly from
+# ``felid_assemblies.APPROVED_FELID_ASSEMBLIES``) gives the config loader an
+# O(1) membership check and makes drift visible in PR diffs: adding a species
+# requires updating both the registry and this frozenset, exactly like the
+# feline BioProject pinning above.
+from .felid_assemblies import APPROVED_FELID_ASSEMBLIES as _APPROVED_FELID_ASSEMBLIES
+
+APPROVED_FELID_ACCESSIONS: frozenset[str] = frozenset(
+    assembly.accession for assembly in _APPROVED_FELID_ASSEMBLIES
+)
+"""Frozen set of the six pinned RefSeq accessions approved for the felid foundation corpus."""
+
+REQUIRED_FELID_FOUNDATION_SPECIES_COUNT = len(_APPROVED_FELID_ASSEMBLIES)
+"""The felid foundation contract requires exactly this many approved species."""
+
 # Consensus-calling policy whitelist
 
 # Exhaustive set of allowed policies for resolving heterozygous or
