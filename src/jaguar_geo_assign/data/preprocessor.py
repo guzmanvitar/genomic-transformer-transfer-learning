@@ -1477,6 +1477,15 @@ class TokenizedCorpusWriter:
                 range(0, len(partition_records), row_group_size)
             ):
                 chunk = partition_records[chunk_start : chunk_start + row_group_size]
+                # TRADE-OFF (Greptile #4, Parquet filename): the
+                # ``part-{batch:05d}-{chunk:05d}.parquet`` scheme is unique
+                # per (partition_dir, batch_index, chunk_index) which is
+                # sufficient for a single-process writer (the contract
+                # documented in the class docstring). It is not collision-
+                # safe for future multi-process writers or for
+                # ``batch_index`` > 99999; deferred because changing the
+                # filename shape breaks downstream parity and autodiscovery
+                # tests and is out of scope for this PR.
                 file_path = (
                     partition_dir
                     / f"part-{self._batch_index:05d}-{chunk_index:05d}.parquet"
@@ -1525,20 +1534,46 @@ class TokenizedCorpusWriter:
             exc_tb: Traceback of the propagating exception, or ``None``.
         """
         self._closed = True
+        metadata_write_failed = False
         try:
             if exc_type is not None:
-                for path in self._written_files:
-                    try:
-                        path.unlink()
-                    except FileNotFoundError:
-                        pass
+                self._cleanup_written_parquet_files()
                 return None
-            self._write_metadata_json()
+            try:
+                self._write_metadata_json()
+            except BaseException:
+                # Intent: a failure inside ``_write_metadata_json`` leaves
+                # Parquet files on disk with no accompanying manifest. That
+                # state is worse than a clean rollback because downstream
+                # autodiscovery tooling treats any tree with ``*.parquet``
+                # files as a usable corpus. Mirror the caller-exception
+                # branch (unlink Parquet files + prune empty dirs) so both
+                # failure paths leave the output root empty. ``BaseException``
+                # is caught to include ``KeyboardInterrupt`` /
+                # ``SystemExit``; we re-raise immediately so propagation is
+                # preserved.
+                metadata_write_failed = True
+                self._cleanup_written_parquet_files()
+                raise
             return None
         finally:
             self._teardown_sqlite_sidecar()
-            if exc_type is not None:
+            if exc_type is not None or metadata_write_failed:
                 self._prune_empty_output_tree()
+
+    def _cleanup_written_parquet_files(self) -> None:
+        """Unlink every Parquet file this writer created during the session.
+
+        Intent: centralise the unlink loop so the caller-exception path and
+        the metadata-write-failure path in ``__exit__`` cannot drift. Each
+        path must leave the output tree in the same half-cleaned state
+        before ``_prune_empty_output_tree`` runs.
+        """
+        for path in self._written_files:
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                pass
 
     def _teardown_sqlite_sidecar(self) -> None:
         """Close the SQLite connection and remove the sidecar file.
@@ -1592,20 +1627,23 @@ class TokenizedCorpusWriter:
                 pass
 
     def _write_metadata_json(self) -> None:
-        """Write ``metadata.json`` with a streamed ``split_manifest`` array.
+        """Write ``metadata.json`` as a streamed JSON object.
 
         Intent: avoid materialising the full manifest as a Python list
         (~O(total-windows)) to keep peak RAM at close near the SQLite
-        row-factory buffer rather than the full 7M-locus dict. The
-        non-manifest head is serialised with ``json.dumps(sort_keys=True,
-        indent=2)`` so top-level key order is byte-identical to the prior
-        implementation; ``split_manifest`` is spliced in immediately
-        before ``"splits"`` (its lexicographic successor) by streaming
-        rows from the SQLite sidecar in
-        ``(contig, block_start, split)`` order.
+        row-factory buffer rather than the full 7M-locus dict. Emit the
+        top-level object one key at a time in alphabetical order so the
+        file is valid JSON without the prior ``str.index`` splice, which
+        relied on the exact whitespace shape produced by
+        ``json.dumps(..., indent=2)`` and would have crashed noisily if
+        a future ``json`` change altered that shape. O(1)-in-window-count
+        head fields are serialised eagerly; ``split_manifest`` is streamed
+        directly from the SQLite sidecar in
+        ``(contig, block_start, split)`` order so only ``fetchmany`` chunks
+        are ever resident.
         """
         metadata_provenance = self._resolve_final_provenance()
-        metadata_head = {
+        head_fields: dict[str, Any] = {
             "access_pattern": self._contract.access_pattern,
             "deterministic_partition_keys": list(
                 self._contract.deterministic_partition_keys
@@ -1616,7 +1654,6 @@ class TokenizedCorpusWriter:
             "preserve_sequence_hashes": self._contract.preserve_sequence_hashes,
             "row_group_size": self._contract.row_group_size,
             "sequence_hash_algorithm": self._contract.sequence_hash_algorithm,
-            "tokenizer": asdict(metadata_provenance),
             "splits": {
                 split: {
                     "record_count": self._split_record_counts[split],
@@ -1626,12 +1663,12 @@ class TokenizedCorpusWriter:
                 }
                 for split, paths in sorted(self._split_paths.items())
             },
+            "tokenizer": asdict(metadata_provenance),
         }
-        head_serialized = json.dumps(metadata_head, indent=2, sort_keys=True)
-        splice_marker = '\n  "splits":'
-        splice_index = head_serialized.index(splice_marker)
-        prefix = head_serialized[:splice_index]
-        suffix = head_serialized[splice_index:]
+        # Alphabetical union of head fields and the streamed ``split_manifest``
+        # key; the stream is substituted inline by key rather than spliced
+        # into a pre-rendered string.
+        top_level_keys = sorted([*head_fields.keys(), "split_manifest"])
 
         assert self._sqlite_conn is not None
         cursor = self._sqlite_conn.execute(
@@ -1645,38 +1682,64 @@ class TokenizedCorpusWriter:
         total_rows = count_cursor.fetchone()[0]
 
         metadata_path = self._output_path / "metadata.json"
+        last_index = len(top_level_keys) - 1
         with metadata_path.open("w", encoding="utf-8") as handle:
-            handle.write(prefix)
-            handle.write("\n")
-            if total_rows == 0:
-                handle.write('  "split_manifest": []')
-            else:
-                handle.write('  "split_manifest": [\n')
-                fetch_chunk = 500
-                emitted = 0
-                while True:
-                    rows = cursor.fetchmany(fetch_chunk)
-                    if not rows:
-                        break
-                    for locus_id, contig, block_start, block_end, split in rows:
-                        entry = {
-                            "block_end": block_end,
-                            "block_start": block_start,
-                            "contig": contig,
-                            "locus_id": locus_id,
-                            "split": split,
-                        }
-                        body = json.dumps(entry, indent=2, sort_keys=True)
-                        indented = "\n".join("    " + line for line in body.splitlines())
-                        handle.write(indented)
-                        emitted += 1
-                        if emitted < total_rows:
-                            handle.write(",\n")
-                        else:
-                            handle.write("\n")
-                handle.write("  ]")
-            handle.write(",")
-            handle.write(suffix)
+            handle.write("{\n")
+            for idx, key in enumerate(top_level_keys):
+                trailing_comma = "," if idx < last_index else ""
+                if key == "split_manifest":
+                    self._stream_split_manifest(
+                        handle, cursor, total_rows, trailing_comma
+                    )
+                else:
+                    value_blob = json.dumps(
+                        head_fields[key], indent=2, sort_keys=True
+                    )
+                    indented_value = value_blob.replace("\n", "\n  ")
+                    handle.write(f'  "{key}": {indented_value}{trailing_comma}\n')
+            handle.write("}\n")
+
+    def _stream_split_manifest(
+        self,
+        handle: Any,
+        cursor: sqlite3.Cursor,
+        total_rows: int,
+        trailing_comma: str,
+    ) -> None:
+        """Emit the ``split_manifest`` array entry of ``metadata.json``.
+
+        Intent: stream manifest rows from the SQLite sidecar in
+        ``(contig, block_start, split)`` order so peak RAM at close stays
+        bounded by the ``fetchmany`` chunk rather than the full corpus.
+        The caller handles the top-level comma for this key.
+        """
+        if total_rows == 0:
+            handle.write(f'  "split_manifest": []{trailing_comma}\n')
+            return
+        handle.write('  "split_manifest": [\n')
+        fetch_chunk = 500
+        emitted = 0
+        while True:
+            rows = cursor.fetchmany(fetch_chunk)
+            if not rows:
+                break
+            for locus_id, contig, block_start, block_end, split in rows:
+                entry = {
+                    "block_end": block_end,
+                    "block_start": block_start,
+                    "contig": contig,
+                    "locus_id": locus_id,
+                    "split": split,
+                }
+                body = json.dumps(entry, indent=2, sort_keys=True)
+                indented = "\n".join("    " + line for line in body.splitlines())
+                handle.write(indented)
+                emitted += 1
+                if emitted < total_rows:
+                    handle.write(",\n")
+                else:
+                    handle.write("\n")
+        handle.write(f"  ]{trailing_comma}\n")
 
     @property
     def split_paths(self) -> dict[str, list[Path]]:

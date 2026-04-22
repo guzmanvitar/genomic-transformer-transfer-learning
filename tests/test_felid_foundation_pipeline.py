@@ -30,7 +30,16 @@ from jaguar_geo_assign.pretrain import (
     run_felid_foundation_pretrain,
 )
 from jaguar_geo_assign.pretrain._shared import normalize_ru_maxrss_to_bytes
-from tests._felid_fixture import load_example_config_dict, render_example_config
+from tests._felid_fixture import (
+    ALL_APPROVED_FELIDS as _ALL_APPROVED_FELIDS,
+    build_fixture_fasta as _build_fixture_fasta,
+    load_example_config_dict,
+    pad_species_to_full_roster as _pad_to_six_species,
+    placeholder_fasta_filename as _placeholder_fasta_filename,
+    placeholder_fasta_md5 as _placeholder_fasta_md5,
+    render_example_config,
+    write_placeholder_fastas as _write_placeholder_fastas,
+)
 
 
 def test_species_slug_derivation():
@@ -60,79 +69,11 @@ def test_normalize_ru_maxrss_unknown_platform():
         normalize_ru_maxrss_to_bytes(1024, "win32")
 
 
-def _build_fixture_fasta(contigs: dict[str, str]) -> bytes:
-    """Build a gzipped FASTA fixture from a dict of {contig_id: sequence}."""
-    lines = []
-    for contig_id, sequence in contigs.items():
-        lines.append(f">{contig_id}")
-        lines.append(sequence)
-    fasta_text = "\n".join(lines) + "\n"
-    return gzip.compress(fasta_text.encode("ascii"))
-
-
-# All six approved felid species in (species, accession) form. The config
-# loader requires the full six-species set, so every fixture config must
-# include all of these. Tests that want to focus on a subset list only the
-# species they care about and :func:`_build_fixture_config` pads the rest.
-_ALL_APPROVED_FELIDS: tuple[tuple[str, str], ...] = (
-    ("Felis catus", "GCF_000181335.3"),
-    ("Panthera leo", "GCF_018350215.1"),
-    ("Panthera tigris", "GCF_000464555.1"),
-    ("Panthera onca", "GCF_028533385.1"),
-    ("Puma concolor", "GCF_003327715.1"),
-    ("Panthera pardus", "GCF_001857705.1"),
-)
-
-
-def _pad_to_six_species(subset: list[tuple[str, str]]) -> list[tuple[str, str]]:
-    """Pad *subset* with remaining approved felids so the result has six entries.
-
-    Intent: the config loader rejects species lists shorter than six, but
-    most tests only care about behaviour on a smaller subset. Padding keeps
-    the tests focused while respecting the contract.
-    """
-    seen = {acc for _, acc in subset}
-    padding = [entry for entry in _ALL_APPROVED_FELIDS if entry[1] not in seen]
-    return list(subset) + padding[: max(0, 6 - len(subset))]
-
-
-def _placeholder_fasta_filename(accession: str) -> str:
-    """Return the fixture FASTA filename for *accession*.
-
-    Intent: mirrors the ``<ACC>_<ASM>.fna.gz`` filename convention enforced
-    by :func:`build_felid_reference_manifest`. Padded species need a real
-    on-disk fixture FASTA so run tests reach the logic under test instead
-    of failing with :class:`MissingFelidReferenceError` on a padded entry.
-    """
-    from jaguar_geo_assign.data.felid_assemblies import APPROVED_FELID_ASSEMBLIES
-
-    for assembly in APPROVED_FELID_ASSEMBLIES:
-        if assembly.accession == accession:
-            return f"{accession}_{assembly.assembly_name}.fna.gz"
-    raise AssertionError(f"Unknown accession in fixture: {accession}")
-
-
-def _write_placeholder_fastas(
-    reference_dir: Path, padded_accessions: list[str]
-) -> None:
-    """Write a minimal unique FASTA for each padded species.
-
-    Intent: placeholder FASTAs use the accession as the contig ID so they
-    cannot collide with user-authored fixture contigs. The sequence is
-    short enough that windowing yields zero windows, keeping padded
-    species invisible to window-count assertions.
-    """
-    reference_dir.mkdir(parents=True, exist_ok=True)
-    for accession in padded_accessions:
-        path = reference_dir / _placeholder_fasta_filename(accession)
-        if path.exists():
-            continue
-        path.write_bytes(_build_fixture_fasta({accession: "A" * 128}))
-
-
-def _placeholder_fasta_md5(accession: str) -> str:
-    """Return the MD5 of the placeholder FASTA written by :func:`_write_placeholder_fastas`."""
-    return hashlib.md5(_build_fixture_fasta({accession: "A" * 128})).hexdigest()
+# Fixture helpers (``_build_fixture_fasta``, ``_ALL_APPROVED_FELIDS``,
+# ``_pad_to_six_species``, ``_placeholder_fasta_filename``,
+# ``_placeholder_fasta_md5``, ``_write_placeholder_fastas``) are imported
+# from :mod:`tests._felid_fixture` to keep the integration test and this
+# unit-test module on a single source of truth (no copy-paste).
 
 
 def _build_full_mock_manifest(
