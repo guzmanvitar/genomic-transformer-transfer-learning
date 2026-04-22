@@ -383,9 +383,10 @@ class WindowRecord:
         unique_masked_bases: Reported exclusive masked-base count with
             source-aware fallback: for ``source == "consensus"`` this is
             the de-duplicated span-derived count verbatim (no fallback, so
-            provenance gaps remain auditable); for reference/baseline
-            windows it falls back to realized ``N`` coverage when no mask
-            spans are declared.
+            provenance gaps remain auditable); for ``source == "reference"``
+            windows (the only approved non-consensus emitted source label)
+            it falls back to realized ``N`` coverage when no mask spans are
+            declared.
         filtered_bases: Bases masked with the ``"filtered"`` category.
         no_call_bases: Bases masked with the ``"no_call"`` category.
         other_masked_bases: Bases in mask categories other than
@@ -596,6 +597,11 @@ def prepare_sequences(
     are captured in ``PreprocessingReport.filtered`` with a machine-readable
     ``reason``.
 
+    Producer ``source`` labels are validated *before* any filter runs, so
+    malformed provenance (e.g. typos such as ``"consensus_typo"``) cannot
+    be silently swallowed by the short-sequence or high-ambiguity filters
+    and leak into downstream analysis as a missing-record statistic.
+
     Args:
         records: Raw consensus sequences to process.
         config: Preprocessing thresholds and alphabet settings.
@@ -603,11 +609,16 @@ def prepare_sequences(
     Returns:
         A ``PreprocessingReport`` with retained and filtered sequences
         plus aggregate GC and ambiguity statistics.
+
+    Raises:
+        PreprocessingError: If any record carries a ``source`` label outside
+            the approved producer set ``{"consensus", "reference"}``.
     """
     retained: list[PreparedSequence] = []
     filtered: list[FilteredSequence] = []
 
     for record in records:
+        _require_approved_source_label(record.source)
         normalized = normalize_sequence(
             record.sequence,
             ambiguity_mode=config.ambiguity_mode,
@@ -790,6 +801,28 @@ REFERENCE_SOURCE_LABEL = "reference"
 APPROVED_SOURCE_LABELS = frozenset({CONSENSUS_SOURCE_LABEL, REFERENCE_SOURCE_LABEL})
 
 
+def _require_approved_source_label(source: str) -> None:
+    """Fail loudly on any producer ``source`` label outside the approved set.
+
+    Intent: the approved emitted producer source set is exactly
+    ``{"consensus", "reference"}``. Any other label must raise before
+    downstream filtering or fallback logic can silently swallow it
+    (e.g. a short-sequence or high-ambiguity filter would otherwise drop
+    malformed records with typos and hide the provenance defect).
+
+    Args:
+        source: Candidate producer source label.
+
+    Raises:
+        PreprocessingError: If ``source`` is not in ``APPROVED_SOURCE_LABELS``.
+    """
+    if source not in APPROVED_SOURCE_LABELS:
+        raise PreprocessingError(
+            f"Unknown source label '{source}': only {sorted(APPROVED_SOURCE_LABELS)} are approved. "
+            "Update the centralized source contract if a new label is required."
+        )
+
+
 def _count_realized_unique_masked_bases(
     sequence: str,
     span_unique_masked_bases: int,
@@ -821,11 +854,7 @@ def _count_realized_unique_masked_bases(
     Raises:
         PreprocessingError: If ``source`` is not in ``APPROVED_SOURCE_LABELS``.
     """
-    if source not in APPROVED_SOURCE_LABELS:
-        raise PreprocessingError(
-            f"Unknown source label '{source}': only {sorted(APPROVED_SOURCE_LABELS)} are approved. "
-            "Update the centralized source contract if a new label is required."
-        )
+    _require_approved_source_label(source)
     if source == CONSENSUS_SOURCE_LABEL:
         return span_unique_masked_bases
     return max(span_unique_masked_bases, sequence.count("N"))

@@ -284,14 +284,16 @@ def test_window_sequences_reference_source_with_intrinsic_n_uses_realized_covera
     assert windows[0].masked_base_counts == ()
 
 
-def test_window_sequences_reject_unknown_source_label_before_fallback() -> None:
-    """Regression: unknown source labels fail loudly instead of silently using relaxed fallback.
+def test_prepare_sequences_rejects_unknown_source_label_on_retained_record_shape() -> None:
+    """Regression: retained-shape records with unknown source labels fail loudly at ingress.
 
     Wave 6b approval mandated that the approved producer-side source set
     is exactly ``{"consensus", "reference"}``; any other label must raise
-    a fail-fast contract error before it can reach the fallback path.
-    This prevents silent data-quality degradation from typos or
-    unapproved labels.
+    a fail-fast contract error before filtering or fallback logic can
+    swallow it. Wave 6c moved the validation to ``prepare_sequences`` so
+    even records that would otherwise be retained now fail at the earliest
+    ingress point. This prevents silent data-quality degradation from
+    typos or unapproved labels.
     """
     config = PreprocessingConfig(
         min_sequence_length=6,
@@ -301,10 +303,55 @@ def test_window_sequences_reject_unknown_source_label_before_fallback() -> None:
         locus_block_size=6,
     )
 
-    report = prepare_sequences(
-        [SequenceRecord("cat-1", "cat-1", "chr1", "ACGNAA", source="consensus_typo")],
-        config,
+    with pytest.raises(PreprocessingError, match=r"Unknown source label 'consensus_typo'"):
+        prepare_sequences(
+            [SequenceRecord("cat-1", "cat-1", "chr1", "ACGNAA", source="consensus_typo")],
+            config,
+        )
+
+
+def test_prepare_sequences_rejects_unknown_source_label_on_short_sequence_record() -> None:
+    """Regression: malformed source labels raise even when the record would be short-filtered.
+
+    A short-sequence record with an unapproved source must not be allowed
+    to disappear into ``PreprocessingReport.filtered`` as a ``"short_sequence"``
+    rejection; the provenance defect is the primary failure and must be
+    surfaced by ``prepare_sequences`` before any length filter runs.
+    """
+    config = PreprocessingConfig(
+        min_sequence_length=10,
+        max_ambiguity_fraction=1.0,
+        window_size=4,
+        window_stride=4,
+        locus_block_size=8,
     )
 
     with pytest.raises(PreprocessingError, match=r"Unknown source label 'consensus_typo'"):
-        window_sequences(list(report.retained), config)
+        prepare_sequences(
+            [SequenceRecord("cat-1", "cat-1", "chr1", "ACGT", source="consensus_typo")],
+            config,
+        )
+
+
+def test_prepare_sequences_rejects_unknown_source_label_on_high_ambiguity_record() -> None:
+    """Regression: malformed source labels raise even when the record would be ambiguity-filtered.
+
+    A high-ambiguity record with an unapproved source must not be allowed
+    to disappear into ``PreprocessingReport.filtered`` as a
+    ``"high_ambiguity"`` rejection; the provenance defect is the primary
+    failure and must be surfaced by ``prepare_sequences`` before the
+    ambiguity filter runs.
+    """
+    config = PreprocessingConfig(
+        min_sequence_length=4,
+        max_ambiguity_fraction=0.1,
+        window_size=4,
+        window_stride=4,
+        locus_block_size=8,
+    )
+
+    with pytest.raises(PreprocessingError, match=r"Unknown source label 'consensus_typo'"):
+        prepare_sequences(
+            [SequenceRecord("cat-1", "cat-1", "chr1", "NNNN", source="consensus_typo")],
+            config,
+        )
