@@ -86,6 +86,13 @@ DEFAULT_EXPORT_PARTITION_KEYS = ("split", "contig", "block_id")
 DEFAULT_EXPORT_ACCESS_PATTERN = "offline_window_materialization"
 DEFAULT_SPLITS = (("train", 0.8), ("validation", 0.2))
 
+# Remediation hint surfaced when ``transformers`` is missing at runtime.
+# The upper bound (``<6``) mirrors the contract this module was tested
+# against; the canonical dependency pin lives in ``pyproject.toml`` and
+# is intentionally duplicated here as a string rather than derived via
+# ``importlib.metadata`` to avoid runtime coupling to package metadata.
+_SUPPORTED_TRANSFORMERS_VERSION_HINT = "transformers>=5.6,<6"
+
 
 class TokenizerLike(Protocol):
     """Structural typing protocol for any callable that behaves like a HuggingFace tokenizer.
@@ -1094,7 +1101,7 @@ def load_dnabert2_tokenizer(
     except ImportError as exc:  # pragma: no cover - exercised through integration, not unit logic
         raise RuntimeError(
             "DNABERT-2 tokenization requires transformers. Install with: "
-            "uv add \"transformers>=4.28,<5\""
+            f'uv add "{_SUPPORTED_TRANSFORMERS_VERSION_HINT}"'
         ) from exc
 
     tokenizer = AutoTokenizer.from_pretrained(
@@ -1665,8 +1672,11 @@ class TokenizedCorpusWriter:
                     value_blob = json.dumps(
                         head_fields[key], indent=2, sort_keys=True
                     )
-                    indented_value = value_blob.replace("\n", "\n  ")
-                    handle.write(f'  "{key}": {indented_value}{trailing_comma}\n')
+                    value_lines = value_blob.splitlines()
+                    handle.write(f'  "{key}": {value_lines[0]}')
+                    for continuation in value_lines[1:]:
+                        handle.write(f"\n  {continuation}")
+                    handle.write(f"{trailing_comma}\n")
             handle.write("}\n")
 
     def _stream_split_manifest(
