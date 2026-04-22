@@ -67,6 +67,8 @@ import sqlite3
 import tarfile
 from typing import Any, Protocol
 
+from transformers import AutoTokenizer
+
 from .pipeline_contract import (
     DNABERT2_TOKENIZER_ID,
     DNABERT2_TOKENIZER_REVISION as DNABERT2_TOKENIZER_REVISION_HASH,
@@ -85,13 +87,6 @@ DEFAULT_ROW_GROUP_SIZE = 4096
 DEFAULT_EXPORT_PARTITION_KEYS = ("split", "contig", "block_id")
 DEFAULT_EXPORT_ACCESS_PATTERN = "offline_window_materialization"
 DEFAULT_SPLITS = (("train", 0.8), ("validation", 0.2))
-
-# Remediation hint surfaced when ``transformers`` is missing at runtime.
-# The upper bound (``<6``) mirrors the contract this module was tested
-# against; the canonical dependency pin lives in ``pyproject.toml`` and
-# is intentionally duplicated here as a string rather than derived via
-# ``importlib.metadata`` to avoid runtime coupling to package metadata.
-_SUPPORTED_TRANSFORMERS_VERSION_HINT = "transformers>=5.6,<6"
 
 
 class TokenizerLike(Protocol):
@@ -1093,17 +1088,8 @@ def load_dnabert2_tokenizer(
     Raises:
         TokenizerContractError: If ``trust_remote_code`` does not match the
             approved pipeline contract value.
-        RuntimeError: If the ``transformers`` package is not installed.
     """
     _assert_approved_dnabert2_trust_policy(provenance.trust_remote_code)
-    try:
-        from transformers import AutoTokenizer
-    except ImportError as exc:  # pragma: no cover - exercised through integration, not unit logic
-        raise RuntimeError(
-            "DNABERT-2 tokenization requires transformers. Install with: "
-            f'uv add "{_SUPPORTED_TRANSFORMERS_VERSION_HINT}"'
-        ) from exc
-
     tokenizer = AutoTokenizer.from_pretrained(
         provenance.identifier,
         revision=provenance.revision,

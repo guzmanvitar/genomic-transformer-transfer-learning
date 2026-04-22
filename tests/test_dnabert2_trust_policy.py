@@ -43,7 +43,9 @@ def test_load_dnabert2_tokenizer_uses_explicit_trust_remote_code_policy(
             )
             return fake_tokenizer
 
-    monkeypatch.setitem(sys.modules, "transformers", SimpleNamespace(AutoTokenizer=FakeAutoTokenizer))
+    monkeypatch.setattr(
+        "jaguar_geo_assign.data.preprocessor.AutoTokenizer", FakeAutoTokenizer
+    )
 
     tokenizer, provenance = load_dnabert2_tokenizer(DNABERT2_TOKENIZER_PROVENANCE)
 

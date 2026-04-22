@@ -6,16 +6,16 @@ NCBI RefSeq accession, assembly name, tax ID, and expected MD5 of the ``_genomic
 file so that ``download_with_retry`` can verify integrity and refuse silently truncated
 or stale payloads.
 
-Intent highlights:
+Pinning is deliberate and closed — adding a species requires a code + test change,
+which prevents drift from turning the foundation corpus into an untracked mixture.
 
-* Pinning is deliberate and closed — adding a species requires a code + test change,
-  which prevents drift from turning the foundation corpus into an untracked mixture.
-* The MD5s are pinned manually from each assembly's ``md5checksums.txt``. This avoids
-  an online dependency at registry-construction time while still catching on-disk
-  corruption when the manifest is consumed.
-* The module intentionally does not call NCBI Entrez or execute any downloads; it only
-  produces typed plans. Actual transfer is handled by consumers via the existing
-  ``download_with_retry`` primitive in :mod:`jaguar_geo_assign.data.acquisition`.
+The MD5s are pinned manually from each assembly's ``md5checksums.txt``. This avoids
+an online dependency at registry-construction time while still catching on-disk
+corruption when the manifest is consumed.
+
+The module intentionally does not call NCBI Entrez or execute any downloads; it only
+produces typed plans. Actual transfer is handled by consumers via the existing
+``download_with_retry`` primitive in :mod:`jaguar_geo_assign.data.acquisition`.
 """
 
 from __future__ import annotations

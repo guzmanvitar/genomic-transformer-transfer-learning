@@ -962,39 +962,3 @@ def test_writer_metadata_json_tolerates_new_top_level_key(tmp_path) -> None:
     assert data["export_format"] == "parquet"
     assert "train" in data["splits"]
     assert data["splits"]["train"]["record_count"] == len(batch)
-
-
-def test_transformers_import_error_surfaces_pinned_hint(monkeypatch):
-    """The runtime remediation hint must match the project dep bound.
-
-    Registry #13 — if ``transformers`` is missing, the
-    ``RuntimeError`` raised from ``load_dnabert2_tokenizer`` must
-    tell the user to install exactly the bound declared in
-    ``pyproject.toml`` (no drift). Forces the ``ImportError`` path
-    by hiding the real ``transformers`` module.
-    """
-    import builtins
-    import sys
-    from jaguar_geo_assign.data.preprocessor import (
-        _SUPPORTED_TRANSFORMERS_VERSION_HINT,
-        load_dnabert2_tokenizer,
-    )
-
-    monkeypatch.delitem(sys.modules, "transformers", raising=False)
-    real_import = builtins.__import__
-
-    def fake_import(name, *args, **kwargs):
-        if name == "transformers" or name.startswith("transformers."):
-            raise ImportError("simulated missing transformers")
-        return real_import(name, *args, **kwargs)
-
-    monkeypatch.setattr(builtins, "__import__", fake_import)
-
-    with pytest.raises(RuntimeError) as exc_info:
-        load_dnabert2_tokenizer()
-
-    # The message must carry the pinned remediation hint, and the hint must
-    # itself reference the upper bound we enforce in pyproject.toml.
-    assert _SUPPORTED_TRANSFORMERS_VERSION_HINT in str(exc_info.value)
-    assert "<6" in _SUPPORTED_TRANSFORMERS_VERSION_HINT
-    assert ">=5.6" in _SUPPORTED_TRANSFORMERS_VERSION_HINT
