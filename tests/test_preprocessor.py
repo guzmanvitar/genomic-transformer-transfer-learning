@@ -846,3 +846,119 @@ def test_tokenized_corpus_writer_bounded_manifest_memory(tmp_path) -> None:
     assert block_starts == sorted(block_starts), (
         "split_manifest must be streamed in (contig, block_start, split) order"
     )
+
+
+
+def test_writer_cleans_up_parquet_when_metadata_write_fails(
+    tmp_path, monkeypatch
+) -> None:
+    """Metadata-write failure must trigger the Parquet+sidecar cleanup path.
+
+    Intent: Greptile #7 flagged that a raw ``_write_metadata_json`` call
+    left a half-written tree (Parquet files on disk, no manifest, SQLite
+    sidecar still present) when the metadata write itself failed mid-way.
+    Inject an ``OSError`` at the ``metadata.json`` ``open`` call — and only
+    there, leaving the SQLite sidecar and Parquet writes alone — then
+    assert that (a) the error propagates to the caller and (b) neither
+    the metadata file, the Parquet files, nor the scratch SQLite sidecar
+    survive in the output tree.
+    """
+    pytest.importorskip("pyarrow")
+    batch = (
+        _streaming_tokenized(sample_id="meta-1", sequence_hash="m1"),
+        _streaming_tokenized(
+            sample_id="meta-2",
+            locus_id="chr1:8-16",
+            block_start=8,
+            block_end=16,
+            window_start=8,
+            window_end=14,
+            sequence_hash="m2",
+        ),
+    )
+
+    import pathlib as _pathlib
+
+    real_open = _pathlib.Path.open
+
+    def _open_failing_on_metadata(self, *args, **kwargs):
+        """Raise only on the ``metadata.json`` write; pass through otherwise."""
+        if self.name == "metadata.json":
+            raise OSError("injected disk full")
+        return real_open(self, *args, **kwargs)
+
+    monkeypatch.setattr(_pathlib.Path, "open", _open_failing_on_metadata)
+
+    with pytest.raises(OSError, match="injected disk full"):
+        with TokenizedCorpusWriter(tmp_path) as writer:
+            writer.write_batch(batch)
+
+    assert not (tmp_path / "metadata.json").exists(), (
+        "metadata.json must not remain when its own write raised"
+    )
+    assert not list(tmp_path.rglob("*.parquet")), (
+        "Parquet files must be cleaned up when metadata-write fails, just "
+        "like when the caller raises inside the with-block"
+    )
+    assert not (tmp_path / ".locus_manifest.sqlite").exists(), (
+        "SQLite sidecar must be torn down on every __exit__ path"
+    )
+
+
+def test_writer_metadata_json_tolerates_new_top_level_key(tmp_path) -> None:
+    """A subclass inserting an extra head key must produce alphabetical JSON.
+
+    Intent: Greptile #8 flagged that the prior ``str.index`` splice in
+    ``_write_metadata_json`` hard-coded the position of ``split_manifest``
+    between ``sequence_hash_algorithm`` and ``splits``. If a future key
+    (e.g. ``split_registry``) were added to the head, the splice would
+    either collide or place the key in the wrong slot. The refactor emits
+    one top-level key at a time in ``sorted`` order, so any new head field
+    lands in its alphabetical position for free. This test exercises that
+    via the documented ``_build_metadata_head`` test seam.
+    """
+    pytest.importorskip("pyarrow")
+    batch = (
+        _streaming_tokenized(sample_id="reg-1", sequence_hash="r1"),
+        _streaming_tokenized(
+            sample_id="reg-2",
+            locus_id="chr1:8-16",
+            block_start=8,
+            block_end=16,
+            window_start=8,
+            window_end=14,
+            sequence_hash="r2",
+        ),
+    )
+
+    injected_registry = {"version": 1, "shards": ["train-0"]}
+
+    class _WriterWithRegistry(TokenizedCorpusWriter):
+        """Subclass that injects ``split_registry`` via the documented seam."""
+
+        def _build_metadata_head(self) -> dict:
+            head = super()._build_metadata_head()
+            # ``split_registry`` sorts strictly between ``split_manifest``
+            # (streamed) and ``splits`` (eagerly serialised), so its
+            # presence proves alphabetical ordering is preserved across
+            # the stream/eager boundary.
+            head["split_registry"] = injected_registry
+            return head
+
+    with _WriterWithRegistry(tmp_path) as writer:
+        writer.write_batch(batch)
+
+    data = _json.loads((tmp_path / "metadata.json").read_text(encoding="utf-8"))
+    assert data["split_registry"] == injected_registry
+    assert isinstance(data["split_manifest"], list)
+    assert len(data["split_manifest"]) == len(batch)
+    manifest_locus_ids = {entry["locus_id"] for entry in data["split_manifest"]}
+    assert manifest_locus_ids == {"chr1:0-8", "chr1:8-16"}
+    assert list(data.keys()) == sorted(data.keys()), (
+        "top-level keys must be emitted in alphabetical order, including "
+        "any subclass-injected field"
+    )
+    assert data["access_pattern"] == "offline_window_materialization"
+    assert data["export_format"] == "parquet"
+    assert "train" in data["splits"]
+    assert data["splits"]["train"]["record_count"] == len(batch)

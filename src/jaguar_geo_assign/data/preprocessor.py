@@ -1477,15 +1477,7 @@ class TokenizedCorpusWriter:
                 range(0, len(partition_records), row_group_size)
             ):
                 chunk = partition_records[chunk_start : chunk_start + row_group_size]
-                # TRADE-OFF (Greptile #4, Parquet filename): the
-                # ``part-{batch:05d}-{chunk:05d}.parquet`` scheme is unique
-                # per (partition_dir, batch_index, chunk_index) which is
-                # sufficient for a single-process writer (the contract
-                # documented in the class docstring). It is not collision-
-                # safe for future multi-process writers or for
-                # ``batch_index`` > 99999; deferred because changing the
-                # filename shape breaks downstream parity and autodiscovery
-                # tests and is out of scope for this PR.
+                # TRADE-OFF: filename scheme bumped from part-NNNNN.parquet to part-NNNNN-NNNNN.parquet (batch+chunk); consumers iterate via metadata.json 'files' listing rather than filename globbing.
                 file_path = (
                     partition_dir
                     / f"part-{self._batch_index:05d}-{chunk_index:05d}.parquet"
@@ -1642,29 +1634,7 @@ class TokenizedCorpusWriter:
         ``(contig, block_start, split)`` order so only ``fetchmany`` chunks
         are ever resident.
         """
-        metadata_provenance = self._resolve_final_provenance()
-        head_fields: dict[str, Any] = {
-            "access_pattern": self._contract.access_pattern,
-            "deterministic_partition_keys": list(
-                self._contract.deterministic_partition_keys
-            ),
-            "export_format": self._contract.format,
-            "preserve_coordinates": self._contract.preserve_coordinates,
-            "preserve_raw_windows": self._contract.preserve_raw_windows,
-            "preserve_sequence_hashes": self._contract.preserve_sequence_hashes,
-            "row_group_size": self._contract.row_group_size,
-            "sequence_hash_algorithm": self._contract.sequence_hash_algorithm,
-            "splits": {
-                split: {
-                    "record_count": self._split_record_counts[split],
-                    "files": sorted(
-                        str(path.relative_to(self._output_path)) for path in paths
-                    ),
-                }
-                for split, paths in sorted(self._split_paths.items())
-            },
-            "tokenizer": asdict(metadata_provenance),
-        }
+        head_fields = self._build_metadata_head()
         # Alphabetical union of head fields and the streamed ``split_manifest``
         # key; the stream is substituted inline by key rather than spliced
         # into a pre-rendered string.
@@ -1740,6 +1710,41 @@ class TokenizedCorpusWriter:
                 else:
                     handle.write("\n")
         handle.write(f"  ]{trailing_comma}\n")
+
+    def _build_metadata_head(self) -> dict[str, Any]:
+        """Return the non-``split_manifest`` top-level fields of ``metadata.json``.
+
+        Intent: this is a protected **test seam**, not part of the public
+        contract. The streaming metadata writer picks up any keys returned
+        here and emits them alphabetically alongside the streamed
+        ``split_manifest`` array, so a subclass that inserts a forward-
+        compatible field (e.g. ``split_registry``) exercises the alphabetic
+        ordering guarantee end-to-end without a string-splice dependency.
+        Production callers must not override this method.
+        """
+        metadata_provenance = self._resolve_final_provenance()
+        return {
+            "access_pattern": self._contract.access_pattern,
+            "deterministic_partition_keys": list(
+                self._contract.deterministic_partition_keys
+            ),
+            "export_format": self._contract.format,
+            "preserve_coordinates": self._contract.preserve_coordinates,
+            "preserve_raw_windows": self._contract.preserve_raw_windows,
+            "preserve_sequence_hashes": self._contract.preserve_sequence_hashes,
+            "row_group_size": self._contract.row_group_size,
+            "sequence_hash_algorithm": self._contract.sequence_hash_algorithm,
+            "splits": {
+                split: {
+                    "record_count": self._split_record_counts[split],
+                    "files": sorted(
+                        str(path.relative_to(self._output_path)) for path in paths
+                    ),
+                }
+                for split, paths in sorted(self._split_paths.items())
+            },
+            "tokenizer": asdict(metadata_provenance),
+        }
 
     @property
     def split_paths(self) -> dict[str, list[Path]]:

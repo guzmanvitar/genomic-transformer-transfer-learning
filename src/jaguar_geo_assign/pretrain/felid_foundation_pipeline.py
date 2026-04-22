@@ -357,6 +357,7 @@ def _run_single_species(
         len(report.filtered),
     )
 
+    # TRADE-OFF: counts characters not bytes; all inputs are ASCII DNA so char == byte in practice.
     bytes_tokenized = sum(len(prepared.sequence) for prepared in report.retained)
     windows = (
         window_sequences(list(report.retained), preprocessing_config)
