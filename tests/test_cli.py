@@ -1496,3 +1496,43 @@ def _synthetic_tokenized_window(*, index: int, source: str) -> TokenizedWindow:
         token_to_base_ratio=1.0,
         tokenizer=TokenizerProvenance(max_position_embeddings=8),
     )
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "validate-felid-foundation-config",
+        "describe-felid-foundation-config",
+        "check-felid-foundation-runtime",
+    ],
+)
+def test_felid_foundation_cli_smoke_help_exits_zero(command: str) -> None:
+    """Guard that every felid foundation CLI subcommand accepts --help."""
+    import subprocess
+
+    result = subprocess.run(
+        ["uv", "run", "python", "-m", "jaguar_geo_assign.cli", command, "--help"],
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0
+    assert "usage:" in result.stdout.lower()
+
+
+def test_validate_felid_foundation_config_reports_success(capsys) -> None:
+    """Verify the approved felid foundation config passes the strict validator."""
+    exit_code = main(["validate-felid-foundation-config", "configs/examples/felid_foundation_pretrain.toml"])
+
+    captured = capsys.readouterr()
+    assert exit_code == 0
+    assert "matches the approved contract" in captured.out
+
+
+def test_describe_felid_foundation_config_reports_species(capsys) -> None:
+    """Check the describe command surfaces the species roster."""
+    exit_code = main(["describe-felid-foundation-config", "configs/examples/felid_foundation_pretrain.toml"])
+
+    captured = capsys.readouterr()
+    assert exit_code == 0
+    assert "Felis catus" in captured.out
+    assert "Panthera leo" in captured.out

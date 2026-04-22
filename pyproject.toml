@@ -18,8 +18,12 @@ build-backend = "uv_build"
 [dependency-groups]
 dev = [
     "pytest>=8.3,<9",
+    "tomli-w>=1.2.0",
 ]
 
 [tool.pytest.ini_options]
-addopts = "-q"
+addopts = "-q -m 'not integration'"
 testpaths = ["tests"]
+markers = [
+    "integration: live external services (NCBI and HuggingFace); off by default",
+]
