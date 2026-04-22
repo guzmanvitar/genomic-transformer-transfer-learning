@@ -161,6 +161,70 @@ def test_window_sequences_count_realized_n_coverage_without_mask_spans() -> None
     assert windows[0].masked_base_counts == ()
 
 
+def test_window_sequences_preserve_consensus_provenance_without_sequence_fallback() -> None:
+    """Consensus windows report span-derived masked coverage verbatim so silent ``N`` bases remain auditable.
+
+    The reference/baseline fallback that folds in ``sequence.count("N")``
+    must not apply to consensus-sourced windows; otherwise a consensus
+    record with an ``N`` base unaccounted for by any mask span would be
+    silently reconciled and the downstream coverage invariant could no
+    longer catch corrupt VCF→FASTA provenance.
+    """
+    config = PreprocessingConfig(
+        min_sequence_length=6,
+        max_ambiguity_fraction=1.0,
+        window_size=6,
+        window_stride=6,
+        locus_block_size=6,
+    )
+
+    report = prepare_sequences(
+        [SequenceRecord("cat-1", "cat-1", "chr1", "ACGNAA", source="consensus")],
+        config,
+    )
+
+    windows = window_sequences(list(report.retained), config)
+
+    assert len(windows) == 1
+    assert windows[0].sequence == "ACGNAA"
+    assert windows[0].source == "consensus"
+    assert windows[0].unique_masked_bases == 0
+    assert windows[0].masked_base_counts == ()
+
+
+def test_window_sequences_report_consensus_span_coverage_when_spans_declared() -> None:
+    """Consensus windows with faithful mask spans report the span-derived unique coverage."""
+    config = PreprocessingConfig(
+        min_sequence_length=6,
+        max_ambiguity_fraction=1.0,
+        window_size=6,
+        window_stride=6,
+        locus_block_size=6,
+    )
+
+    report = prepare_sequences(
+        [
+            SequenceRecord(
+                "cat-1",
+                "cat-1",
+                "chr1",
+                "ACGNAA",
+                source="consensus",
+                mask_spans=((3, 4, "no_call"),),
+            )
+        ],
+        config,
+    )
+
+    windows = window_sequences(list(report.retained), config)
+
+    assert len(windows) == 1
+    assert windows[0].sequence == "ACGNAA"
+    assert windows[0].unique_masked_bases == 1
+    assert windows[0].no_call_bases == 1
+    assert windows[0].masked_base_counts == (("no_call", 1),)
+
+
 def test_window_sequences_drop_high_ambiguity_windows_from_retained_sequence() -> None:
     """A retained sequence can still shed individual windows that exceed the per-window ambiguity cap."""
     config = PreprocessingConfig(

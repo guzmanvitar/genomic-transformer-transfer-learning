@@ -380,8 +380,12 @@ class WindowRecord:
         gc_fraction: GC content among canonical bases.
         ambiguity_fraction: Fraction of ``N`` bases.
         sequence_hash: SHA-256 hex digest of ``sequence``.
-        unique_masked_bases: Count of uniquely masked bases (de-duplicated
-            across overlapping mask spans).
+        unique_masked_bases: Reported exclusive masked-base count with
+            source-aware fallback: for ``source == "consensus"`` this is
+            the de-duplicated span-derived count verbatim (no fallback, so
+            provenance gaps remain auditable); for reference/baseline
+            windows it falls back to realized ``N`` coverage when no mask
+            spans are declared.
         filtered_bases: Bases masked with the ``"filtered"`` category.
         no_call_bases: Bases masked with the ``"no_call"`` category.
         other_masked_bases: Bases in mask categories other than
@@ -781,19 +785,38 @@ def _count_unique_masked_bases(overlapping_ranges: list[tuple[int, int]]) -> int
     return merged_total + (current_end - current_start)
 
 
-def _count_realized_unique_masked_bases(sequence: str, span_unique_masked_bases: int) -> int:
-    """Return the larger of span-derived and sequence-derived masked-base counts.
+CONSENSUS_SOURCE_LABEL = "consensus"
 
-    The span-based count may under-count if the normalisation step
-    introduced additional ``N`` bases not tracked by explicit mask spans.
+
+def _count_realized_unique_masked_bases(
+    sequence: str,
+    span_unique_masked_bases: int,
+    *,
+    source: str,
+) -> int:
+    """Return the single reported exclusive masked-base count for a window.
+
+    The fallback behaviour is strictly source-aware so the producer never
+    silently reconciles a provenance gap for consensus-derived windows. For
+    consensus windows the span-derived count is reported verbatim so
+    downstream diagnostics can detect any ``N`` base that is not accounted
+    for by an explicit mask span. For retained reference/baseline windows
+    (which legitimately carry intrinsic ``N`` bases but never declare mask
+    spans) the realized ``N`` coverage is used as a fallback so valid
+    windows are not false-flagged by the coverage invariant.
 
     Args:
         sequence: The window nucleotide string.
         span_unique_masked_bases: De-duplicated base count from mask spans.
+        source: Window provenance label (``"consensus"`` is provenance-strict;
+            any other value is treated as reference/baseline and allowed to
+            fall back to the realized ``N`` coverage of *sequence*).
 
     Returns:
-        Conservative (higher) estimate of masked bases.
+        The reported ``unique_masked_bases`` value for the window.
     """
+    if source == CONSENSUS_SOURCE_LABEL:
+        return span_unique_masked_bases
     return max(span_unique_masked_bases, sequence.count("N"))
 
 
@@ -867,6 +890,7 @@ def window_sequences(
                 unique_masked_bases = _count_realized_unique_masked_bases(
                     window_sequence,
                     span_unique_masked_bases,
+                    source=sequence.source,
                 )
                 filtered_bases = mask_counts.get("filtered", 0)
                 no_call_bases = mask_counts.get("no_call", 0)

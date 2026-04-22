@@ -1089,6 +1089,110 @@ def test_runtime_diagnostics_flags_inconsistent_unique_masked_coverage() -> None
     assert payload["consensus_corpus"]["shape_issue_count"] == 1
 
 
+def test_runtime_diagnostics_accepts_valid_consensus_window_from_producer() -> None:
+    """End-to-end guard: a consensus window with an ``N`` covered by a mask span passes the coverage invariant.
+
+    This exercises the producer path (``window_sequences``) rather than a
+    hand-authored ``replace`` so it proves Option B's source-aware producer
+    continues to emit span-derived ``unique_masked_bases`` that satisfy the
+    diagnostics invariant when consensus provenance is intact.
+    """
+    config = preprocessor_module.PreprocessingConfig(
+        min_sequence_length=6,
+        max_ambiguity_fraction=1.0,
+        window_size=6,
+        window_stride=6,
+        locus_block_size=6,
+    )
+    prepared = preprocessor_module.prepare_sequences(
+        [
+            preprocessor_module.SequenceRecord(
+                "cat-1",
+                "cat-1",
+                "chr1",
+                "ACGNAA",
+                source="consensus",
+                mask_spans=((3, 4, "no_call"),),
+            )
+        ],
+        config,
+    )
+    consensus_window = preprocessor_module.window_sequences(list(prepared.retained), config)[0]
+    tokenized_window = TokenizedWindow(
+        window=consensus_window,
+        input_ids=(101, 201, 202, 203, 204, 205, 206, 102),
+        attention_mask=(1, 1, 1, 1, 1, 1, 1, 1),
+        token_count=6,
+        token_to_base_ratio=1.0,
+        tokenizer=TokenizerProvenance(max_position_embeddings=8),
+    )
+
+    payload = pretrain_pipeline._build_diagnostics_payload(
+        tokenized_consensus=(tokenized_window,),
+        tokenized_baseline=(),
+        consensus_results={},
+    )
+
+    sample = payload["consensus_samples"][0]
+    assert sample["sequence"] == "ACGNAA"
+    assert sample["callable_bases"] == 5
+    assert sample["unique_masked_bases"] == 1
+    assert sample["no_call_bases"] == 1
+    assert payload["consensus_corpus"]["shape_issue_count"] == 0
+
+
+def test_runtime_diagnostics_flags_corrupted_consensus_provenance_from_producer() -> None:
+    """End-to-end guard: a consensus window whose ``N`` bases are not covered by mask spans fails loudly.
+
+    This is the critical Option B invariant: the producer must NOT silently
+    reconcile a VCF→FASTA provenance gap by falling back to
+    ``sequence.count("N")``; instead, the downstream coverage invariant
+    (``callable + unique_masked == len(sequence)``) must trip so corrupt
+    consensus provenance surfaces as a shape issue.
+    """
+    config = preprocessor_module.PreprocessingConfig(
+        min_sequence_length=6,
+        max_ambiguity_fraction=1.0,
+        window_size=6,
+        window_stride=6,
+        locus_block_size=6,
+    )
+    prepared = preprocessor_module.prepare_sequences(
+        [
+            preprocessor_module.SequenceRecord(
+                "cat-1",
+                "cat-1",
+                "chr1",
+                "ACGNAA",
+                source="consensus",
+            )
+        ],
+        config,
+    )
+    corrupted_window = preprocessor_module.window_sequences(list(prepared.retained), config)[0]
+    assert corrupted_window.unique_masked_bases == 0
+    tokenized_window = TokenizedWindow(
+        window=corrupted_window,
+        input_ids=(101, 201, 202, 203, 204, 205, 206, 102),
+        attention_mask=(1, 1, 1, 1, 1, 1, 1, 1),
+        token_count=6,
+        token_to_base_ratio=1.0,
+        tokenizer=TokenizerProvenance(max_position_embeddings=8),
+    )
+
+    payload = pretrain_pipeline._build_diagnostics_payload(
+        tokenized_consensus=(tokenized_window,),
+        tokenized_baseline=(),
+        consensus_results={},
+    )
+
+    sample = payload["consensus_samples"][0]
+    assert sample["sequence"] == "ACGNAA"
+    assert sample["callable_bases"] == 5
+    assert sample["unique_masked_bases"] == 0
+    assert payload["consensus_corpus"]["shape_issue_count"] == 1
+
+
 def test_pretrain_cli_reports_actionable_config_error(capsys) -> None:
     """Ensure ``pretrain`` rejects a non-feline config with an operator-readable message (no traceback)."""
     exit_code = main(["pretrain", "--config", "configs/examples/fine_tune.toml"])
