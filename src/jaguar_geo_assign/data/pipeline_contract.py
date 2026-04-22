@@ -62,7 +62,7 @@ REQUIRED_SAMPLE_MANIFEST_FIELDS = ("sample_id", "individual_id", "vcf_path")
 
 # Felid foundation corpus contracts.
 #
-# Intent: the felid-foundation pretraining path mixes six reference assemblies
+# The felid-foundation pretraining path mixes six reference assemblies
 # into a single tokenized corpus. Pinning the *set* of approved accessions at
 # contract level (rather than taking the list directly from
 # ``felid_assemblies.APPROVED_FELID_ASSEMBLIES``) gives the config loader an

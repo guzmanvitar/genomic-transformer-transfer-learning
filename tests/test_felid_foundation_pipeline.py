@@ -116,7 +116,7 @@ def _build_fixture_config(
 ) -> Path:
     """Build a felid-foundation config TOML in *tmp_path* derived from the example.
 
-    Intent: the canonical TOML contract lives in
+    The canonical TOML contract lives in
     ``configs/examples/felid_foundation_pretrain.toml``; this helper
     round-trips that file through
     :func:`tests._felid_fixture.render_example_config` so every test
@@ -187,7 +187,7 @@ def test_config_loader_happy_path(tmp_path):
 def test_example_config_is_loader_valid():
     """Canary: the canonical example TOML always round-trips through the loader.
 
-    Intent: any divergence between
+    Any divergence between
     ``configs/examples/felid_foundation_pretrain.toml`` and the felid
     foundation loader contract must surface as a test failure here
     before it silently propagates into every downstream fixture that
@@ -229,8 +229,8 @@ def test_config_loader_rejects_duplicate_accession(tmp_path):
 def test_config_loader_rejects_missing_reference_dir(tmp_path):
     """Config loader requires paths.reference_dir.
 
-    Intent: drop the required ``reference_dir`` key from an otherwise
-    canonical example config and assert the loader surfaces the exact
+    Drops the required ``reference_dir`` key from an otherwise
+    canonical example config and asserts the loader surfaces the exact
     missing-field diagnostic, so future edits to ``[paths]`` can't
     silently make ``reference_dir`` optional.
     """
@@ -401,7 +401,7 @@ def test_run_pretrain_contig_collision_raises(tmp_path):
 def test_pipeline_zero_windows_leaves_no_artifacts(tmp_path):
     """Zero-window pipeline run raises and leaves no corpus directory.
 
-    Intent: when every species FASTA yields zero windows post-filter,
+    When every species FASTA yields zero windows post-filter,
     the pipeline must abort inside the writer's ``with`` block so the
     writer's exception cleanup path runs before the ``RuntimeError``
     surfaces. Beyond the artefact-level guarantees (no ``metadata.json``,

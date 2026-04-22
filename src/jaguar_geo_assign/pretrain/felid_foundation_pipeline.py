@@ -9,7 +9,7 @@ tokenize → Parquet ``write_batch``) before the next species begins. The
 the run and closed at the end, so peak heap usage is bounded by the
 largest single assembly rather than by the full six-species corpus.
 
-Intent — why a separate module exists:
+Why a separate module exists:
     The consensus (feline) pretraining path in ``pretrain/pipeline.py``
     is structured around VCF → ``bcftools`` → consensus-FASTA →
     diagnostics and is keyed by ``sample_id``/``individual_id``. The
@@ -121,7 +121,7 @@ class FelidFoundationPretrainArtifacts:
 class FelidSpeciesPretrainStats:
     """Per-species summary mirroring the run-summary JSON ``per_species`` entry.
 
-    Intent: every field here maps 1:1 to a key in the pinned run-summary
+    Every field here maps 1:1 to a key in the pinned run-summary
     JSON schema for a single species. Storing the structured values on a
     typed dataclass lets downstream callers (CLI, tests) introspect
     results without re-parsing the JSON, while the ``_dump`` serialiser
@@ -170,7 +170,7 @@ class FelidSpeciesPretrainStats:
 class FelidFoundationPretrainRunResult:
     """Immutable summary returned by :func:`run_felid_foundation_pretrain`.
 
-    Intent: this dataclass mirrors the top-level run-summary JSON schema
+    This dataclass mirrors the top-level run-summary JSON schema
     so the CLI and tests can introspect corpus-wide statistics without
     re-parsing the JSON. The schema keys are pinned; any change requires
     a corresponding update in the schema-equality test.
@@ -203,7 +203,7 @@ def _resolve_fasta_path(
 ) -> Path:
     """Derive the canonical ``<ACC>_<ASM>.fna.gz`` path for a species.
 
-    Intent: the per-species filename is deterministic from the registry
+    The per-species filename is deterministic from the registry
     so :func:`acquire_felid_foundation_assemblies` and
     :func:`run_felid_foundation_pretrain` resolve the same path without
     sharing state. Keeping the derivation in a single helper means any
@@ -218,7 +218,7 @@ def _iter_species_sequence_records(
 ) -> Iterable[SequenceRecord]:
     """Yield one ``SequenceRecord`` per contig in a species FASTA.
 
-    Intent: the felid foundation pipeline encodes species identity as
+    The felid foundation pipeline encodes species identity as
     ``individual_id=<species_slug>`` so downstream consumers can group
     emitted windows by species without re-deriving the slug. The
     ``sample_id`` is ``f"{species_slug}-{contig}"`` so every
@@ -252,7 +252,7 @@ def _iter_species_sequence_records(
 def _read_peak_rss_bytes() -> int:
     """Return the current process's peak RSS in normalised bytes.
 
-    Intent: isolating the ``resource.getrusage`` syscall behind a helper
+    Isolating the ``resource.getrusage`` syscall behind a helper
     makes it trivial to stub out in unit tests without monkeypatching the
     stdlib. The unit-conversion responsibility lives in
     :func:`normalize_ru_maxrss_to_bytes`, which is platform-aware.
@@ -274,7 +274,7 @@ def _run_single_species(
 ) -> FelidSpeciesPretrainStats:
     """Run prepare → window → tokenize → write for one species.
 
-    Intent: this helper owns the per-species streaming-writer contract.
+    This helper owns the per-species streaming-writer contract.
     It reads the species FASTA lazily, guards cross-species contig
     collisions on first sighting, decomposes the prepare/window/tokenize
     cascade so the intermediate retained/filtered counts required by the

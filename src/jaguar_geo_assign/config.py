@@ -681,7 +681,7 @@ def load_feline_pipeline_config(path: str | Path) -> FelinePipelineConfig:
 class FelidSpeciesEntry:
     """One approved species pinned to its RefSeq accession and assembly name.
 
-    Intent: the felid-foundation corpus mixes six species, and the per-species
+    The felid-foundation corpus mixes six species, and the per-species
     FASTA filename is deterministically derived from the accession + assembly
     name. Freezing the triple in a typed entry lets every downstream stage
     (path resolution, logging, run-summary keys) share the same species slug
@@ -767,7 +767,7 @@ class FelidFoundationPipelineConfig:
 def _slugify_species(latin_binomial: str) -> str:
     """Convert a Latin binomial to the canonical species slug.
 
-    Intent: the slug is used as ``individual_id`` on every emitted window
+    The slug is used as ``individual_id`` on every emitted window
     and as the run-summary key, so it must be deterministic and stable.
     We normalise whitespace to a single underscore and lowercase the
     result; validation against the approved registry is the loader's job.
@@ -881,7 +881,7 @@ def _validate_felid_species_entries(
 ) -> tuple[FelidSpeciesEntry, ...]:
     """Validate the ``[[species]]`` list against the approved felid registry.
 
-    Intent: prevent corpus drift. The foundation contract pins the exact
+    Prevents corpus drift. The foundation contract pins the exact
     set of six approved accessions in :data:`APPROVED_FELID_ACCESSIONS`;
     any config that references an unknown accession, duplicates an
     accession, or declares a species/accession pair that does not match

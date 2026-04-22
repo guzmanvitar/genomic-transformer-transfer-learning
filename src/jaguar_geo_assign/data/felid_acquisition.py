@@ -47,7 +47,7 @@ _LOGGER = logging.getLogger(__name__)
 class FelidAcquisitionError(RuntimeError):
     """Raised when an approved felid reference FASTA cannot be acquired or verified.
 
-    Intent: the CLI operator needs the root cause (``ConnectionResetError``,
+    The CLI operator needs the root cause (``ConnectionResetError``,
     ``HTTPError``, ``ChecksumMismatch``) surfaced directly in the error
     message so they can distinguish transient network faults from
     deterministic contract violations without digging through traceback
@@ -61,7 +61,7 @@ class FelidAcquisitionError(RuntimeError):
 class FelidAcquisitionSummary:
     """Typed summary of a felid-foundation acquisition run.
 
-    Intent: the only value returned to the CLI so operators can inspect
+    The only value returned to the CLI so operators can inspect
     which files were downloaded, skipped, or redownloaded without
     re-parsing logs. Every field mirrors a metric emitted by the
     download loop.
@@ -87,7 +87,7 @@ class FelidAcquisitionSummary:
 def _compute_md5(path: Path) -> str:
     """Return the lowercase hex MD5 of *path* using streaming reads.
 
-    Intent: felid assemblies are multi-hundred-MB ``.fna.gz`` blobs.
+    Felid assemblies are multi-hundred-MB ``.fna.gz`` blobs.
     Loading the whole file into memory to hash it would make the acquire
     step a memory hog on operators' laptops; a 1 MiB streaming chunk
     keeps the hash cost bounded and matches the chunk size already used
@@ -106,7 +106,7 @@ def _zip_entries_with_assets(
 ) -> tuple[tuple[FelidSpeciesEntry, DownloadAsset], ...]:
     """Pair each configured species with its matching :class:`DownloadAsset`.
 
-    Intent: :class:`DownloadAsset` is intentionally accession-agnostic so
+    :class:`DownloadAsset` is intentionally accession-agnostic so
     the acquisition layer stays generic. For felid-specific logging we
     need the species slug and Latin binomial alongside the asset. The
     manifest is sorted by accession; we index assets by their
@@ -138,7 +138,7 @@ def acquire_felid_foundation_assemblies(
 ) -> FelidAcquisitionSummary:
     """Download every configured felid reference FASTA with integrity checks.
 
-    Intent: the operator-facing acquisition entry point. It resolves
+    The operator-facing acquisition entry point. It resolves
     destination paths via :func:`build_felid_reference_manifest`,
     verifies existing files by MD5, deletes and re-downloads on
     mismatch, and short-circuits on match. The download is idempotent:

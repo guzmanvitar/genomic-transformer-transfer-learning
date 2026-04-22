@@ -1,6 +1,6 @@
 """Shared test helper for materialising felid foundation pretrain configs.
 
-Intent: prevent drift between the canonical example config
+Prevents drift between the canonical example config
 (``configs/examples/felid_foundation_pretrain.toml``) and the TOML
 fixtures synthesised per-test. Every test that previously hand-wrote a
 ``config_content = f\"\"\"...\"\"\"`` literal now routes through
@@ -51,7 +51,7 @@ ALL_APPROVED_FELIDS: tuple[tuple[str, str], ...] = (
 def build_fixture_fasta(contigs: dict[str, str]) -> bytes:
     """Build a gzipped FASTA fixture from a ``{contig_id: sequence}`` dict.
 
-    Intent: keep the exact byte layout deterministic so the placeholder
+    Keeps the exact byte layout deterministic so the placeholder
     MD5 helper below stays in sync with what
     :func:`write_placeholder_fastas` actually writes to disk.
     """
@@ -66,7 +66,7 @@ def build_fixture_fasta(contigs: dict[str, str]) -> bytes:
 def placeholder_fasta_filename(accession: str) -> str:
     """Return the fixture FASTA filename for *accession*.
 
-    Intent: mirrors the ``<ACC>_<ASM>.fna.gz`` filename convention enforced
+    Mirrors the ``<ACC>_<ASM>.fna.gz`` filename convention enforced
     by :func:`build_felid_reference_manifest`. Padded species need a real
     on-disk fixture FASTA so tests reach the logic under test instead of
     failing with :class:`MissingFelidReferenceError` on a padded entry.
@@ -84,7 +84,7 @@ def write_placeholder_fastas(
 ) -> None:
     """Write a minimal unique FASTA for each padded species.
 
-    Intent: placeholder FASTAs use the accession as the contig ID so they
+    Placeholder FASTAs use the accession as the contig ID so they
     cannot collide with user-authored fixture contigs. The 128 bp sequence
     is short enough that windowing yields zero windows, keeping padded
     species invisible to window-count assertions.
@@ -107,7 +107,7 @@ def pad_species_to_full_roster(
 ) -> list[tuple[str, str]]:
     """Pad *subset* with remaining approved felids so the result has six entries.
 
-    Intent: the config loader rejects species lists shorter than six, but
+    The config loader rejects species lists shorter than six, but
     most tests only care about behaviour on a smaller subset. Padding keeps
     the tests focused while respecting the contract.
     """
@@ -119,7 +119,7 @@ def pad_species_to_full_roster(
 def load_example_config_dict() -> dict[str, Any]:
     """Return the parsed example config as a mutable dict.
 
-    Intent: callers that want to apply structured edits before writing
+    Callers that want to apply structured edits before writing
     can do so on a fresh copy of the canonical contract rather than
     re-inventing it per test.
     """

@@ -68,7 +68,7 @@ def _tokenize_sequence_records(
 ) -> tuple[TokenizedWindow, ...]:
     """Prepare, window, and tokenize records using this module's bindings.
 
-    Intent: resolves ``prepare_sequences``, ``window_sequences``, and
+    Resolves ``prepare_sequences``, ``window_sequences``, and
     ``tokenize_windows`` through ``pipeline`` module scope so that
     existing feline tests which monkeypatch
     ``pretrain_pipeline.prepare_sequences`` continue to intercept calls

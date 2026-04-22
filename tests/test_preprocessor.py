@@ -438,7 +438,7 @@ def test_window_sequences_rejects_unknown_source_label_when_all_windows_would_be
 # ---------------------------------------------------------------------------
 #
 # These tests cover the refactor from full-materialisation to an
-# append-capable :class:`TokenizedCorpusWriter`. Intent: guard the RAM
+# append-capable :class:`TokenizedCorpusWriter`. They guard the RAM
 # bound (multi-species pretraining never materialises the whole corpus)
 # while keeping the legacy single-shot ``write_tokenized_dataset`` API
 # binary-compatible via a thin one-batch shim.
@@ -472,7 +472,7 @@ def _streaming_window(
 ) -> WindowRecord:
     """Build a minimal ``WindowRecord`` for streaming-writer tests.
 
-    Intent: centralise the fixture boilerplate so each test expresses
+    Centralises the fixture boilerplate so each test expresses
     only the dimensions it actually varies (split, locus, contig,
     etc.), making the test's failure mode obvious from its body.
     """
@@ -497,7 +497,7 @@ def _streaming_window(
 def _streaming_tokenized(**overrides: object) -> TokenizedWindow:
     """Wrap ``_streaming_window`` in a ``TokenizedWindow`` with fixed provenance.
 
-    Intent: every test in this suite exercises the writer, not the
+    Every test in this suite exercises the writer, not the
     tokenizer, so the token arrays are intentionally trivial and the
     provenance is the canonical pinned default.
     """
@@ -514,7 +514,7 @@ def _streaming_tokenized(**overrides: object) -> TokenizedWindow:
 def _read_parquet_records(output_path, split: str) -> list[dict]:
     """Read every Parquet row under ``split=<split>/`` for set-equality checks.
 
-    Intent: the streaming writer no longer guarantees a global
+    The streaming writer no longer guarantees a global
     within-split sort order, so tests must compare record sets
     without relying on row ordering. This helper collapses all
     Parquet files under a split into a flat list of row dicts.
@@ -531,7 +531,7 @@ def _read_parquet_records(output_path, split: str) -> list[dict]:
 def _primary_key(row: dict) -> tuple:
     """Stable primary key over the fields that uniquely identify a window.
 
-    Intent: set-equality across two Parquet datasets must not be
+    Set-equality across two Parquet datasets must not be
     confused by dict-ordering or list vs. tuple representation of
     ``input_ids`` / ``attention_mask``. Coercing to a tuple of
     scalar identifiers gives a hashable, comparable key.
@@ -552,7 +552,7 @@ def _primary_key(row: dict) -> tuple:
 def test_streaming_writer_round_trip_matches_single_shot(tmp_path) -> None:
     """Two-batch streaming write produces the same record set as a one-shot shim call.
 
-    Intent: proving equivalence on set-of-primary-keys (order-insensitive)
+    Proving equivalence on set-of-primary-keys (order-insensitive)
     guards the invariant that streaming does not drop, duplicate, or
     mutate records relative to the legacy single-shot path. This is
     the RAM-for-correctness trade the refactor makes: downstream train
@@ -613,7 +613,7 @@ def test_streaming_writer_round_trip_matches_single_shot(tmp_path) -> None:
 def test_streaming_writer_empty_validation_split_is_not_materialised(tmp_path) -> None:
     """Train-only batch must not create a zero-row ``split=validation/`` tree.
 
-    Intent: downstream loaders globbing the Hive tree treat the absence
+    Downstream loaders globbing the Hive tree treat the absence
     of a ``split=validation`` directory as "no validation data" and
     skip it; a zero-row Parquet file would be loaded and then fail
     on empty-batch assumptions, wasting iteration on a corpus where
@@ -646,7 +646,7 @@ def test_streaming_writer_empty_validation_split_is_not_materialised(tmp_path) -
 def test_streaming_writer_row_group_size_honoured_per_batch(tmp_path) -> None:
     """No Parquet row group emitted by ``write_batch`` exceeds ``row_group_size``.
 
-    Intent: the contract promises a per-batch bound on row-group
+    The contract promises a per-batch bound on row-group
     size so downstream predicate-pushdown readers can size buffers
     without scanning the whole corpus. Verifying via
     ``ParquetFile.metadata.row_group(i).num_rows`` checks the
@@ -689,7 +689,7 @@ def test_streaming_writer_row_group_size_honoured_per_batch(tmp_path) -> None:
 def test_streaming_writer_cleans_partial_files_on_mid_stream_exception(tmp_path) -> None:
     """An exception after a successful batch must remove any half-written Parquet artifacts.
 
-    Intent: downstream training jobs that autodiscover the corpus by
+    Downstream training jobs that autodiscover the corpus by
     globbing ``*.parquet`` must never pick up a file that was written
     before an error aborted the run. The cleanup contract is the
     difference between a failed pretraining run that can simply be
@@ -736,7 +736,7 @@ def test_streaming_writer_cleans_partial_files_on_mid_stream_exception(tmp_path)
 def test_streaming_writer_shim_parity_identical_records_and_manifest(tmp_path) -> None:
     """Shim and direct one-batch streaming write produce identical records + manifests.
 
-    Intent: the shim is the ONLY thing that stops the legacy consensus
+    The shim is the ONLY thing that stops the legacy consensus
     pretrain pipeline from needing edits. If the shim and the direct
     ``TokenizedCorpusWriter`` single-batch path ever diverge on
     record content or manifest JSON, downstream audits that diff
@@ -787,7 +787,7 @@ def test_streaming_writer_shim_parity_identical_records_and_manifest(tmp_path) -
 def test_tokenized_corpus_writer_bounded_manifest_memory(tmp_path) -> None:
     """Writer retains no in-memory manifest dict across batches.
 
-    Intent: the full felid corpus has ~7M loci, so an in-memory
+    The full felid corpus has ~7M loci, so an in-memory
     ``{locus_id: SplitManifestEntry}`` dict at close would add
     ~2\u20134 GB of Python heap pressure and violate the spec's
     "peak RAM \u2248 O(largest single species)" claim. The refactor
@@ -854,7 +854,7 @@ def test_writer_cleans_up_parquet_when_metadata_write_fails(
 ) -> None:
     """Metadata-write failure must trigger the Parquet+sidecar cleanup path.
 
-    Intent: Greptile #7 flagged that a raw ``_write_metadata_json`` call
+    Greptile #7 flagged that a raw ``_write_metadata_json`` call
     left a half-written tree (Parquet files on disk, no manifest, SQLite
     sidecar still present) when the metadata write itself failed mid-way.
     Inject an ``OSError`` at the ``metadata.json`` ``open`` call — and only
@@ -908,7 +908,7 @@ def test_writer_cleans_up_parquet_when_metadata_write_fails(
 def test_writer_metadata_json_tolerates_new_top_level_key(tmp_path) -> None:
     """A subclass inserting an extra head key must produce alphabetical JSON.
 
-    Intent: Greptile #8 flagged that the prior ``str.index`` splice in
+    Greptile #8 flagged that the prior ``str.index`` splice in
     ``_write_metadata_json`` hard-coded the position of ``split_manifest``
     between ``sequence_hash_algorithm`` and ``splits``. If a future key
     (e.g. ``split_registry``) were added to the head, the splice would
@@ -967,7 +967,7 @@ def test_writer_metadata_json_tolerates_new_top_level_key(tmp_path) -> None:
 def test_transformers_import_error_surfaces_pinned_hint(monkeypatch):
     """The runtime remediation hint must match the project dep bound.
 
-    Intent: Registry #13 — if ``transformers`` is missing, the
+    Registry #13 — if ``transformers`` is missing, the
     ``RuntimeError`` raised from ``load_dnabert2_tokenizer`` must
     tell the user to install exactly the bound declared in
     ``pyproject.toml`` (no drift). Forces the ``ImportError`` path

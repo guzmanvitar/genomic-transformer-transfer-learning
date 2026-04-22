@@ -1,21 +1,20 @@
 """Cross-pipeline helpers shared by the consensus and felid-foundation pretraining paths.
 
-Intent — why this module exists:
-    The consensus (feline) pretraining pipeline and the felid-foundation
-    pretraining pipeline both load a typed pipeline config, map it to
-    preprocessor/tokenizer contracts, resolve filesystem paths, and run
-    the prepare → window → tokenize cascade. Before this module existed
-    those helpers lived exclusively in ``pretrain/pipeline.py`` and the
-    new felid pipeline would have had to either duplicate them (drift
-    risk) or import private symbols from a sibling pipeline module
-    (tight coupling).
+The consensus (feline) pretraining pipeline and the felid-foundation
+pretraining pipeline both load a typed pipeline config, map it to
+preprocessor/tokenizer contracts, resolve filesystem paths, and run
+the prepare → window → tokenize cascade. Before this module existed
+those helpers lived exclusively in ``pretrain/pipeline.py`` and the
+new felid pipeline would have had to either duplicate them (drift
+risk) or import private symbols from a sibling pipeline module
+(tight coupling).
 
-    Moving the truly shared helpers here gives both pipelines a single
-    source of truth. ``pretrain/pipeline.py`` re-imports every moved
-    symbol at its own module scope so that existing tests which patch
-    ``jaguar_geo_assign.pretrain.pipeline.<helper>`` via
-    ``monkeypatch.setattr`` continue to work unchanged — the re-import
-    is the explicit test-seam preservation called out in the task DoD.
+Moving the truly shared helpers here gives both pipelines a single
+source of truth. ``pretrain/pipeline.py`` re-imports every moved
+symbol at its own module scope so that existing tests which patch
+``jaguar_geo_assign.pretrain.pipeline.<helper>`` via
+``monkeypatch.setattr`` continue to work unchanged — the re-import
+is the explicit test-seam preservation called out in the task DoD.
 """
 
 from __future__ import annotations
@@ -39,7 +38,7 @@ from ..data.preprocessor import (
 def normalize_ru_maxrss_to_bytes(raw: int, platform: str) -> int:
     """Normalise a raw ``ru_maxrss`` reading to bytes across platforms.
 
-    Intent: ``resource.getrusage(RUSAGE_SELF).ru_maxrss`` reports peak
+    ``resource.getrusage(RUSAGE_SELF).ru_maxrss`` reports peak
     resident-set-size in **kilobytes** on Linux and in **bytes** on
     macOS. A peak-RSS telemetry field that silently mixes units would
     make the run-summary JSON useless for cross-platform comparison
@@ -201,7 +200,7 @@ def _require_runtime_boolean(value: object, *, field_name: str) -> bool:
 def _build_preprocessing_config(config: Any) -> PreprocessingConfig:
     """Derive a ``PreprocessingConfig`` from any pipeline config with windowing/split/tokenizer sections.
 
-    Intent: the consensus and felid-foundation configs share the same
+    The consensus and felid-foundation configs share the same
     windowing/split/tokenizer shape even though their top-level dataclass
     types differ. Duck-typing on the three required attribute paths
     lets one helper serve both pipelines without leaking cross-pipeline

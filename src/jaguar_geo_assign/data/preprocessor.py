@@ -833,7 +833,7 @@ APPROVED_SOURCE_LABELS = frozenset({CONSENSUS_SOURCE_LABEL, REFERENCE_SOURCE_LAB
 def _require_approved_source_label(source: str) -> None:
     """Fail loudly on any producer ``source`` label outside the approved set.
 
-    Intent: the approved emitted producer source set is exactly
+    The approved emitted producer source set is exactly
     ``{"consensus", "reference"}``. Any other label must raise before
     downstream filtering or fallback logic can silently swallow it
     (e.g. a short-sequence or high-ambiguity filter would otherwise drop
@@ -1234,16 +1234,15 @@ def tokenize_windows(
 class TokenizedCorpusWriter:
     """Streaming/append Parquet writer for multi-batch tokenized corpora.
 
-    Intent — why this class exists:
-        The felid foundation pretraining corpus is assembled from six
-        multi-gigabase reference assemblies. Full materialisation of all
-        tokenized windows in one process would OOM even a large VM. This
-        writer lets callers feed one batch at a time (typically one
-        species per batch) so peak RAM stays bounded by the **largest
-        single batch**, not the full corpus. The legacy single-shot
-        ``write_tokenized_dataset`` is preserved as a thin one-batch
-        shim around this class so the consensus pretrain pipeline
-        continues to run unchanged.
+    The felid foundation pretraining corpus is assembled from six
+    multi-gigabase reference assemblies. Full materialisation of all
+    tokenized windows in one process would OOM even a large VM. This
+    writer lets callers feed one batch at a time (typically one
+    species per batch) so peak RAM stays bounded by the **largest
+    single batch**, not the full corpus. The legacy single-shot
+    ``write_tokenized_dataset`` is preserved as a thin one-batch
+    shim around this class so the consensus pretrain pipeline
+    continues to run unchanged.
 
     Contract change (vs. legacy single-shot writer):
         The legacy writer globally sorted all records within each
@@ -1333,7 +1332,7 @@ class TokenizedCorpusWriter:
 
         The locus manifest is stored in a SQLite sidecar at
         ``{output_dir}/.locus_manifest.sqlite`` rather than an in-memory
-        dict. Intent: prevent the previous O(total-windows) Python heap
+        dict, preventing the previous O(total-windows) Python heap
         pressure (~2–4 GB on the full felid corpus) that contradicted
         the "peak RAM ≈ O(largest single species)" spec claim. The
         sidecar is scratch: it is created here and removed unconditionally
@@ -1541,7 +1540,7 @@ class TokenizedCorpusWriter:
             try:
                 self._write_metadata_json()
             except BaseException:
-                # Intent: a failure inside ``_write_metadata_json`` leaves
+                # A failure inside ``_write_metadata_json`` leaves
                 # Parquet files on disk with no accompanying manifest. That
                 # state is worse than a clean rollback because downstream
                 # autodiscovery tooling treats any tree with ``*.parquet``
@@ -1563,7 +1562,7 @@ class TokenizedCorpusWriter:
     def _cleanup_written_parquet_files(self) -> None:
         """Unlink every Parquet file this writer created during the session.
 
-        Intent: centralise the unlink loop so the caller-exception path and
+        Centralises the unlink loop so the caller-exception path and
         the metadata-write-failure path in ``__exit__`` cannot drift. Each
         path must leave the output tree in the same half-cleaned state
         before ``_prune_empty_output_tree`` runs.
@@ -1577,7 +1576,7 @@ class TokenizedCorpusWriter:
     def _teardown_sqlite_sidecar(self) -> None:
         """Close the SQLite connection and remove the sidecar file.
 
-        Intent: ensure the scratch database never leaks into the
+        Ensures the scratch database never leaks into the
         output tree regardless of which exit path triggered teardown,
         so downstream packagers and auditors see only the canonical
         Parquet + ``metadata.json`` deliverable.
@@ -1598,7 +1597,7 @@ class TokenizedCorpusWriter:
     def _prune_empty_output_tree(self) -> None:
         """Conservatively remove empty partition dirs and the output root.
 
-        Intent: when the writer's ``with`` block raises, ``__exit__``
+        When the writer's ``with`` block raises, ``__exit__``
         has already unlinked every Parquet file this writer created
         and the SQLite sidecar, but the Hive-style
         ``split=/contig=/block_id=/`` partition tree created during
@@ -1628,7 +1627,7 @@ class TokenizedCorpusWriter:
     def _write_metadata_json(self) -> None:
         """Write ``metadata.json`` as a streamed JSON object.
 
-        Intent: avoid materialising the full manifest as a Python list
+        Avoids materialising the full manifest as a Python list
         (~O(total-windows)) to keep peak RAM at close near the SQLite
         row-factory buffer rather than the full 7M-locus dict. Emit the
         top-level object one key at a time in alphabetical order so the
@@ -1688,7 +1687,7 @@ class TokenizedCorpusWriter:
     ) -> None:
         """Emit the ``split_manifest`` array entry of ``metadata.json``.
 
-        Intent: stream manifest rows from the SQLite sidecar in
+        Streams manifest rows from the SQLite sidecar in
         ``(contig, block_start, split)`` order so peak RAM at close stays
         bounded by the ``fetchmany`` chunk rather than the full corpus.
         The caller handles the top-level comma for this key.
@@ -1724,7 +1723,7 @@ class TokenizedCorpusWriter:
     def _build_metadata_head(self) -> dict[str, Any]:
         """Return the non-``split_manifest`` top-level fields of ``metadata.json``.
 
-        Intent: this is a protected **test seam**, not part of the public
+        This is a protected **test seam**, not part of the public
         contract. The streaming metadata writer picks up any keys returned
         here and emits them alphabetically alongside the streamed
         ``split_manifest`` array, so a subclass that inserts a forward-
@@ -1760,7 +1759,7 @@ class TokenizedCorpusWriter:
     def split_paths(self) -> dict[str, list[Path]]:
         """Return a copy of the split-to-Parquet-paths mapping written so far.
 
-        Intent: surface the per-split file list to the shim so the
+        Surfaces the per-split file list to the shim so the
         public ``write_tokenized_dataset`` return value shape remains
         unchanged for legacy callers.
         """
@@ -1797,7 +1796,7 @@ def write_tokenized_dataset(
 ) -> dict[str, list[Path]]:
     """Write tokenised windows to a Hive-partitioned Parquet dataset (one-batch shim).
 
-    Intent: preserve the legacy single-shot API for the consensus
+    Preserves the legacy single-shot API for the consensus
     pretrain pipeline. This function is a thin wrapper that opens a
     :class:`TokenizedCorpusWriter`, calls ``write_batch`` once with the
     supplied windows, and closes. All on-disk artifacts (Hive partition

@@ -195,7 +195,7 @@ def test_load_feline_pipeline_config_rejects_non_boolean_preservation_flags(
 ) -> None:
     """Windowing/export boolean guards must reject truthy-coercible scalars.
 
-    Intent: these flags gate short-sequence dropping and the
+    These flags gate short-sequence dropping and the
     auditability guarantees of the export format. If Python's
     ``if value`` coercion let a ``1`` or ``"true"`` stand in for
     ``True``, a misconfigured TOML could silently disable audit
@@ -246,7 +246,7 @@ def test_load_felid_foundation_pipeline_config_rejects_non_boolean_flags(
 ) -> None:
     """Felid foundation loader rejects truthy-coercible scalars on every bool flag.
 
-    Intent: the felid foundation pretraining contract shares the same
+    The felid foundation pretraining contract shares the same
     ``_require_boolean_field`` helper as the feline loader, but has
     its own call sites. Parametrising over each strictly-validated
     boolean field in ``configs/examples/felid_foundation_pretrain.toml``
@@ -279,7 +279,7 @@ def test_load_felid_foundation_pipeline_config_accepts_real_booleans(
 ) -> None:
     """Real TOML booleans on ``drop_short_sequences`` round-trip through the loader.
 
-    Intent: the strict-bool guard must still admit the two values a
+    The strict-bool guard must still admit the two values a
     legitimate config can express (``true`` / ``false``) so the
     validator does not become a trap door for valid configurations.
     ``drop_short_sequences`` is picked because, unlike

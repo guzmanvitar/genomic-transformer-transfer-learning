@@ -43,7 +43,7 @@ from tests._felid_fixture import render_example_config, write_placeholder_fastas
 def test_felid_foundation_integration_panthera_tigris():
     """Live download + pretrain of Panthera tigris (5 MB slice, real tokenizer).
 
-    Intent: exercise the full felid-foundation pipeline end-to-end against a
+    Exercises the full felid-foundation pipeline end-to-end against a
     real DNABERT-2 tokenizer and a real (truncated) RefSeq assembly while
     honouring the six-species loader contract via placeholder FASTAs for the
     non-tigris roster.
