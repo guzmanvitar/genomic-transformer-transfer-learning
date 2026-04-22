@@ -37,6 +37,11 @@ def _build_realistic_records(*, total: int, source: str) -> list[dict[str, objec
                 sequence = "T" + reference_sequence[1:]
             elif pattern == 3:
                 sequence = reference_sequence[:-1] + "N"
+        variant_count = sum(
+            1
+            for base, reference_base in zip(sequence, reference_sequence)
+            if base != "N" and base != reference_base
+        )
         records.append(
             {
                 "sample_id": f"{source}-{index}",
@@ -45,7 +50,7 @@ def _build_realistic_records(*, total: int, source: str) -> list[dict[str, objec
                 "source": source,
                 "sequence": sequence,
                 "reference_sequence": reference_sequence,
-                "variant_count": 0 if sequence == reference_sequence else 1,
+                "variant_count": variant_count,
                 "callable_bases": len(sequence) - sequence.count("N"),
                 "unique_masked_bases": sequence.count("N"),
                 "filtered_bases": 0,
@@ -66,7 +71,7 @@ def consensus_records() -> list[dict[str, object]]:
             "source": "consensus",
             "sequence": "ACGTNCGT",
             "reference_sequence": "ACGTACGT",
-            "variant_count": 1,
+            "variant_count": 0,
             "callable_bases": 7,
             "unique_masked_bases": 1,
             "filtered_bases": 0,
@@ -186,7 +191,7 @@ def test_compare_reference_baseline_reports_corpus_level_deltas(
 
     assert comparison["deltas"]["retained_window_count"] == 1
     assert comparison["deltas"]["ambiguity_fraction"] == 0.041667
-    assert comparison["deltas"]["variant_fraction"] == 0.125
+    assert comparison["deltas"]["variant_fraction"] == 0.083333
     assert comparison["deltas"]["duplicate_window_fraction"] == pytest.approx(1 / 3)
     assert comparison["deltas"]["near_duplicate_pair_fraction"] == pytest.approx(-1 / 3)
     assert comparison["deltas"]["token_to_base_ratio"] == 0.0
@@ -509,3 +514,60 @@ def test_write_eda_payload_json_persists_report_payload(tmp_path, consensus_reco
     assert payload["consensus_corpus"]["retained_window_count"] == 3
     assert payload["consensus_corpus"]["near_duplicate_analysis"]["mode"] == "exact"
     assert payload["baseline_comparison"]["deltas"]["near_duplicate_pair_fraction"] == pytest.approx(-1 / 3)
+
+
+def test_diagnostics_producer_excludes_n_mismatches_from_variant_count() -> None:
+    """Anchor fixture semantics to the real producer rule.
+
+    The producer in ``pretrain/pipeline.py`` treats an ``N``-vs-reference
+    mismatch as missingness, not a called variant. This regression exercises
+    that producer directly so the hand-authored fixtures in this module
+    cannot drift back toward counting ambiguity as divergence.
+    """
+    from jaguar_geo_assign.data.preprocessor import (
+        DNABERT2_TOKENIZER_PROVENANCE,
+        TokenizedWindow,
+        WindowRecord,
+    )
+    from jaguar_geo_assign.pretrain.pipeline import (
+        _tokenized_windows_to_diagnostics_records,
+    )
+
+    window = WindowRecord(
+        sample_id="cat-1",
+        individual_id="cat-1",
+        contig="chr1",
+        source="consensus",
+        split="train",
+        locus_id="chr1:0-8",
+        block_start=0,
+        block_end=8,
+        window_start=0,
+        window_end=8,
+        sequence="ACGTNCGT",
+        gc_fraction=0.571429,
+        ambiguity_fraction=0.125,
+        sequence_hash="hash-n-only",
+        unique_masked_bases=1,
+        no_call_bases=1,
+    )
+    tokenized = TokenizedWindow(
+        window=window,
+        input_ids=(1,),
+        attention_mask=(1,),
+        token_count=1,
+        token_to_base_ratio=1 / 8,
+        tokenizer=DNABERT2_TOKENIZER_PROVENANCE,
+    )
+    reference_lookup = {("chr1", 0, 8): "ACGTACGT"}
+
+    records = list(
+        _tokenized_windows_to_diagnostics_records((tokenized,), reference_lookup)
+    )
+
+    assert len(records) == 1
+    record = records[0]
+    assert record["sequence"] == "ACGTNCGT"
+    assert record["reference_sequence"] == "ACGTACGT"
+    assert record["variant_count"] == 0
+    assert record["no_call_bases"] == 1
