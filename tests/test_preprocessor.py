@@ -9,8 +9,11 @@ Together they prevent silent data contamination and maintain traceability
 for downstream model-quality diagnostics.
 """
 
+import pytest
+
 from jaguar_geo_assign.data.preprocessor import (
     PreprocessingConfig,
+    PreprocessingError,
     SequenceRecord,
     normalize_sequence,
     prepare_sequences,
@@ -250,3 +253,58 @@ def test_window_sequences_drop_high_ambiguity_windows_from_retained_sequence() -
     assert windows[0].window_end == 4
     assert windows[0].sequence == "ACGT"
     assert windows[0].ambiguity_fraction == 0.0
+
+
+def test_window_sequences_reference_source_with_intrinsic_n_uses_realized_coverage() -> None:
+    """Regression: approved reference windows with intrinsic ``N`` fall back to realized coverage.
+
+    Wave 6b approval confirmed that ``source="reference"`` is the only
+    approved non-consensus label allowed to use realized ``N`` fallback
+    for windows lacking declared mask spans.
+    """
+    config = PreprocessingConfig(
+        min_sequence_length=6,
+        max_ambiguity_fraction=1.0,
+        window_size=6,
+        window_stride=6,
+        locus_block_size=6,
+    )
+
+    report = prepare_sequences(
+        [SequenceRecord("ref-1", "reference", "chr1", "ACNNAA", source="reference")],
+        config,
+    )
+
+    windows = window_sequences(list(report.retained), config)
+
+    assert len(windows) == 1
+    assert windows[0].sequence == "ACNNAA"
+    assert windows[0].source == "reference"
+    assert windows[0].unique_masked_bases == 2
+    assert windows[0].masked_base_counts == ()
+
+
+def test_window_sequences_reject_unknown_source_label_before_fallback() -> None:
+    """Regression: unknown source labels fail loudly instead of silently using relaxed fallback.
+
+    Wave 6b approval mandated that the approved producer-side source set
+    is exactly ``{"consensus", "reference"}``; any other label must raise
+    a fail-fast contract error before it can reach the fallback path.
+    This prevents silent data-quality degradation from typos or
+    unapproved labels.
+    """
+    config = PreprocessingConfig(
+        min_sequence_length=6,
+        max_ambiguity_fraction=1.0,
+        window_size=6,
+        window_stride=6,
+        locus_block_size=6,
+    )
+
+    report = prepare_sequences(
+        [SequenceRecord("cat-1", "cat-1", "chr1", "ACGNAA", source="consensus_typo")],
+        config,
+    )
+
+    with pytest.raises(PreprocessingError, match=r"Unknown source label 'consensus_typo'"):
+        window_sequences(list(report.retained), config)

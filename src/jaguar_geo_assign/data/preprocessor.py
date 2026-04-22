@@ -786,6 +786,8 @@ def _count_unique_masked_bases(overlapping_ranges: list[tuple[int, int]]) -> int
 
 
 CONSENSUS_SOURCE_LABEL = "consensus"
+REFERENCE_SOURCE_LABEL = "reference"
+APPROVED_SOURCE_LABELS = frozenset({CONSENSUS_SOURCE_LABEL, REFERENCE_SOURCE_LABEL})
 
 
 def _count_realized_unique_masked_bases(
@@ -800,21 +802,30 @@ def _count_realized_unique_masked_bases(
     silently reconciles a provenance gap for consensus-derived windows. For
     consensus windows the span-derived count is reported verbatim so
     downstream diagnostics can detect any ``N`` base that is not accounted
-    for by an explicit mask span. For retained reference/baseline windows
-    (which legitimately carry intrinsic ``N`` bases but never declare mask
-    spans) the realized ``N`` coverage is used as a fallback so valid
-    windows are not false-flagged by the coverage invariant.
+    for by an explicit mask span. For approved reference windows (which
+    legitimately carry intrinsic ``N`` bases but never declare mask spans)
+    the realized ``N`` coverage is used as a fallback so valid windows are
+    not false-flagged by the coverage invariant.
 
     Args:
         sequence: The window nucleotide string.
         span_unique_masked_bases: De-duplicated base count from mask spans.
-        source: Window provenance label (``"consensus"`` is provenance-strict;
-            any other value is treated as reference/baseline and allowed to
-            fall back to the realized ``N`` coverage of *sequence*).
+        source: Window provenance label. Must be one of the approved labels
+            in ``APPROVED_SOURCE_LABELS``. ``"consensus"`` is provenance-strict;
+            ``"reference"`` is the only approved non-consensus label allowed to
+            fall back to the realized ``N`` coverage of *sequence*.
 
     Returns:
         The reported ``unique_masked_bases`` value for the window.
+
+    Raises:
+        PreprocessingError: If ``source`` is not in ``APPROVED_SOURCE_LABELS``.
     """
+    if source not in APPROVED_SOURCE_LABELS:
+        raise PreprocessingError(
+            f"Unknown source label '{source}': only {sorted(APPROVED_SOURCE_LABELS)} are approved. "
+            "Update the centralized source contract if a new label is required."
+        )
     if source == CONSENSUS_SOURCE_LABEL:
         return span_unique_masked_bases
     return max(span_unique_masked_bases, sequence.count("N"))
