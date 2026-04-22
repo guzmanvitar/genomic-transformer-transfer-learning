@@ -7,29 +7,10 @@ tokenize → Parquet ``write_batch``) before the next species begins. The
 :class:`TokenizedCorpusWriter` from
 :mod:`jaguar_geo_assign.data.preprocessor` is opened once at the start of
 the run and closed at the end, so peak heap usage is bounded by the
-largest single assembly rather than by the full six-species corpus.
-
-Why a separate module exists:
-    The consensus (feline) pretraining path in ``pretrain/pipeline.py``
-    is structured around VCF → ``bcftools`` → consensus-FASTA →
-    diagnostics and is keyed by ``sample_id``/``individual_id``. The
-    felid-foundation path has an entirely different input shape
-    (pre-existing reference FASTAs pinned in
-    :data:`APPROVED_FELID_ASSEMBLIES`), never invokes ``bcftools``,
-    uses ``source="reference"`` on every record, and does *not* emit the
-    EDA payload (which is shaped around ``tokenized_consensus`` vs.
-    ``tokenized_baseline`` semantics that do not apply to multi-species
-    reference corpora). Keeping the two runtimes in separate modules
-    with a shared helper layer in ``_shared.py`` avoids turning either
-    into an if/else maze keyed on pipeline kind.
-
-Streaming-writer contract:
-    The writer contract is: **for each species, hold at most one
-    species' windows in memory; call write_batch; release**. Tests
-    explicitly verify that the tokenizer fake never observes more than
-    one species' records concurrently. Do not "collect all species then
-    concat" — that pattern is exactly what Task 4's streaming writer was
-    introduced to eliminate.
+largest single assembly rather than by the full six-species corpus. For
+each species the pipeline holds at most one species' windows in memory,
+calls ``write_batch``, and releases; tests explicitly verify that the
+tokenizer fake never observes more than one species' records concurrently.
 """
 
 from __future__ import annotations

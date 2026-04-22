@@ -16,22 +16,18 @@ genomics transformer project, covering four stages:
    backs the multi-species felid foundation corpus: callers feed one
    batch (typically one species's tokenized windows) at a time so peak
    RAM is bounded by the largest single batch rather than the full
-   corpus. The legacy ``write_tokenized_dataset`` function is preserved
-   as a thin one-batch shim so the consensus pretrain pipeline keeps
-   working unchanged.
+   corpus. ``write_tokenized_dataset`` is a one-batch convenience
+   wrapper around the same writer used by the consensus pretrain
+   pipeline.
 
-Contract change — within-split Parquet ordering
------------------------------------------------
-Prior to the streaming writer, a single ``write_tokenized_dataset``
-call sorted the entire corpus and emitted Parquet files in globally
-sorted ``(split, contig, block_start, window_start, ...)`` order within
-each Hive ``split=`` partition. With the streaming writer, sorting is
-**per-batch by ``locus_id``** only; multiple Parquet files may coexist
-under a single ``split=.../contig=.../block_id=.../`` directory, each
-internally sorted, but there is no global order across files within a
-split. Downstream consumers must not assume a row-level sort across
-the Parquet dataset; use ``split_manifest`` in ``metadata.json`` to
-recover the split assignment of any locus.
+Within-split Parquet ordering
+-----------------------------
+Parquet files under a single ``split=.../contig=.../block_id=.../``
+directory are each internally sorted by ``locus_id``; there is no
+global order across files within a split. Downstream consumers must
+not assume a row-level sort across the Parquet dataset; use
+``split_manifest`` in ``metadata.json`` to recover the split
+assignment of any locus.
 
 Fragility flags
 ---------------
@@ -1220,37 +1216,14 @@ def tokenize_windows(
 class TokenizedCorpusWriter:
     """Streaming/append Parquet writer for multi-batch tokenized corpora.
 
-    The felid foundation pretraining corpus is assembled from six
-    multi-gigabase reference assemblies. Full materialisation of all
-    tokenized windows in one process would OOM even a large VM. This
-    writer lets callers feed one batch at a time (typically one
-    species per batch) so peak RAM stays bounded by the **largest
-    single batch**, not the full corpus. The legacy single-shot
-    ``write_tokenized_dataset`` is preserved as a thin one-batch
-    shim around this class so the consensus pretrain pipeline
-    continues to run unchanged.
-
-    Contract change (vs. legacy single-shot writer):
-        The legacy writer globally sorted all records within each
-        ``split=`` Hive partition before writing, producing a single
-        totally-ordered sequence of Parquet files per split. The
-        streaming writer sorts **per batch** by ``locus_id``, then
-        partitions by ``(split, contig, block_id)`` as before. Across
-        multiple ``write_batch`` calls, a single
-        ``split=.../contig=.../block_id=.../`` directory may therefore
-        contain several internally-sorted Parquet files with **no
-        global order across files**. Downstream consumers that relied
-        on within-split row ordering must now read the whole partition
-        and re-sort if they need a total order (see the module
-        docstring for the full rationale).
-
-    Grep evidence supporting the contract change (captured during the
-    refactor so we don't accidentally reintroduce an invariant nobody
-    enforces): the only hit for ``sort_values.*locus`` / ``locus_id.*sort``
-    / ``sorted.*locus_id`` across ``src/`` and ``tests/`` was in
-    ``reporting/genomics_diagnostics.py`` (sorting diagnostic dict
-    output by locus_id), which does not read the Parquet dataset and
-    does not assume row order within any Parquet file.
+    The felid foundation corpus spans six multi-gigabase reference assemblies,
+    so full materialisation in one process would OOM even a large VM. Callers
+    feed one batch at a time (typically one species per batch) so peak RAM
+    stays bounded by the largest single batch. Records are sorted by
+    ``locus_id`` within each batch and partitioned by
+    ``(split, contig, block_id)``; multiple Parquet files may coexist under a
+    single partition directory, each internally sorted, with no global order
+    across files.
 
     Usage:
         >>> with TokenizedCorpusWriter(output_dir, contract=contract,
@@ -1260,24 +1233,21 @@ class TokenizedCorpusWriter:
         >>> writer.split_paths  # {"train": [...], "validation": [...]}
 
     Lifecycle guarantees:
-        - Per-split Parquet writers are created lazily: no
-          ``split=validation/`` file tree is produced if no batch ever
-          contains a validation window.
-        - ``__exit__`` writes the corpus ``metadata.json`` sidecar on
-          clean exit. On an exception bubbling out of the ``with``
-          block, any Parquet files already written are deleted and no
-          manifest is emitted, so the output directory never contains
-          half-written artifacts that would corrupt a downstream train
-          loader.
-        - ``row_group_size`` from the ``ExportContract`` is honoured
-          **per batch**: each ``write_batch`` call partitions its own
-          records into row-group-sized chunks. The cumulative row
-          count in a single Parquet file never exceeds
-          ``contract.row_group_size``.
+        - Per-split Parquet writers are created lazily: no ``split=validation/``
+          file tree is produced if no batch ever contains a validation window.
+        - ``__exit__`` writes the corpus ``metadata.json`` sidecar on clean
+          exit. On an exception bubbling out of the ``with`` block, any Parquet
+          files already written are deleted and no manifest is emitted, so the
+          output directory never contains half-written artifacts that would
+          corrupt a downstream train loader.
+        - ``row_group_size`` from the ``ExportContract`` is honoured **per
+          batch**: each ``write_batch`` call partitions its own records into
+          row-group-sized chunks. The cumulative row count in a single Parquet
+          file never exceeds ``contract.row_group_size``.
 
     Thread-safety:
-        Not thread-safe. A single writer instance must be driven by a
-        single producer. Multi-process writers are out of scope.
+        Not thread-safe. A single writer instance must be driven by a single
+        producer. Multi-process writers are out of scope.
     """
 
     def __init__(
@@ -1782,13 +1752,13 @@ def write_tokenized_dataset(
 ) -> dict[str, list[Path]]:
     """Write tokenised windows to a Hive-partitioned Parquet dataset (one-batch shim).
 
-    Preserves the legacy single-shot API for the consensus
-    pretrain pipeline. This function is a thin wrapper that opens a
-    :class:`TokenizedCorpusWriter`, calls ``write_batch`` once with the
-    supplied windows, and closes. All on-disk artifacts (Hive partition
-    layout, ``metadata.json`` schema, return-value shape) are produced
-    by the underlying writer; this function adds no behaviour of its
-    own beyond the single-batch call.
+    One-batch convenience wrapper used by the consensus pretrain
+    pipeline. This function opens a :class:`TokenizedCorpusWriter`,
+    calls ``write_batch`` once with the supplied windows, and closes.
+    All on-disk artifacts (Hive partition layout, ``metadata.json``
+    schema, return-value shape) are produced by the underlying writer;
+    this function adds no behaviour of its own beyond the single
+    ``write_batch`` call.
 
     Args:
         tokenized_windows: Records to serialise in a single batch.

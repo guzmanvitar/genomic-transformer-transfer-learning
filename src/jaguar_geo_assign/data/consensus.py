@@ -1,4 +1,8 @@
-"""VCF-to-consensus-sequence construction for felid genomes. Retained for downstream jaguar-assignment workflows that require per-sample consensus calling; not wired into the current felid foundation pretraining path, which operates on reference FASTAs directly.
+"""VCF-to-consensus-sequence construction for felid genomes.
+
+Retained for downstream jaguar-assignment workflows that require per-sample
+consensus calling; not wired into the current felid foundation pretraining
+path, which operates on reference FASTAs directly.
 
 This module implements the consensus stage of the feline data workflow:
 :func:`classify_consensus_site` encodes a deterministic per-site decision

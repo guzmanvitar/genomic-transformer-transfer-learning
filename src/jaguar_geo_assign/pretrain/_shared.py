@@ -43,9 +43,7 @@ def normalize_ru_maxrss_to_bytes(raw: int, platform: str) -> int:
     macOS. A peak-RSS telemetry field that silently mixes units would
     make the run-summary JSON useless for cross-platform comparison
     (and would understate macOS runs by 1000x on a Linux reader's
-    mental model). Isolating the normalisation in a pure helper keeps
-    the platform branch independently unit-testable without touching
-    the real ``resource`` module.
+    mental model).
 
     Args:
         raw: The raw ``ru_maxrss`` integer returned by
@@ -61,8 +59,7 @@ def normalize_ru_maxrss_to_bytes(raw: int, platform: str) -> int:
     Raises:
         ValueError: If *platform* is not a recognised normalisation
             target. Unknown platforms fail loudly rather than silently
-            picking a default, because a wrong default would produce
-            systematically-biased telemetry that is hard to audit.
+            picking a default.
     """
     if platform.startswith("linux"):
         return int(raw) * 1024
