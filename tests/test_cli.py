@@ -20,7 +20,7 @@ import textwrap
 import pytest
 
 from jaguar_geo_assign.cli import main
-from jaguar_geo_assign.data.acquisition import ConsensusDiagnostics, ConsensusResult
+from jaguar_geo_assign.data.consensus import ConsensusDiagnostics, ConsensusResult
 from jaguar_geo_assign.data import preprocessor as preprocessor_module
 from jaguar_geo_assign.data.preprocessor import ExportContractError, TokenizedWindow, TokenizerProvenance, WindowRecord
 from jaguar_geo_assign.pretrain import pipeline as pretrain_pipeline

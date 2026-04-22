@@ -33,7 +33,7 @@ from pathlib import Path
 from typing import Callable, Iterable
 
 from ..config import FelinePipelineConfig, load_feline_pipeline_config
-from ..data.acquisition import ConsensusResult, generate_consensus_fastas
+from ..data.consensus import ConsensusResult, generate_consensus_fastas
 from ..data.pipeline_contract import REQUIRED_SAMPLE_MANIFEST_FIELDS
 from ..data.preprocessor import (
     ExportContract,
