@@ -15,8 +15,8 @@ import pytest
 
 from jaguar_geo_assign.config import (
     load_experiment_config,
-    load_feline_pipeline_config,
     load_felid_foundation_pipeline_config,
+    load_feline_pipeline_config,
 )
 from jaguar_geo_assign.data.contracts import JAGUAR_METADATA_FIELDS
 from jaguar_geo_assign.data.pipeline_contract import (
@@ -27,7 +27,8 @@ from jaguar_geo_assign.data.pipeline_contract import (
 
 
 def test_load_experiment_config_preserves_metadata_contract() -> None:
-    """An experiment config round-trips the jaguar metadata fields and baseline stage wiring intact."""
+    """An experiment config round-trips the jaguar metadata fields and baseline stage wiring
+    intact."""
     config = load_experiment_config("configs/examples/regression_transfer.toml")
 
     assert config.jaguar_metadata_fields == JAGUAR_METADATA_FIELDS
@@ -40,7 +41,9 @@ def test_load_experiment_config_rejects_extra_metadata_fields(tmp_path: Path) ->
     """Adding fields outside the bootstrap metadata contract fails config loading."""
     invalid_config = tmp_path / "invalid.toml"
     invalid_config.write_text(
-        Path("configs/examples/fine_tune.toml").read_text(encoding="utf-8").replace(
+        Path("configs/examples/fine_tune.toml")
+        .read_text(encoding="utf-8")
+        .replace(
             '  "longitude",\n]',
             '  "longitude",\n  "coordinate_uncertainty_meters",\n]',
         ),
@@ -52,7 +55,8 @@ def test_load_experiment_config_rejects_extra_metadata_fields(tmp_path: Path) ->
 
 
 def test_load_feline_pipeline_config_preserves_scientific_contracts() -> None:
-    """The feline pipeline config exposes the approved accession, assembly, tokenizer revision, and split strategy."""
+    """The feline pipeline config exposes the approved accession, assembly, tokenizer revision,
+    and split strategy."""
     config = load_feline_pipeline_config("configs/examples/feline_pretrain.toml")
 
     assert config.project_accession == APPROVED_BIOPROJECT_ACCESSION
@@ -69,7 +73,9 @@ def test_load_feline_pipeline_config_rejects_unpinned_tokenizer_revision(tmp_pat
     """A mutable tokenizer revision (e.g. ``main``) is rejected to prevent silent upstream drift."""
     invalid_config = tmp_path / "invalid_feline.toml"
     invalid_config.write_text(
-        Path("configs/examples/feline_pretrain.toml").read_text(encoding="utf-8").replace(
+        Path("configs/examples/feline_pretrain.toml")
+        .read_text(encoding="utf-8")
+        .replace(
             'revision = "7bce263b15377fc15361f52cfab88f8b586abda0"',
             'revision = "main"',
         ),
@@ -93,9 +99,9 @@ def test_load_feline_pipeline_config_requires_explicit_trust_remote_code(tmp_pat
     """The security-critical ``trust_remote_code`` field must be declared, not defaulted."""
     invalid_config = tmp_path / "missing_trust_remote_code.toml"
     invalid_config.write_text(
-        Path("configs/examples/feline_pretrain.toml").read_text(encoding="utf-8").replace(
-            "trust_remote_code = true\n", ""
-        ),
+        Path("configs/examples/feline_pretrain.toml")
+        .read_text(encoding="utf-8")
+        .replace("trust_remote_code = true\n", ""),
         encoding="utf-8",
     )
 
@@ -107,7 +113,9 @@ def test_load_feline_pipeline_config_rejects_trust_remote_code_mismatch(tmp_path
     """Loader refuses any ``trust_remote_code`` value that diverges from the approved policy."""
     invalid_config = tmp_path / "invalid_trust_remote_code.toml"
     invalid_config.write_text(
-        Path("configs/examples/feline_pretrain.toml").read_text(encoding="utf-8").replace(
+        Path("configs/examples/feline_pretrain.toml")
+        .read_text(encoding="utf-8")
+        .replace(
             "trust_remote_code = true",
             "trust_remote_code = false",
         ),
@@ -128,14 +136,18 @@ def test_load_feline_pipeline_config_rejects_non_boolean_trust_remote_code(
     """Truthy strings/ints cannot stand in for a TOML boolean on ``trust_remote_code``."""
     invalid_config = tmp_path / "invalid_trust_remote_code_type.toml"
     invalid_config.write_text(
-        Path("configs/examples/feline_pretrain.toml").read_text(encoding="utf-8").replace(
+        Path("configs/examples/feline_pretrain.toml")
+        .read_text(encoding="utf-8")
+        .replace(
             "trust_remote_code = true",
             f"trust_remote_code = {replacement}",
         ),
         encoding="utf-8",
     )
 
-    with pytest.raises(ValueError, match="tokenizer.trust_remote_code must be a TOML boolean true/false") as exc_info:
+    with pytest.raises(
+        ValueError, match="tokenizer.trust_remote_code must be a TOML boolean true/false"
+    ) as exc_info:
         load_feline_pipeline_config(invalid_config)
 
     assert expected_fragment in str(exc_info.value)
@@ -152,10 +164,13 @@ def test_load_feline_pipeline_config_rejects_non_boolean_consensus_mismatch_guar
     replacement: str,
     expected_fragment: str,
 ) -> None:
-    """Consensus mismatch guards (assembly/contig) must be real booleans to prevent silent bypass."""
+    """Consensus mismatch guards (assembly/contig) must be real booleans to prevent silent
+    bypass."""
     invalid_config = tmp_path / f"invalid_{field_name}_type.toml"
     invalid_config.write_text(
-        Path("configs/examples/feline_pretrain.toml").read_text(encoding="utf-8").replace(
+        Path("configs/examples/feline_pretrain.toml")
+        .read_text(encoding="utf-8")
+        .replace(
             f"{field_name} = true",
             f"{field_name} = {replacement}",
             1,
@@ -207,7 +222,9 @@ def test_load_feline_pipeline_config_rejects_non_boolean_preservation_flags(
     field_name = field_line.split(" = ")[0]
     invalid_config = tmp_path / f"invalid_{field_name}_{replacement}.toml"
     invalid_config.write_text(
-        Path("configs/examples/feline_pretrain.toml").read_text(encoding="utf-8").replace(
+        Path("configs/examples/feline_pretrain.toml")
+        .read_text(encoding="utf-8")
+        .replace(
             field_line,
             f"{field_name} = {replacement}",
             1,

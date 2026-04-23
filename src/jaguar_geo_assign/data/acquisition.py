@@ -16,12 +16,12 @@ Consensus-sequence construction (VCF → FASTA) lives in
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 import hashlib
 import json
-from pathlib import Path
 import time
-from typing import Callable, Mapping
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass
+from pathlib import Path
 from urllib.parse import urlparse
 from urllib.request import OpenerDirector, Request, build_opener
 
@@ -164,7 +164,9 @@ def fetch_bioproject_summary(
     search_payload = _load_json(opener, BIOPROJECT_SEARCH_URL.format(accession=accession))
     id_list = search_payload["esearchresult"]["idlist"]
     if len(id_list) != 1:
-        raise AcquisitionError(f"Expected exactly one BioProject for {accession}, found {len(id_list)}")
+        raise AcquisitionError(
+            f"Expected exactly one BioProject for {accession}, found {len(id_list)}"
+        )
     project_id = id_list[0]
     summary_payload = _load_json(opener, BIOPROJECT_SUMMARY_URL.format(project_id=project_id))
     record = summary_payload["result"][project_id]
@@ -221,7 +223,8 @@ def build_feline_acquisition_manifest(
     project = fetch_bioproject_summary(project_accession, opener=opener)
     if "99 Lives" not in project.title:
         raise AcquisitionError(
-            f"BioProject {project.accession} does not look like the approved 99 Lives target: {project.title}"
+            f"BioProject {project.accession} does not look like the approved 99 Lives target: "
+            f"{project.title}"
         )
 
     output_root = Path(output_dir)
@@ -307,7 +310,9 @@ def download_with_retry(
     partial_path = destination.with_name(f"{destination.name}.part")
 
     if destination.exists() and _checksum_matches(destination, asset.checksum, asset.checksum_name):
-        return DownloadResult(destination, attempts=0, resumed=False, skipped_existing=True, bytes_written=0)
+        return DownloadResult(
+            destination, attempts=0, resumed=False, skipped_existing=True, bytes_written=0
+        )
     if destination.exists():
         destination.unlink()
 
@@ -322,10 +327,13 @@ def download_with_retry(
                 timeout_seconds=timeout_seconds,
                 chunk_size=chunk_size,
             )
-            if asset.checksum and not _checksum_matches(partial_path, asset.checksum, asset.checksum_name):
+            if asset.checksum and not _checksum_matches(
+                partial_path, asset.checksum, asset.checksum_name
+            ):
                 partial_path.unlink(missing_ok=True)
                 raise AcquisitionError(
-                    f"Checksum mismatch for {asset.url}; expected {asset.checksum_name}={asset.checksum}"
+                    f"Checksum mismatch for {asset.url}; "
+                    f"expected {asset.checksum_name}={asset.checksum}"
                 )
             partial_path.replace(destination)
             return DownloadResult(
@@ -342,7 +350,9 @@ def download_with_retry(
             if attempt >= retries:
                 break
             sleep(backoff_seconds * (2 ** (attempt - 1)))
-    raise AcquisitionError(f"Failed to download {asset.url} after {retries} attempts") from last_error
+    raise AcquisitionError(
+        f"Failed to download {asset.url} after {retries} attempts"
+    ) from last_error
 
 
 def _download_once(

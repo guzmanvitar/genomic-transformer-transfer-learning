@@ -20,17 +20,14 @@ from __future__ import annotations
 
 import gzip
 import hashlib
-from pathlib import Path
 import tomllib
+from pathlib import Path
 from typing import Any
 
 import tomli_w
 
 EXAMPLE_FELID_FOUNDATION_CONFIG_PATH = (
-    Path(__file__).resolve().parents[1]
-    / "configs"
-    / "examples"
-    / "felid_foundation_pretrain.toml"
+    Path(__file__).resolve().parents[1] / "configs" / "examples" / "felid_foundation_pretrain.toml"
 )
 
 
@@ -79,9 +76,7 @@ def placeholder_fasta_filename(accession: str) -> str:
     raise AssertionError(f"Unknown accession in fixture: {accession}")
 
 
-def write_placeholder_fastas(
-    reference_dir: Path, padded_accessions: list[str]
-) -> None:
+def write_placeholder_fastas(reference_dir: Path, padded_accessions: list[str]) -> None:
     """Write a minimal unique FASTA for each padded species.
 
     Placeholder FASTAs use the accession as the contig ID so they
@@ -176,9 +171,7 @@ def render_example_config(
         config["paths"][key] = str(value)
 
     if species is not None:
-        config["species"] = [
-            {"species": sp, "accession": acc} for sp, acc in species
-        ]
+        config["species"] = [{"species": sp, "accession": acc} for sp, acc in species]
 
     if runtime_external_tools is not None:
         config["runtime"]["external_tools"] = list(runtime_external_tools)
@@ -191,17 +184,12 @@ def render_example_config(
                     f"scalar_overrides key {dotted_key!r} must be dotted (section.field)"
                 )
             if section not in config:
-                raise KeyError(
-                    f"scalar_overrides section {section!r} not in example config"
-                )
+                raise KeyError(f"scalar_overrides section {section!r} not in example config")
             if field not in config[section]:
-                raise KeyError(
-                    f"scalar_overrides field {dotted_key!r} not in example config"
-                )
+                raise KeyError(f"scalar_overrides field {dotted_key!r} not in example config")
             config[section][field] = value
 
     target = tmp_path / filename
     with target.open("wb") as handle:
         tomli_w.dump(config, handle)
     return target
-

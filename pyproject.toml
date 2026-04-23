@@ -19,8 +19,28 @@ build-backend = "uv_build"
 [dependency-groups]
 dev = [
     "pytest>=8.3,<9",
+    "ruff>=0.9,<1",
     "tomli-w>=1.2.0",
 ]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+exclude = ["notebooks"]
+
+[tool.ruff.lint]
+select = ["B", "E", "F", "I", "N", "UP", "W"]
+ignore = [
+    "N812",  # lowercase-imported-as-non-lowercase (common in ML: import torch.nn as nn)
+]
+
+[tool.ruff.lint.isort]
+split-on-trailing-comma = false
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+docstring-code-format = true
 
 [tool.pytest.ini_options]
 addopts = "-q -m 'not integration'"

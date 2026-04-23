@@ -52,25 +52,25 @@ Fragility flags
 
 from __future__ import annotations
 
+import json
+import os
+import sqlite3
+import tarfile
 from collections import Counter, defaultdict
 from dataclasses import asdict, dataclass
 from hashlib import sha256
 from io import BytesIO
-import json
-import os
 from pathlib import Path
-import sqlite3
-import tarfile
 from typing import Any, Protocol
 
 from transformers import AutoTokenizer
 
 from .pipeline_contract import (
     DNABERT2_TOKENIZER_ID,
-    DNABERT2_TOKENIZER_REVISION as DNABERT2_TOKENIZER_REVISION_HASH,
     DNABERT2_TRUST_REMOTE_CODE,
     POST_CONSENSUS_ALLOWED_ALPHABET,
 )
+from .pipeline_contract import DNABERT2_TOKENIZER_REVISION as DNABERT2_TOKENIZER_REVISION_HASH
 
 DNABERT2_TOKENIZER_NAME = DNABERT2_TOKENIZER_ID
 DNABERT2_TOKENIZER_REVISION = DNABERT2_TOKENIZER_REVISION_HASH
@@ -154,7 +154,9 @@ def _require_boolean_trust_remote_code(
         error_type: If ``type(value)`` is not exactly ``bool``.
     """
     if type(value) is not bool:
-        raise error_type(f"{field_name} must be an actual boolean, got {value!r} ({type(value).__name__})")
+        raise error_type(
+            f"{field_name} must be an actual boolean, got {value!r} ({type(value).__name__})"
+        )
     return value
 
 
@@ -516,7 +518,9 @@ class ExportContract:
         if self.row_group_size <= 0:
             raise ExportContractError("row_group_size must be positive")
         if not self.preserve_raw_windows and not self.preserve_sequence_hashes:
-            raise ExportContractError("export must preserve raw windows or immutable sequence hashes")
+            raise ExportContractError(
+                "export must preserve raw windows or immutable sequence hashes"
+            )
         if self.sequence_hash_algorithm != "sha256":
             raise ExportContractError("sequence_hash_algorithm must remain sha256")
 
@@ -604,6 +608,7 @@ def ambiguity_fraction(sequence: str) -> float:
     if not sequence:
         return 0.0
     return sequence.count("N") / len(sequence)
+
 
 def prepare_sequences(
     records: list[SequenceRecord],
@@ -697,7 +702,9 @@ def prepare_sequences(
     )
 
 
-def assign_split(locus_id: str, split_weights: tuple[tuple[str, float], ...], split_seed: str) -> str:
+def assign_split(
+    locus_id: str, split_weights: tuple[tuple[str, float], ...], split_seed: str
+) -> str:
     """Deterministically assign a locus block to a fold using SHA-256 hashing.
 
     The assignment is computed as
@@ -718,7 +725,7 @@ def assign_split(locus_id: str, split_weights: tuple[tuple[str, float], ...], sp
         The name of the assigned fold.
     """
     total = sum(weight for _, weight in split_weights)
-    bucket = int(sha256(f"{split_seed}:{locus_id}".encode("utf-8")).hexdigest()[:16], 16)
+    bucket = int(sha256(f"{split_seed}:{locus_id}".encode()).hexdigest()[:16], 16)
     position = bucket / float(16**16)
     cumulative = 0.0
     for split_name, weight in split_weights:
@@ -772,7 +779,10 @@ class _WindowMaskCounter:
             de-duplicated total across all categories.
         """
         assert self.active_spans is not None
-        while self.next_index < len(self.mask_spans) and self.mask_spans[self.next_index][0] < window_end:
+        while (
+            self.next_index < len(self.mask_spans)
+            and self.mask_spans[self.next_index][0] < window_end
+        ):
             self.active_spans.append(self.mask_spans[self.next_index])
             self.next_index += 1
         self.active_spans = [span for span in self.active_spans if span[1] > window_start]
@@ -783,7 +793,9 @@ class _WindowMaskCounter:
             overlap = min(window_end, span_end) - max(window_start, span_start)
             if overlap > 0:
                 counts[category] += overlap
-                overlapping_ranges.append((max(window_start, span_start), min(window_end, span_end)))
+                overlapping_ranges.append(
+                    (max(window_start, span_start), min(window_end, span_end))
+                )
         return counts, _count_unique_masked_bases(overlapping_ranges)
 
 
@@ -941,7 +953,9 @@ def window_sequences(
             locus_id = f"{sequence.contig}:{block_start}-{block_end}"
             split = assign_split(locus_id, config.split_weights, config.split_seed)
 
-            for offset in range(0, len(block_sequence) - config.window_size + 1, config.window_stride):
+            for offset in range(
+                0, len(block_sequence) - config.window_size + 1, config.window_stride
+            ):
                 window_start = overlap_start + offset
                 window_end = window_start + config.window_size
                 if window_end > overlap_end:
@@ -962,7 +976,9 @@ def window_sequences(
                 filtered_bases = mask_counts.get("filtered", 0)
                 no_call_bases = mask_counts.get("no_call", 0)
                 other_masked_bases = sum(
-                    count for category, count in mask_counts.items() if category not in {"filtered", "no_call"}
+                    count
+                    for category, count in mask_counts.items()
+                    if category not in {"filtered", "no_call"}
                 )
                 windows.append(
                     WindowRecord(
@@ -1021,7 +1037,9 @@ def build_split_manifest(windows: tuple[WindowRecord, ...]) -> tuple[SplitManife
         if current is not None and current.split != entry.split:
             raise SplitLeakageError(f"Locus {window.locus_id} is assigned to multiple splits")
         manifest[window.locus_id] = entry
-    return tuple(sorted(manifest.values(), key=lambda item: (item.contig, item.block_start, item.split)))
+    return tuple(
+        sorted(manifest.values(), key=lambda item: (item.contig, item.block_start, item.split))
+    )
 
 
 def assert_split_safety(windows: tuple[WindowRecord, ...]) -> None:
@@ -1054,13 +1072,19 @@ def assert_split_safety(windows: tuple[WindowRecord, ...]) -> None:
     for contig, contig_windows in by_contig.items():
         active: list[WindowRecord] = []
         for window in sorted(contig_windows, key=lambda item: (item.window_start, item.window_end)):
-            active = [candidate for candidate in active if candidate.window_end > window.window_start]
+            active = [
+                candidate for candidate in active if candidate.window_end > window.window_start
+            ]
             for candidate in active:
-                overlaps = candidate.window_start < window.window_end and window.window_start < candidate.window_end
+                overlaps = (
+                    candidate.window_start < window.window_end
+                    and window.window_start < candidate.window_end
+                )
                 if overlaps and candidate.split != window.split:
                     raise SplitLeakageError(
                         "Overlapping windows across splits detected on "
-                        f"{contig}: {candidate.window_start}-{candidate.window_end} ({candidate.split}) vs "
+                        f"{contig}: {candidate.window_start}-{candidate.window_end} "
+                        f"({candidate.split}) vs "
                         f"{window.window_start}-{window.window_end} ({window.split})"
                     )
             active.append(window)
@@ -1145,7 +1169,9 @@ def _resolve_export_tokenizer_provenance(
         resolved = tokenized_windows[0].tokenizer
         _assert_approved_dnabert2_trust_policy(resolved.trust_remote_code)
         if any(record.tokenizer != resolved for record in tokenized_windows[1:]):
-            raise ExportContractError("All tokenized windows must share identical tokenizer provenance")
+            raise ExportContractError(
+                "All tokenized windows must share identical tokenizer provenance"
+            )
         if provenance is not None and provenance != resolved:
             raise ExportContractError(
                 "Explicit tokenizer provenance does not match the tokenized window metadata"
@@ -1153,7 +1179,8 @@ def _resolve_export_tokenizer_provenance(
         return resolved
     if provenance is None:
         raise ExportContractError(
-            "Tokenized export metadata requires explicit tokenizer provenance when no tokenized windows are available"
+            "Tokenized export metadata requires explicit tokenizer provenance "
+            "when no tokenized windows are available"
         )
     _assert_approved_dnabert2_trust_policy(provenance.trust_remote_code)
     return provenance
@@ -1187,7 +1214,9 @@ def tokenize_windows(
     tokenized: list[TokenizedWindow] = []
     for window in windows:
         tokenization_window = _prepare_window_for_tokenization(window, provenance)
-        encoding = tokenizer(tokenization_window.sequence, add_special_tokens=True, truncation=False)
+        encoding = tokenizer(
+            tokenization_window.sequence, add_special_tokens=True, truncation=False
+        )
         input_ids = _coerce_int_tuple(encoding.get("input_ids"), field_name="input_ids")
         attention_mask_raw = encoding.get("attention_mask", [1] * len(input_ids))
         attention_mask = _coerce_int_tuple(attention_mask_raw, field_name="attention_mask")
@@ -1226,8 +1255,9 @@ class TokenizedCorpusWriter:
     across files.
 
     Usage:
-        >>> with TokenizedCorpusWriter(output_dir, contract=contract,
-        ...                            provenance=provenance) as writer:
+        >>> with TokenizedCorpusWriter(
+        ...     output_dir, contract=contract, provenance=provenance
+        ... ) as writer:
         ...     for batch in batches:
         ...         writer.write_batch(batch)
         >>> writer.split_paths  # {"train": [...], "validation": [...]}
@@ -1283,7 +1313,7 @@ class TokenizedCorpusWriter:
         self._opened = False
         self._closed = False
 
-    def __enter__(self) -> "TokenizedCorpusWriter":
+    def __enter__(self) -> TokenizedCorpusWriter:
         """Validate the contract, create the output directory, open the writer.
 
         The locus manifest is stored in a SQLite sidecar at
@@ -1383,9 +1413,7 @@ class TokenizedCorpusWriter:
             row = (window.contig, window.block_start, window.block_end, window.split)
             existing = batch_entries.get(window.locus_id)
             if existing is not None and existing[3] != window.split:
-                raise SplitLeakageError(
-                    f"Locus {window.locus_id} is assigned to multiple splits"
-                )
+                raise SplitLeakageError(f"Locus {window.locus_id} is assigned to multiple splits")
             batch_entries[window.locus_id] = row
 
         assert self._sqlite_conn is not None
@@ -1402,9 +1430,7 @@ class TokenizedCorpusWriter:
             for locus_id, prior_split in cursor.fetchall():
                 batch_split = batch_entries[locus_id][3]
                 if prior_split != batch_split:
-                    raise SplitLeakageError(
-                        f"Locus {locus_id} is assigned to multiple splits"
-                    )
+                    raise SplitLeakageError(f"Locus {locus_id} is assigned to multiple splits")
         conn.executemany(
             "INSERT OR IGNORE INTO locus_entries "
             "(locus_id, contig, block_start, block_end, split) "
@@ -1427,10 +1453,7 @@ class TokenizedCorpusWriter:
         for partition_key in sorted(partitioned):
             split, contig, block_id = partition_key
             partition_dir = (
-                self._output_path
-                / f"split={split}"
-                / f"contig={contig}"
-                / f"block_id={block_id}"
+                self._output_path / f"split={split}" / f"contig={contig}" / f"block_id={block_id}"
             )
             partition_dir.mkdir(parents=True, exist_ok=True)
             partition_records = partitioned[partition_key]
@@ -1439,10 +1462,11 @@ class TokenizedCorpusWriter:
                 range(0, len(partition_records), row_group_size)
             ):
                 chunk = partition_records[chunk_start : chunk_start + row_group_size]
-                # TRADE-OFF: filename scheme bumped from part-NNNNN.parquet to part-NNNNN-NNNNN.parquet (batch+chunk); consumers iterate via metadata.json 'files' listing rather than filename globbing.
+                # TRADE-OFF: filename scheme bumped from part-NNNNN.parquet to
+                # part-NNNNN-NNNNN.parquet (batch+chunk); consumers iterate via
+                # metadata.json 'files' listing rather than filename globbing.
                 file_path = (
-                    partition_dir
-                    / f"part-{self._batch_index:05d}-{chunk_index:05d}.parquet"
+                    partition_dir / f"part-{self._batch_index:05d}-{chunk_index:05d}.parquet"
                 )
                 table = pyarrow.Table.from_pylist(
                     [_export_record(record, contract=self._contract) for record in chunk]
@@ -1570,9 +1594,7 @@ class TokenizedCorpusWriter:
         """
         if not self._output_path.exists():
             return
-        for dirpath, _dirnames, filenames in os.walk(
-            self._output_path, topdown=False
-        ):
+        for dirpath, _dirnames, filenames in os.walk(self._output_path, topdown=False):
             if filenames:
                 continue
             try:
@@ -1608,9 +1630,7 @@ class TokenizedCorpusWriter:
             "FROM locus_entries "
             "ORDER BY contig, block_start, split"
         )
-        count_cursor = self._sqlite_conn.execute(
-            "SELECT COUNT(*) FROM locus_entries"
-        )
+        count_cursor = self._sqlite_conn.execute("SELECT COUNT(*) FROM locus_entries")
         total_rows = count_cursor.fetchone()[0]
 
         metadata_path = self._output_path / "metadata.json"
@@ -1620,13 +1640,9 @@ class TokenizedCorpusWriter:
             for idx, key in enumerate(top_level_keys):
                 trailing_comma = "," if idx < last_index else ""
                 if key == "split_manifest":
-                    self._stream_split_manifest(
-                        handle, cursor, total_rows, trailing_comma
-                    )
+                    self._stream_split_manifest(handle, cursor, total_rows, trailing_comma)
                 else:
-                    value_blob = json.dumps(
-                        head_fields[key], indent=2, sort_keys=True
-                    )
+                    value_blob = json.dumps(head_fields[key], indent=2, sort_keys=True)
                     value_lines = value_blob.splitlines()
                     handle.write(f'  "{key}": {value_lines[0]}')
                     for continuation in value_lines[1:]:
@@ -1690,9 +1706,7 @@ class TokenizedCorpusWriter:
         metadata_provenance = self._resolve_final_provenance()
         return {
             "access_pattern": self._contract.access_pattern,
-            "deterministic_partition_keys": list(
-                self._contract.deterministic_partition_keys
-            ),
+            "deterministic_partition_keys": list(self._contract.deterministic_partition_keys),
             "export_format": self._contract.format,
             "preserve_coordinates": self._contract.preserve_coordinates,
             "preserve_raw_windows": self._contract.preserve_raw_windows,
@@ -1702,9 +1716,7 @@ class TokenizedCorpusWriter:
             "splits": {
                 split: {
                     "record_count": self._split_record_counts[split],
-                    "files": sorted(
-                        str(path.relative_to(self._output_path)) for path in paths
-                    ),
+                    "files": sorted(str(path.relative_to(self._output_path)) for path in paths),
                 }
                 for split, paths in sorted(self._split_paths.items())
             },
@@ -1737,9 +1749,7 @@ class TokenizedCorpusWriter:
                 "Tokenized export metadata requires explicit tokenizer provenance "
                 "when no tokenized windows are available"
             )
-        _assert_approved_dnabert2_trust_policy(
-            self._explicit_provenance.trust_remote_code
-        )
+        _assert_approved_dnabert2_trust_policy(self._explicit_provenance.trust_remote_code)
         return self._explicit_provenance
 
 
@@ -1889,7 +1899,9 @@ def write_webdataset_shards(
         },
         "split_manifest": [asdict(entry) for entry in manifest],
     }
-    (output_path / "metadata.json").write_text(json.dumps(metadata, indent=2, sort_keys=True), encoding="utf-8")
+    (output_path / "metadata.json").write_text(
+        json.dumps(metadata, indent=2, sort_keys=True), encoding="utf-8"
+    )
     return {split: paths for split, paths in shard_paths.items()}
 
 

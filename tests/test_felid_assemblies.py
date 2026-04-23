@@ -9,9 +9,9 @@ in the pinned registry before any real download is attempted.
 
 from __future__ import annotations
 
+import re
 from dataclasses import replace
 from pathlib import Path
-import re
 
 import pytest
 
@@ -21,7 +21,6 @@ from jaguar_geo_assign.data.felid_assemblies import (
     build_felid_reference_manifest,
     build_refseq_fasta_url,
 )
-
 
 _EXPECTED_SPECIES = {
     "Felis catus",
@@ -109,7 +108,11 @@ def test_manifest_honours_checksum_override(tmp_path: Path) -> None:
     manifest = build_felid_reference_manifest(
         tmp_path, checksum_override={target.accession: override_hash}
     )
-    overridden = [a for a in manifest if a.url.endswith(f"{target.accession}_{target.assembly_name}_genomic.fna.gz")]
+    overridden = [
+        a
+        for a in manifest
+        if a.url.endswith(f"{target.accession}_{target.assembly_name}_genomic.fna.gz")
+    ]
     assert len(overridden) == 1
     assert overridden[0].checksum == override_hash
 
@@ -119,4 +122,3 @@ def test_manifest_rejects_empty_checksum_clone(tmp_path: Path) -> None:
     bad_clone = replace(APPROVED_FELID_ASSEMBLIES[0], expected_md5="")
     with pytest.raises(AssertionError):
         build_felid_reference_manifest(tmp_path, assemblies=(bad_clone,))
-

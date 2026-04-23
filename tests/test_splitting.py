@@ -11,8 +11,8 @@ model-evaluation metrics.
 import pytest
 
 from jaguar_geo_assign.data.preprocessor import (
-    PreprocessingConfig,
     PreparedSequence,
+    PreprocessingConfig,
     SplitLeakageError,
     WindowRecord,
     assert_split_safety,
@@ -22,7 +22,8 @@ from jaguar_geo_assign.data.preprocessor import (
 
 
 def test_window_sequences_reuse_global_locus_split_across_individuals_and_references() -> None:
-    """All windows covering the same locus block share one split across individuals and approved references.
+    """All windows covering the same locus block share one split across individuals and approved
+    references.
 
     The approved emitted producer source set is exactly
     ``{"consensus", "reference"}``; this regression covers the direct-entry

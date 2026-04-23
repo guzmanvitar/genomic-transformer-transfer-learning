@@ -69,4 +69,3 @@ sequence_hash_algorithm = "sha256"
 
 [runtime]
 external_tools = []
-

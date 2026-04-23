@@ -11,12 +11,10 @@ FASTAs and fake tokenizers.
 
 from __future__ import annotations
 
-import gzip
 import hashlib
 import json
 from pathlib import Path
 from unittest.mock import MagicMock
-from urllib.error import URLError
 
 import pytest
 
@@ -30,16 +28,11 @@ from jaguar_geo_assign.pretrain import (
     run_felid_foundation_pretrain,
 )
 from jaguar_geo_assign.pretrain._shared import normalize_ru_maxrss_to_bytes
-from tests._felid_fixture import (
-    ALL_APPROVED_FELIDS as _ALL_APPROVED_FELIDS,
-    build_fixture_fasta as _build_fixture_fasta,
-    load_example_config_dict,
-    pad_species_to_full_roster as _pad_to_six_species,
-    placeholder_fasta_filename as _placeholder_fasta_filename,
-    placeholder_fasta_md5 as _placeholder_fasta_md5,
-    render_example_config,
-    write_placeholder_fastas as _write_placeholder_fastas,
-)
+from tests._felid_fixture import build_fixture_fasta as _build_fixture_fasta
+from tests._felid_fixture import load_example_config_dict, render_example_config
+from tests._felid_fixture import pad_species_to_full_roster as _pad_to_six_species
+from tests._felid_fixture import placeholder_fasta_md5 as _placeholder_fasta_md5
+from tests._felid_fixture import write_placeholder_fastas as _write_placeholder_fastas
 
 
 def test_species_slug_derivation():
@@ -147,9 +140,7 @@ def _build_fixture_config(
     final_species = _pad_to_six_species(species_subset) if pad else list(species_subset)
     if write_placeholder_fastas and pad:
         explicit_accessions = {acc for _, acc in species_subset}
-        padded_only = [
-            acc for _, acc in final_species if acc not in explicit_accessions
-        ]
+        padded_only = [acc for _, acc in final_species if acc not in explicit_accessions]
         _write_placeholder_fastas(tmp_path / "reference", padded_only)
     overrides: dict[str, object] = {
         "windowing.context_window": 510,
@@ -295,7 +286,7 @@ def test_run_pretrain_source_is_reference(tmp_path):
         writer.write_batch = capture_batch
         return writer
 
-    result = run_felid_foundation_pretrain(
+    run_felid_foundation_pretrain(
         config_path,
         tokenizer_loader=fake_tokenizer_loader,
         export_writer=fake_export_writer,
@@ -344,7 +335,7 @@ def test_run_pretrain_individual_id_is_species_slug(tmp_path):
         writer.write_batch = capture_batch
         return writer
 
-    result = run_felid_foundation_pretrain(
+    run_felid_foundation_pretrain(
         config_path,
         tokenizer_loader=fake_tokenizer_loader,
         export_writer=fake_export_writer,
@@ -547,7 +538,7 @@ def test_run_summary_schema_exact_keys(tmp_path):
     }
 
     # per_species entry keys
-    for species_slug, species_data in summary["per_species"].items():
+    for _species_slug, species_data in summary["per_species"].items():
         assert set(species_data.keys()) == {
             "accession",
             "assembly_name",
@@ -602,7 +593,7 @@ def test_ambiguity_threshold_boundary_retained(tmp_path):
         writer.write_batch = capture_batch
         return writer
 
-    result = run_felid_foundation_pretrain(
+    run_felid_foundation_pretrain(
         config_path,
         tokenizer_loader=fake_tokenizer_loader,
         export_writer=fake_export_writer,
@@ -639,7 +630,9 @@ def test_acquisition_happy_path_skip(tmp_path):
 
     from unittest.mock import patch
 
-    with patch("jaguar_geo_assign.data.felid_acquisition.build_felid_reference_manifest") as mock_manifest:
+    with patch(
+        "jaguar_geo_assign.data.felid_acquisition.build_felid_reference_manifest"
+    ) as mock_manifest:
         mock_manifest.return_value = _build_full_mock_manifest(
             reference_dir,
             overrides={"GCF_000181335.3": computed_md5},
@@ -678,9 +671,11 @@ def test_acquisition_checksum_mismatch_redownload(tmp_path):
     correct_content = _build_fixture_fasta({"NC_test": "A" * 100})
     correct_md5 = hashlib.md5(correct_content).hexdigest()
 
-    from unittest.mock import patch, MagicMock
+    from unittest.mock import patch
 
-    with patch("jaguar_geo_assign.data.felid_acquisition.build_felid_reference_manifest") as mock_manifest:
+    with patch(
+        "jaguar_geo_assign.data.felid_acquisition.build_felid_reference_manifest"
+    ) as mock_manifest:
         mock_manifest.return_value = _build_full_mock_manifest(
             reference_dir,
             overrides={"GCF_000181335.3": correct_md5},
@@ -723,11 +718,15 @@ def test_acquisition_failure_preserves_root_cause(tmp_path):
     from jaguar_geo_assign.data.felid_assemblies import APPROVED_FELID_ASSEMBLIES
 
     felis_assembly = next(a for a in APPROVED_FELID_ASSEMBLIES if a.accession == "GCF_000181335.3")
-    fasta_path = reference_dir / f"{felis_assembly.accession}_{felis_assembly.assembly_name}.fna.gz"
+    _fasta_path = (
+        reference_dir / f"{felis_assembly.accession}_{felis_assembly.assembly_name}.fna.gz"
+    )
 
     from unittest.mock import patch
 
-    with patch("jaguar_geo_assign.data.felid_acquisition.build_felid_reference_manifest") as mock_manifest:
+    with patch(
+        "jaguar_geo_assign.data.felid_acquisition.build_felid_reference_manifest"
+    ) as mock_manifest:
         # Full six-species manifest; Felis catus (explicit, no on-disk
         # file) is iterated first, so the download attempt fires before
         # padded-species skips matter.
@@ -758,4 +757,3 @@ def test_acquisition_failure_preserves_root_cause(tmp_path):
             assert "ConnectionResetError" in error_message
             assert "kaboom" in error_message
             assert "GCF_000181335.3" in error_message
-

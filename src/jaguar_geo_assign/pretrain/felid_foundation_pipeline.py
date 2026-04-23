@@ -19,15 +19,13 @@ import json
 import logging
 import resource
 import sys
+from collections.abc import Callable, Iterable
 from contextlib import AbstractContextManager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Iterable, Protocol
+from typing import Any, Protocol
 
-from ..config import (
-    FelidSpeciesEntry,
-    load_felid_foundation_pipeline_config,
-)
+from ..config import FelidSpeciesEntry, load_felid_foundation_pipeline_config
 from ..data.preprocessor import (
     SequenceRecord,
     TokenizedCorpusWriter,
@@ -179,9 +177,7 @@ class FelidFoundationPretrainRunResult:
     artifacts: FelidFoundationPretrainArtifacts
 
 
-def _resolve_fasta_path(
-    reference_dir: Path, entry: FelidSpeciesEntry
-) -> Path:
+def _resolve_fasta_path(reference_dir: Path, entry: FelidSpeciesEntry) -> Path:
     """Derive the canonical ``<ACC>_<ASM>.fna.gz`` path for a species.
 
     The per-species filename is deterministic from the registry
@@ -320,9 +316,7 @@ def _run_single_species(
     report = prepare_sequences(species_records, preprocessing_config)
     filter_reason_counts: dict[str, int] = {}
     for filtered in report.filtered:
-        filter_reason_counts[filtered.reason] = (
-            filter_reason_counts.get(filtered.reason, 0) + 1
-        )
+        filter_reason_counts[filtered.reason] = filter_reason_counts.get(filtered.reason, 0) + 1
     for reason, count in sorted(filter_reason_counts.items()):
         _LOGGER.debug(
             "filter_reason species=%s reason=%s count=%d",
@@ -341,9 +335,7 @@ def _run_single_species(
     # TRADE-OFF: counts characters not bytes; all inputs are ASCII DNA so char == byte in practice.
     bytes_tokenized = sum(len(prepared.sequence) for prepared in report.retained)
     windows = (
-        window_sequences(list(report.retained), preprocessing_config)
-        if report.retained
-        else ()
+        window_sequences(list(report.retained), preprocessing_config) if report.retained else ()
     )
     _LOGGER.info(
         "windows_generated species=%s accession=%s windows=%d",
@@ -352,9 +344,7 @@ def _run_single_species(
         len(windows),
     )
 
-    species_windows = (
-        tokenize_windows(windows, tokenizer, provenance=provenance) if windows else ()
-    )
+    species_windows = tokenize_windows(windows, tokenizer, provenance=provenance) if windows else ()
     species_windows = tuple(species_windows)
     _LOGGER.info(
         "windows_tokenized species=%s accession=%s tokens=%d",
@@ -544,8 +534,7 @@ def run_felid_foundation_pretrain(
     )
 
     species_tuple = tuple(
-        (stats.species_slug, stats.accession, stats.assembly_name)
-        for stats in per_species_stats
+        (stats.species_slug, stats.accession, stats.assembly_name) for stats in per_species_stats
     )
     return FelidFoundationPretrainRunResult(
         config_name=config.name,

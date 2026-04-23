@@ -9,9 +9,9 @@ per-split purity, sequence hashes, and tokenizer metadata needed to
 reproduce or re-tokenize a corpus.
 """
 
-from dataclasses import replace
 import json
 import tarfile
+from dataclasses import replace
 
 import pytest
 
@@ -21,9 +21,9 @@ from jaguar_geo_assign.data.preprocessor import (
     DNABERT2_TOKENIZER_REVISION,
     ExportContract,
     ExportContractError,
+    TokenizedWindow,
     TokenizerContractError,
     TokenizerProvenance,
-    TokenizedWindow,
     WindowRecord,
     tokenize_windows,
     write_tokenized_dataset,
@@ -127,7 +127,10 @@ def test_tokenize_windows_enforces_max_position_embeddings() -> None:
     """Reject windows that tokenize past ``max_position_embeddings`` with a diagnosable error."""
     window = _window()
 
-    with pytest.raises(TokenizerContractError, match="Retained genomic window tokenized beyond max_position_embeddings") as exc_info:
+    with pytest.raises(
+        TokenizerContractError,
+        match="Retained genomic window tokenized beyond max_position_embeddings",
+    ) as exc_info:
         tokenize_windows((window,), TooLongTokenizer())
 
     message = str(exc_info.value)
@@ -142,7 +145,8 @@ def test_tokenize_windows_enforces_max_position_embeddings() -> None:
 
 
 def test_tokenize_windows_fail_fast_instead_of_silently_skipping_over_length_window() -> None:
-    """Guard that a later over-length window aborts the whole batch rather than being silently dropped."""
+    """Guard that a later over-length window aborts the whole batch rather than being silently
+    dropped."""
     retained_window = _window(sequence="ACGT", sequence_hash="retained")
     offending_window = replace(
         _window(sequence="AACCGG", sequence_hash="offending"),
@@ -185,6 +189,7 @@ def test_write_tokenized_dataset_requires_pyarrow_for_parquet(
     tmp_path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Surface an actionable install hint when Parquet export is requested without pyarrow."""
+
     def missing_backend() -> None:
         raise ExportContractError("Parquet export requires pyarrow. Install with: uv add pyarrow")
 
@@ -389,7 +394,9 @@ def test_write_webdataset_shards_default_sizing_stays_split_pure(tmp_path) -> No
 def test_write_webdataset_shards_oversize_shard_request_stays_within_split(tmp_path) -> None:
     """Check that a ``records_per_shard`` larger than a split still emits one shard per split."""
     tokenized = (
-        _tokenized_window(sample_id="train-1", individual_id="cat-train-1", split="train", sequence_hash="train-1"),
+        _tokenized_window(
+            sample_id="train-1", individual_id="cat-train-1", split="train", sequence_hash="train-1"
+        ),
         _tokenized_window(
             sample_id="train-2",
             individual_id="cat-train-2",
@@ -422,7 +429,9 @@ def test_write_webdataset_shards_oversize_shard_request_stays_within_split(tmp_p
 def test_write_webdataset_shards_does_not_bridge_train_validation_boundary(tmp_path) -> None:
     """Guard against a full train shard spilling validation records into the same tarball."""
     tokenized = (
-        _tokenized_window(sample_id="train-1", individual_id="cat-train-1", split="train", sequence_hash="train-1"),
+        _tokenized_window(
+            sample_id="train-1", individual_id="cat-train-1", split="train", sequence_hash="train-1"
+        ),
         _tokenized_window(
             sample_id="validation-1",
             individual_id="cat-validation-1",
@@ -448,7 +457,10 @@ def test_write_webdataset_shards_does_not_bridge_train_validation_boundary(tmp_p
 
     assert [path.name for path in shard_paths["train"]] == ["train-00000.tar"]
     assert [path.name for path in shard_paths["validation"]] == ["validation-00000.tar"]
-    assert {record["window"]["split"] for record in _read_webdataset_records(shard_paths["train"][0])} == {"train"}
     assert {
-        record["window"]["split"] for record in _read_webdataset_records(shard_paths["validation"][0])
+        record["window"]["split"] for record in _read_webdataset_records(shard_paths["train"][0])
+    } == {"train"}
+    assert {
+        record["window"]["split"]
+        for record in _read_webdataset_records(shard_paths["validation"][0])
     } == {"validation"}

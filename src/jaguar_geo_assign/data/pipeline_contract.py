@@ -10,8 +10,8 @@ model training.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 import shutil
+from dataclasses import dataclass
 
 # Data-provenance contracts
 
@@ -69,7 +69,7 @@ REQUIRED_SAMPLE_MANIFEST_FIELDS = ("sample_id", "individual_id", "vcf_path")
 # O(1) membership check and makes drift visible in PR diffs: adding a species
 # requires updating both the registry and this frozenset, exactly like the
 # feline BioProject pinning above.
-from .felid_assemblies import APPROVED_FELID_ASSEMBLIES as _APPROVED_FELID_ASSEMBLIES
+from .felid_assemblies import APPROVED_FELID_ASSEMBLIES as _APPROVED_FELID_ASSEMBLIES  # noqa: E402
 
 APPROVED_FELID_ACCESSIONS: frozenset[str] = frozenset(
     assembly.accession for assembly in _APPROVED_FELID_ASSEMBLIES

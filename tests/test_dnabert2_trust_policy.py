@@ -9,7 +9,6 @@ implicit conversions.
 """
 
 from dataclasses import replace
-import sys
 from types import SimpleNamespace
 
 import pytest
@@ -27,7 +26,8 @@ from jaguar_geo_assign.pretrain import pipeline as pretrain_pipeline
 def test_load_dnabert2_tokenizer_uses_explicit_trust_remote_code_policy(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The loader forwards the pinned identifier, revision, and trust_remote_code flag to transformers."""
+    """The loader forwards the pinned identifier, revision, and trust_remote_code flag to
+    transformers."""
     captured: dict[str, object] = {}
     fake_tokenizer = object()
 
@@ -43,9 +43,7 @@ def test_load_dnabert2_tokenizer_uses_explicit_trust_remote_code_policy(
             )
             return fake_tokenizer
 
-    monkeypatch.setattr(
-        "jaguar_geo_assign.data.preprocessor.AutoTokenizer", FakeAutoTokenizer
-    )
+    monkeypatch.setattr("jaguar_geo_assign.data.preprocessor.AutoTokenizer", FakeAutoTokenizer)
 
     tokenizer, provenance = load_dnabert2_tokenizer(DNABERT2_TOKENIZER_PROVENANCE)
 
@@ -59,7 +57,8 @@ def test_load_dnabert2_tokenizer_uses_explicit_trust_remote_code_policy(
 
 
 def test_load_dnabert2_tokenizer_rejects_unapproved_trust_remote_code_policy() -> None:
-    """Attempting to load with a policy that diverges from the approved constant raises TokenizerContractError."""
+    """Attempting to load with a policy that diverges from the approved constant raises
+    TokenizerContractError."""
     with pytest.raises(TokenizerContractError, match="trust_remote_code policy mismatch"):
         load_dnabert2_tokenizer(
             replace(
@@ -76,7 +75,8 @@ def test_load_dnabert2_tokenizer_rejects_unapproved_trust_remote_code_policy() -
 def test_tokenizer_provenance_requires_boolean_trust_remote_code(
     invalid_value: object, expected_fragment: str
 ) -> None:
-    """Non-bool trust_remote_code values are rejected at provenance construction with a typed error message."""
+    """Non-bool trust_remote_code values are rejected at provenance construction with a typed
+    error message."""
     with pytest.raises(ValueError, match="actual boolean") as exc_info:
         replace(DNABERT2_TOKENIZER_PROVENANCE, trust_remote_code=invalid_value)
 
@@ -84,7 +84,8 @@ def test_tokenizer_provenance_requires_boolean_trust_remote_code(
 
 
 def test_assert_tokenizer_matches_config_rejects_trust_remote_code_mismatch() -> None:
-    """Pretrain config and tokenizer provenance must agree on trust_remote_code or startup aborts."""
+    """Pretrain config and tokenizer provenance must agree on trust_remote_code or startup
+    aborts."""
     config = load_feline_pipeline_config("configs/examples/feline_pretrain.toml")
 
     with pytest.raises(RuntimeError, match="trust_remote_code"):
@@ -100,7 +101,8 @@ def test_assert_tokenizer_matches_config_rejects_trust_remote_code_mismatch() ->
 
 
 def test_assert_tokenizer_matches_config_rejects_non_boolean_trust_remote_code() -> None:
-    """Non-bool trust_remote_code on the tokenizer object is rejected by the pipeline guard with type context."""
+    """Non-bool trust_remote_code on the tokenizer object is rejected by the pipeline guard with
+    type context."""
     config = load_feline_pipeline_config("configs/examples/feline_pretrain.toml")
 
     with pytest.raises(RuntimeError, match="actual boolean") as exc_info:
