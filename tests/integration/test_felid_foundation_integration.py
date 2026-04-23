@@ -51,14 +51,12 @@ def test_felid_foundation_integration_panthera_tigris():
     pinned_accession = "GCF_000464555.1"
     pinned_assembly = "PanTig1.0"
     pinned_species_slug = "panthera_tigris"
-    # TRADE-OFF (Greptile #3, char-vs-byte): ``max_decompressed_bytes`` is a
+    # TRADE-OFF: ``max_decompressed_bytes`` is a
     # byte count applied via a ``bytes`` slice below. FASTA bytes are ASCII
     # (1 byte per char) so the byte-level truncation is semantically
     # equivalent to a char-level truncation here, but the naming/semantics
     # gap is real for any caller who generalises this fixture to non-ASCII
-    # payloads. Deferred: kept explicit because the pinned FASTA is strictly
-    # ASCII and the integration test is not the right place to audit a
-    # general char/byte policy.
+    # payloads.
     max_decompressed_bytes = 5_000_000
 
     with tempfile.TemporaryDirectory() as tmp_dir_str:

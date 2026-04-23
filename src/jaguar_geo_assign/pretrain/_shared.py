@@ -3,18 +3,7 @@
 The consensus (feline) pretraining pipeline and the felid-foundation
 pretraining pipeline both load a typed pipeline config, map it to
 preprocessor/tokenizer contracts, resolve filesystem paths, and run
-the prepare → window → tokenize cascade. Before this module existed
-those helpers lived exclusively in ``pretrain/pipeline.py`` and the
-new felid pipeline would have had to either duplicate them (drift
-risk) or import private symbols from a sibling pipeline module
-(tight coupling).
-
-Moving the truly shared helpers here gives both pipelines a single
-source of truth. ``pretrain/pipeline.py`` re-imports every moved
-symbol at its own module scope so that existing tests which patch
-``jaguar_geo_assign.pretrain.pipeline.<helper>`` via
-``monkeypatch.setattr`` continue to work unchanged — the re-import
-is the explicit test-seam preservation called out in the task DoD.
+the prepare → window → tokenize cascade.
 """
 
 from __future__ import annotations
