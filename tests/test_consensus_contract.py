@@ -1,7 +1,7 @@
 """Contract tests for the VCF→FASTA consensus generation pipeline.
 
 These tests pin down the data integrity guarantees of
-``jaguar_geo_assign.data.acquisition.generate_consensus_fasta`` and its
+``jaguar_geo_assign.data.consensus.generate_consensus_fasta`` and its
 site-level classifier. They protect the invariants that make downstream
 genomic training safe: homozygous-reference calls preserve the reference,
 unsupported or ambiguous calls are masked with ``N`` rather than silently
@@ -19,8 +19,8 @@ import textwrap
 
 import pytest
 
-from jaguar_geo_assign.data.acquisition import (
-    AcquisitionError,
+from jaguar_geo_assign.data.acquisition import AcquisitionError
+from jaguar_geo_assign.data.consensus import (
     ContigMismatchError,
     MalformedGenotypeError,
     MissingToolError,

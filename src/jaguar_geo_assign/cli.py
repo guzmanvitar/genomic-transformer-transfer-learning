@@ -21,12 +21,21 @@ from typing import Sequence
 from .baselines import BASELINE_EVALUATION_STAGE
 from .config import (
     check_feline_pipeline_runtime,
+    check_felid_foundation_pipeline_runtime,
     describe_experiment,
     describe_feline_pipeline,
+    describe_felid_foundation_config,
     load_experiment_config,
     load_feline_pipeline_config,
+    load_felid_foundation_pipeline_config,
 )
-from .pretrain import format_feline_pretrain_result, run_feline_pretrain_pipeline
+from .pretrain import (
+    acquire_felid_foundation_assemblies,
+    format_feline_pretrain_result,
+    format_felid_foundation_pretrain_result,
+    run_feline_pretrain_pipeline,
+    run_felid_foundation_pretrain,
+)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -42,6 +51,11 @@ def build_parser() -> argparse.ArgumentParser:
     * ``validate-feline-config`` – validate a feline pipeline TOML contract.
     * ``describe-feline-config`` – summarise a feline pipeline TOML contract.
     * ``check-feline-runtime`` – check external runtime dependencies.
+    * ``felid-foundation-pretrain`` – run the felid foundation pretraining pipeline.
+    * ``acquire-felid-foundation-assemblies`` – download felid reference FASTAs.
+    * ``validate-felid-foundation-config`` – validate a felid foundation config.
+    * ``describe-felid-foundation-config`` – summarise a felid foundation config.
+    * ``check-felid-foundation-runtime`` – check felid foundation runtime dependencies.
 
     Returns:
         A fully-configured :class:`argparse.ArgumentParser` ready for
@@ -85,6 +99,38 @@ def build_parser() -> argparse.ArgumentParser:
         help="Check external runtime dependencies for the feline genomics pipeline.",
     )
     runtime.add_argument("config", type=Path)
+
+    # Felid foundation pipeline subcommands
+    felid_pretrain = subparsers.add_parser(
+        "felid-foundation-pretrain",
+        help="Run the multi-species felid foundation pretraining pipeline.",
+    )
+    felid_pretrain.add_argument("config", type=Path, help="Path to the felid foundation pipeline TOML config.")
+
+    felid_acquire = subparsers.add_parser(
+        "acquire-felid-foundation-assemblies",
+        help="Download all six approved felid reference FASTAs with integrity checks.",
+    )
+    felid_acquire.add_argument("config", type=Path, help="Path to the felid foundation pipeline TOML config.")
+
+    felid_validate = subparsers.add_parser(
+        "validate-felid-foundation-config",
+        help="Validate the felid foundation pipeline TOML contract.",
+    )
+    felid_validate.add_argument("config", type=Path)
+
+    felid_describe = subparsers.add_parser(
+        "describe-felid-foundation-config",
+        help="Summarize the felid foundation pipeline TOML contract.",
+    )
+    felid_describe.add_argument("config", type=Path)
+
+    felid_runtime = subparsers.add_parser(
+        "check-felid-foundation-runtime",
+        help="Check external runtime dependencies for the felid foundation pipeline.",
+    )
+    felid_runtime.add_argument("config", type=Path)
+
     return parser
 
 
@@ -152,6 +198,57 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(
             f"Runtime contract satisfied for '{config.name}': "
             f"{', '.join(config.runtime.external_tools)}"
+        )
+        return 0
+
+    if args.command == "felid-foundation-pretrain":
+        try:
+            result = run_felid_foundation_pretrain(args.config)
+        except (RuntimeError, ValueError) as error:
+            print(str(error))
+            return 1
+        print(format_felid_foundation_pretrain_result(result))
+        return 0
+
+    if args.command == "acquire-felid-foundation-assemblies":
+        try:
+            config = load_felid_foundation_pipeline_config(args.config)
+            summary = acquire_felid_foundation_assemblies(config)
+        except (RuntimeError, ValueError) as error:
+            print(str(error))
+            return 1
+        print("Felid foundation assembly acquisition summary:")
+        print(f"  Total bytes written: {summary.total_bytes_written}")
+        print(f"  Skipped (checksum match): {summary.skipped_count}")
+        print(f"  Redownloaded (checksum mismatch): {summary.redownloaded_count}")
+        return 0
+
+    if args.command == "validate-felid-foundation-config":
+        try:
+            config = load_felid_foundation_pipeline_config(args.config)
+        except ValueError as error:
+            print(str(error))
+            return 1
+        print(f"Felid foundation pipeline config '{config.name}' matches the approved contract.")
+        return 0
+
+    if args.command == "describe-felid-foundation-config":
+        try:
+            print(describe_felid_foundation_config(args.config))
+        except ValueError as error:
+            print(str(error))
+            return 1
+        return 0
+
+    if args.command == "check-felid-foundation-runtime":
+        try:
+            config = check_felid_foundation_pipeline_runtime(args.config)
+        except (RuntimeError, ValueError) as error:
+            print(str(error))
+            return 1
+        print(
+            f"Runtime contract satisfied for '{config.name}': "
+            f"{', '.join(config.runtime.external_tools) if config.runtime.external_tools else 'no external tools required'}"
         )
         return 0
 

@@ -13,7 +13,11 @@ from pathlib import Path
 
 import pytest
 
-from jaguar_geo_assign.config import load_experiment_config, load_feline_pipeline_config
+from jaguar_geo_assign.config import (
+    load_experiment_config,
+    load_feline_pipeline_config,
+    load_felid_foundation_pipeline_config,
+)
 from jaguar_geo_assign.data.contracts import JAGUAR_METADATA_FIELDS
 from jaguar_geo_assign.data.pipeline_contract import (
     APPROVED_BIOPROJECT_ACCESSION,
@@ -166,3 +170,134 @@ def test_load_feline_pipeline_config_rejects_non_boolean_consensus_mismatch_guar
         load_feline_pipeline_config(invalid_config)
 
     assert expected_fragment in str(exc_info.value)
+
+
+@pytest.mark.parametrize(
+    ("field_line", "section_field", "original_value"),
+    [
+        ("drop_short_sequences = true", "windowing.drop_short_sequences", "true"),
+        ("preserve_raw_windows = false", "export.preserve_raw_windows", "false"),
+        ("preserve_sequence_hashes = true", "export.preserve_sequence_hashes", "true"),
+        ("preserve_coordinates = true", "export.preserve_coordinates", "true"),
+    ],
+)
+@pytest.mark.parametrize(
+    ("replacement", "expected_fragment"),
+    [("1", "1 (int)"), ('"true"', "'true' (str)"), ("0", "0 (int)")],
+)
+def test_load_feline_pipeline_config_rejects_non_boolean_preservation_flags(
+    tmp_path: Path,
+    field_line: str,
+    section_field: str,
+    original_value: str,
+    replacement: str,
+    expected_fragment: str,
+) -> None:
+    """Windowing/export boolean guards must reject truthy-coercible scalars.
+
+    These flags gate short-sequence dropping and the
+    auditability guarantees of the export format. If Python's
+    ``if value`` coercion let a ``1`` or ``"true"`` stand in for
+    ``True``, a misconfigured TOML could silently disable audit
+    trails. Parametrising across every strictly-validated boolean
+    in the feline export/windowing sections gives us regression
+    coverage for each individual ``_require_boolean_field`` call
+    site without hand-written duplication.
+    """
+    field_name = field_line.split(" = ")[0]
+    invalid_config = tmp_path / f"invalid_{field_name}_{replacement}.toml"
+    invalid_config.write_text(
+        Path("configs/examples/feline_pretrain.toml").read_text(encoding="utf-8").replace(
+            field_line,
+            f"{field_name} = {replacement}",
+            1,
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(
+        ValueError,
+        match=rf"{section_field} must be a TOML boolean true/false",
+    ) as exc_info:
+        load_feline_pipeline_config(invalid_config)
+
+    assert expected_fragment in str(exc_info.value)
+
+
+@pytest.mark.parametrize(
+    ("field_line", "section_field"),
+    [
+        ("drop_short_sequences = true", "windowing.drop_short_sequences"),
+        ("preserve_raw_windows = false", "export.preserve_raw_windows"),
+        ("preserve_sequence_hashes = true", "export.preserve_sequence_hashes"),
+        ("preserve_coordinates = true", "export.preserve_coordinates"),
+    ],
+)
+@pytest.mark.parametrize(
+    ("replacement", "expected_fragment"),
+    [("1", "1 (int)"), ('"true"', "'true' (str)"), ("0", "0 (int)")],
+)
+def test_load_felid_foundation_pipeline_config_rejects_non_boolean_flags(
+    tmp_path: Path,
+    field_line: str,
+    section_field: str,
+    replacement: str,
+    expected_fragment: str,
+) -> None:
+    """Felid foundation loader rejects truthy-coercible scalars on every bool flag.
+
+    The felid foundation pretraining contract shares the same
+    ``_require_boolean_field`` helper as the feline loader, but has
+    its own call sites. Parametrising over each strictly-validated
+    boolean field in ``configs/examples/felid_foundation_pretrain.toml``
+    guards against future regressions where a new boolean gets added
+    to the felid loader without the strict-validation guard, silently
+    letting an integer ``1`` or the string ``"true"`` masquerade as a
+    TOML boolean.
+    """
+    field_name = field_line.split(" = ")[0]
+    invalid_config = tmp_path / f"invalid_felid_{field_name}_{replacement}.toml"
+    invalid_config.write_text(
+        Path("configs/examples/felid_foundation_pretrain.toml")
+        .read_text(encoding="utf-8")
+        .replace(field_line, f"{field_name} = {replacement}", 1),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(
+        ValueError,
+        match=rf"{section_field} must be a TOML boolean true/false",
+    ) as exc_info:
+        load_felid_foundation_pipeline_config(invalid_config)
+
+    assert expected_fragment in str(exc_info.value)
+
+
+@pytest.mark.parametrize("bool_literal", ["true", "false"])
+def test_load_felid_foundation_pipeline_config_accepts_real_booleans(
+    tmp_path: Path, bool_literal: str
+) -> None:
+    """Real TOML booleans on ``drop_short_sequences`` round-trip through the loader.
+
+    The strict-bool guard must still admit the two values a
+    legitimate config can express (``true`` / ``false``) so the
+    validator does not become a trap door for valid configurations.
+    ``drop_short_sequences`` is picked because, unlike
+    ``preserve_coordinates``, it is not gated by a downstream
+    contract-specific equality check, so both ``true`` and ``false``
+    are accepted by the loader.
+    """
+    rebuilt = tmp_path / f"bool_{bool_literal}.toml"
+    rebuilt.write_text(
+        Path("configs/examples/felid_foundation_pretrain.toml")
+        .read_text(encoding="utf-8")
+        .replace(
+            "drop_short_sequences = true",
+            f"drop_short_sequences = {bool_literal}",
+            1,
+        ),
+        encoding="utf-8",
+    )
+
+    config = load_felid_foundation_pipeline_config(rebuilt)
+    assert config.windowing.drop_short_sequences is (bool_literal == "true")

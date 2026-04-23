@@ -12,6 +12,22 @@ genomics transformer project, covering four stages:
    provenance pinning (model ID, revision hash, ``trust_remote_code``).
 4. **Export** — Parquet and WebDataset serialisation with an auditable
    ``ExportContract`` that guarantees coordinate and hash preservation.
+   ``TokenizedCorpusWriter`` is the streaming/append Parquet writer that
+   backs the multi-species felid foundation corpus: callers feed one
+   batch (typically one species's tokenized windows) at a time so peak
+   RAM is bounded by the largest single batch rather than the full
+   corpus. ``write_tokenized_dataset`` is a one-batch convenience
+   wrapper around the same writer used by the consensus pretrain
+   pipeline.
+
+Within-split Parquet ordering
+-----------------------------
+Parquet files under a single ``split=.../contig=.../block_id=.../``
+directory are each internally sorted by ``locus_id``; there is no
+global order across files within a split. Downstream consumers must
+not assume a row-level sort across the Parquet dataset; use
+``split_manifest`` in ``metadata.json`` to recover the split
+assignment of any locus.
 
 Fragility flags
 ---------------
@@ -41,9 +57,13 @@ from dataclasses import asdict, dataclass
 from hashlib import sha256
 from io import BytesIO
 import json
+import os
 from pathlib import Path
+import sqlite3
 import tarfile
 from typing import Any, Protocol
+
+from transformers import AutoTokenizer
 
 from .pipeline_contract import (
     DNABERT2_TOKENIZER_ID,
@@ -804,7 +824,7 @@ APPROVED_SOURCE_LABELS = frozenset({CONSENSUS_SOURCE_LABEL, REFERENCE_SOURCE_LAB
 def _require_approved_source_label(source: str) -> None:
     """Fail loudly on any producer ``source`` label outside the approved set.
 
-    Intent: the approved emitted producer source set is exactly
+    The approved emitted producer source set is exactly
     ``{"consensus", "reference"}``. Any other label must raise before
     downstream filtering or fallback logic can silently swallow it
     (e.g. a short-sequence or high-ambiguity filter would otherwise drop
@@ -1064,17 +1084,8 @@ def load_dnabert2_tokenizer(
     Raises:
         TokenizerContractError: If ``trust_remote_code`` does not match the
             approved pipeline contract value.
-        RuntimeError: If the ``transformers`` package is not installed.
     """
     _assert_approved_dnabert2_trust_policy(provenance.trust_remote_code)
-    try:
-        from transformers import AutoTokenizer
-    except ImportError as exc:  # pragma: no cover - exercised through integration, not unit logic
-        raise RuntimeError(
-            "DNABERT-2 tokenization requires transformers. Install with: "
-            "uv add \"transformers>=4.28,<5\""
-        ) from exc
-
     tokenizer = AutoTokenizer.from_pretrained(
         provenance.identifier,
         revision=provenance.revision,
@@ -1202,6 +1213,536 @@ def tokenize_windows(
     return tuple(tokenized)
 
 
+class TokenizedCorpusWriter:
+    """Streaming/append Parquet writer for multi-batch tokenized corpora.
+
+    The felid foundation corpus spans six multi-gigabase reference assemblies,
+    so full materialisation in one process would OOM even a large VM. Callers
+    feed one batch at a time (typically one species per batch) so peak RAM
+    stays bounded by the largest single batch. Records are sorted by
+    ``locus_id`` within each batch and partitioned by
+    ``(split, contig, block_id)``; multiple Parquet files may coexist under a
+    single partition directory, each internally sorted, with no global order
+    across files.
+
+    Usage:
+        >>> with TokenizedCorpusWriter(output_dir, contract=contract,
+        ...                            provenance=provenance) as writer:
+        ...     for batch in batches:
+        ...         writer.write_batch(batch)
+        >>> writer.split_paths  # {"train": [...], "validation": [...]}
+
+    Lifecycle guarantees:
+        - Per-split Parquet writers are created lazily: no ``split=validation/``
+          file tree is produced if no batch ever contains a validation window.
+        - ``__exit__`` writes the corpus ``metadata.json`` sidecar on clean
+          exit. On an exception bubbling out of the ``with`` block, any Parquet
+          files already written are deleted and no manifest is emitted, so the
+          output directory never contains half-written artifacts that would
+          corrupt a downstream train loader.
+        - ``row_group_size`` from the ``ExportContract`` is honoured **per
+          batch**: each ``write_batch`` call partitions its own records into
+          row-group-sized chunks. The cumulative row count in a single Parquet
+          file never exceeds ``contract.row_group_size``.
+
+    Thread-safety:
+        Not thread-safe. A single writer instance must be driven by a single
+        producer. Multi-process writers are out of scope.
+    """
+
+    def __init__(
+        self,
+        output_dir: str | Path,
+        *,
+        contract: ExportContract = DEFAULT_PARQUET_EXPORT_CONTRACT,
+        provenance: TokenizerProvenance | None = None,
+    ) -> None:
+        """Initialise a streaming Parquet writer (no I/O until ``__enter__``).
+
+        Args:
+            output_dir: Root directory for the Parquet dataset. Created on
+                ``__enter__`` if it does not already exist.
+            contract: Export settings governing format, partitioning, and
+                preservation flags.
+            provenance: Optional explicit tokenizer provenance. Required if
+                the corpus ends up empty (no batches written); otherwise
+                inferred from the first non-empty batch and validated for
+                consistency across subsequent batches.
+        """
+        self._output_path = Path(output_dir)
+        self._contract = contract
+        self._explicit_provenance = provenance
+        self._resolved_provenance: TokenizerProvenance | None = None
+        self._batch_index = 0
+        self._written_files: list[Path] = []
+        self._split_paths: dict[str, list[Path]] = defaultdict(list)
+        self._split_record_counts: dict[str, int] = defaultdict(int)
+        self._sqlite_path: Path | None = None
+        self._sqlite_conn: sqlite3.Connection | None = None
+        self._parquet_backend: tuple[Any, Any] | None = None
+        self._opened = False
+        self._closed = False
+
+    def __enter__(self) -> "TokenizedCorpusWriter":
+        """Validate the contract, create the output directory, open the writer.
+
+        The locus manifest is stored in a SQLite sidecar at
+        ``{output_dir}/.locus_manifest.sqlite`` rather than an in-memory
+        dict, preventing the previous O(total-windows) Python heap
+        pressure (~2–4 GB on the full felid corpus) that contradicted
+        the "peak RAM ≈ O(largest single species)" spec claim. The
+        sidecar is scratch: it is created here and removed unconditionally
+        by ``__exit__`` so it never appears in the deliverable tree.
+        """
+        if self._contract.format != "parquet":
+            raise ExportContractError(
+                "TokenizedCorpusWriter only supports parquet contracts; "
+                "use write_webdataset_shards for webdataset exports"
+            )
+        self._output_path.mkdir(parents=True, exist_ok=True)
+        sidecar_path = self._output_path / ".locus_manifest.sqlite"
+        if sidecar_path.exists():
+            sidecar_path.unlink()
+        self._sqlite_path = sidecar_path
+        self._sqlite_conn = sqlite3.connect(sidecar_path)
+        self._sqlite_conn.execute(
+            "CREATE TABLE locus_entries ("
+            "locus_id TEXT PRIMARY KEY, "
+            "contig TEXT NOT NULL, "
+            "block_start INTEGER NOT NULL, "
+            "block_end INTEGER NOT NULL, "
+            "split TEXT NOT NULL)"
+        )
+        self._sqlite_conn.commit()
+        self._opened = True
+        return self
+
+    def write_batch(self, tokenized_windows: Any) -> None:
+        """Append one batch of tokenized windows to the corpus.
+
+        The batch is sorted by ``locus_id`` (then by the stable tie-breaker
+        ``(contig, block_start, window_start, sample_id, source)``),
+        partitioned by ``(split, contig, block_id)``, and chunked into
+        row-groups of at most ``contract.row_group_size`` records. Each
+        chunk is written to its own Parquet file named
+        ``part-{batch_index:05d}-{chunk_index:05d}.parquet`` under the
+        partition directory.
+
+        Empty batches are accepted (they just advance the batch counter)
+        so a pipeline that iterates over species can safely write an
+        empty result for a species that yielded no tokens without
+        special-casing at the call site.
+
+        Args:
+            tokenized_windows: Records to append. An empty sequence is a
+                no-op beyond advancing the batch counter.
+
+        Raises:
+            ExportContractError: If the writer is not inside a
+                ``with`` block, if a later batch carries a different
+                tokenizer provenance than the first non-empty batch, or
+                if PyArrow is not installed.
+            SplitLeakageError: If a ``locus_id`` already seen in a prior
+                batch is now assigned to a different split.
+        """
+        if not self._opened or self._closed:
+            raise ExportContractError(
+                "TokenizedCorpusWriter.write_batch must be called inside a with-block"
+            )
+        batch = tuple(tokenized_windows)
+        if not batch:
+            self._batch_index += 1
+            return
+
+        batch_provenance = _resolve_export_tokenizer_provenance(
+            batch,
+            provenance=self._explicit_provenance,
+        )
+        if self._resolved_provenance is None:
+            self._resolved_provenance = batch_provenance
+        elif batch_provenance != self._resolved_provenance:
+            raise ExportContractError(
+                "TokenizedCorpusWriter batches must share identical tokenizer provenance"
+            )
+
+        sorted_batch = sorted(
+            batch,
+            key=lambda item: (
+                item.window.locus_id,
+                item.window.contig,
+                item.window.block_start,
+                item.window.window_start,
+                item.window.sample_id,
+                item.window.source,
+            ),
+        )
+
+        batch_entries: dict[str, tuple[str, int, int, str]] = {}
+        for record in sorted_batch:
+            window = record.window
+            row = (window.contig, window.block_start, window.block_end, window.split)
+            existing = batch_entries.get(window.locus_id)
+            if existing is not None and existing[3] != window.split:
+                raise SplitLeakageError(
+                    f"Locus {window.locus_id} is assigned to multiple splits"
+                )
+            batch_entries[window.locus_id] = row
+
+        assert self._sqlite_conn is not None
+        conn = self._sqlite_conn
+        locus_ids = list(batch_entries.keys())
+        chunk_size = 500
+        for start in range(0, len(locus_ids), chunk_size):
+            chunk = locus_ids[start : start + chunk_size]
+            placeholders = ",".join("?" * len(chunk))
+            cursor = conn.execute(
+                f"SELECT locus_id, split FROM locus_entries WHERE locus_id IN ({placeholders})",
+                chunk,
+            )
+            for locus_id, prior_split in cursor.fetchall():
+                batch_split = batch_entries[locus_id][3]
+                if prior_split != batch_split:
+                    raise SplitLeakageError(
+                        f"Locus {locus_id} is assigned to multiple splits"
+                    )
+        conn.executemany(
+            "INSERT OR IGNORE INTO locus_entries "
+            "(locus_id, contig, block_start, block_end, split) "
+            "VALUES (?, ?, ?, ?, ?)",
+            [
+                (locus_id, contig, block_start, block_end, split)
+                for locus_id, (contig, block_start, block_end, split) in batch_entries.items()
+            ],
+        )
+        conn.commit()
+
+        partitioned: dict[tuple[str, str, str], list[TokenizedWindow]] = defaultdict(list)
+        for record in sorted_batch:
+            partitioned[_partition_tuple(record.window)].append(record)
+
+        if self._parquet_backend is None:
+            self._parquet_backend = _load_pyarrow_parquet()
+        pyarrow, pyarrow_parquet = self._parquet_backend
+
+        for partition_key in sorted(partitioned):
+            split, contig, block_id = partition_key
+            partition_dir = (
+                self._output_path
+                / f"split={split}"
+                / f"contig={contig}"
+                / f"block_id={block_id}"
+            )
+            partition_dir.mkdir(parents=True, exist_ok=True)
+            partition_records = partitioned[partition_key]
+            row_group_size = self._contract.row_group_size
+            for chunk_index, chunk_start in enumerate(
+                range(0, len(partition_records), row_group_size)
+            ):
+                chunk = partition_records[chunk_start : chunk_start + row_group_size]
+                # TRADE-OFF: filename scheme bumped from part-NNNNN.parquet to part-NNNNN-NNNNN.parquet (batch+chunk); consumers iterate via metadata.json 'files' listing rather than filename globbing.
+                file_path = (
+                    partition_dir
+                    / f"part-{self._batch_index:05d}-{chunk_index:05d}.parquet"
+                )
+                table = pyarrow.Table.from_pylist(
+                    [_export_record(record, contract=self._contract) for record in chunk]
+                )
+                pyarrow_parquet.write_table(
+                    table,
+                    file_path,
+                    row_group_size=row_group_size,
+                )
+                self._written_files.append(file_path)
+                self._split_paths[split].append(file_path)
+                self._split_record_counts[split] += len(chunk)
+
+        self._batch_index += 1
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_val: BaseException | None,
+        exc_tb: Any,
+    ) -> None:
+        """Flush and close the writer.
+
+        On a clean close (no exception in the ``with`` block), emit the
+        corpus ``metadata.json`` sidecar by streaming ``split_manifest``
+        rows from the SQLite sidecar ordered by
+        ``(contig, block_start, split)``. On an exception, delete any
+        Parquet files that were already written during this session,
+        then conservatively prune any empty partition subdirectories
+        and the output root itself so a failed run leaves no "phantom"
+        corpus tree for downstream autodiscovery tooling to pick up.
+        Directories that still contain files (including any artefacts
+        the writer did not create) are left intact — pruning relies on
+        ``os.rmdir`` semantics, which refuse non-empty directories.
+
+        The SQLite sidecar is unconditionally closed and deleted on
+        every exit path (success, internal failure, caller exception)
+        so it never leaks into the deliverable tree.
+
+        Args:
+            exc_type: Type of the propagating exception, or ``None``.
+            exc_val: Value of the propagating exception, or ``None``.
+            exc_tb: Traceback of the propagating exception, or ``None``.
+        """
+        self._closed = True
+        metadata_write_failed = False
+        try:
+            if exc_type is not None:
+                self._cleanup_written_parquet_files()
+                return None
+            try:
+                self._write_metadata_json()
+            except BaseException:
+                # A failure inside ``_write_metadata_json`` leaves
+                # Parquet files on disk with no accompanying manifest. That
+                # state is worse than a clean rollback because downstream
+                # autodiscovery tooling treats any tree with ``*.parquet``
+                # files as a usable corpus. Mirror the caller-exception
+                # branch (unlink Parquet files + prune empty dirs) so both
+                # failure paths leave the output root empty. ``BaseException``
+                # is caught to include ``KeyboardInterrupt`` /
+                # ``SystemExit``; we re-raise immediately so propagation is
+                # preserved.
+                metadata_write_failed = True
+                self._cleanup_written_parquet_files()
+                raise
+            return None
+        finally:
+            self._teardown_sqlite_sidecar()
+            if exc_type is not None or metadata_write_failed:
+                self._prune_empty_output_tree()
+
+    def _cleanup_written_parquet_files(self) -> None:
+        """Unlink every Parquet file this writer created during the session.
+
+        Centralises the unlink loop so the caller-exception path and
+        the metadata-write-failure path in ``__exit__`` cannot drift. Each
+        path must leave the output tree in the same half-cleaned state
+        before ``_prune_empty_output_tree`` runs.
+        """
+        for path in self._written_files:
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                pass
+
+    def _teardown_sqlite_sidecar(self) -> None:
+        """Close the SQLite connection and remove the sidecar file.
+
+        Ensures the scratch database never leaks into the
+        output tree regardless of which exit path triggered teardown,
+        so downstream packagers and auditors see only the canonical
+        Parquet + ``metadata.json`` deliverable.
+        """
+        if self._sqlite_conn is not None:
+            try:
+                self._sqlite_conn.close()
+            except sqlite3.Error:
+                pass
+            self._sqlite_conn = None
+        if self._sqlite_path is not None:
+            try:
+                self._sqlite_path.unlink()
+            except FileNotFoundError:
+                pass
+            self._sqlite_path = None
+
+    def _prune_empty_output_tree(self) -> None:
+        """Conservatively remove empty partition dirs and the output root.
+
+        When the writer's ``with`` block raises, ``__exit__``
+        has already unlinked every Parquet file this writer created
+        and the SQLite sidecar, but the Hive-style
+        ``split=/contig=/block_id=/`` partition tree created during
+        partitioning remains as empty directories. Leaving that empty
+        tree (and the corpus root) on disk surfaces as a phantom
+        dataset to downstream autodiscovery tools. Pruning relies on
+        ``os.rmdir`` — which refuses to remove non-empty directories —
+        so any file the writer did not create (a stray artefact from
+        a concurrent process, a user-dropped note) preserves its
+        enclosing directory and therefore the whole tree above it.
+        ``topdown=False`` ensures leaves are visited first, so each
+        parent is attempted only after its children had a chance to
+        drain.
+        """
+        if not self._output_path.exists():
+            return
+        for dirpath, _dirnames, filenames in os.walk(
+            self._output_path, topdown=False
+        ):
+            if filenames:
+                continue
+            try:
+                os.rmdir(dirpath)
+            except OSError:
+                pass
+
+    def _write_metadata_json(self) -> None:
+        """Write ``metadata.json`` as a streamed JSON object.
+
+        Avoids materialising the full manifest as a Python list
+        (~O(total-windows)) to keep peak RAM at close near the SQLite
+        row-factory buffer rather than the full 7M-locus dict. Emit the
+        top-level object one key at a time in alphabetical order so the
+        file is valid JSON without the prior ``str.index`` splice, which
+        relied on the exact whitespace shape produced by
+        ``json.dumps(..., indent=2)`` and would have crashed noisily if
+        a future ``json`` change altered that shape. O(1)-in-window-count
+        head fields are serialised eagerly; ``split_manifest`` is streamed
+        directly from the SQLite sidecar in
+        ``(contig, block_start, split)`` order so only ``fetchmany`` chunks
+        are ever resident.
+        """
+        head_fields = self._build_metadata_head()
+        # Alphabetical union of head fields and the streamed ``split_manifest``
+        # key; the stream is substituted inline by key rather than spliced
+        # into a pre-rendered string.
+        top_level_keys = sorted([*head_fields.keys(), "split_manifest"])
+
+        assert self._sqlite_conn is not None
+        cursor = self._sqlite_conn.execute(
+            "SELECT locus_id, contig, block_start, block_end, split "
+            "FROM locus_entries "
+            "ORDER BY contig, block_start, split"
+        )
+        count_cursor = self._sqlite_conn.execute(
+            "SELECT COUNT(*) FROM locus_entries"
+        )
+        total_rows = count_cursor.fetchone()[0]
+
+        metadata_path = self._output_path / "metadata.json"
+        last_index = len(top_level_keys) - 1
+        with metadata_path.open("w", encoding="utf-8") as handle:
+            handle.write("{\n")
+            for idx, key in enumerate(top_level_keys):
+                trailing_comma = "," if idx < last_index else ""
+                if key == "split_manifest":
+                    self._stream_split_manifest(
+                        handle, cursor, total_rows, trailing_comma
+                    )
+                else:
+                    value_blob = json.dumps(
+                        head_fields[key], indent=2, sort_keys=True
+                    )
+                    value_lines = value_blob.splitlines()
+                    handle.write(f'  "{key}": {value_lines[0]}')
+                    for continuation in value_lines[1:]:
+                        handle.write(f"\n  {continuation}")
+                    handle.write(f"{trailing_comma}\n")
+            handle.write("}\n")
+
+    def _stream_split_manifest(
+        self,
+        handle: Any,
+        cursor: sqlite3.Cursor,
+        total_rows: int,
+        trailing_comma: str,
+    ) -> None:
+        """Emit the ``split_manifest`` array entry of ``metadata.json``.
+
+        Streams manifest rows from the SQLite sidecar in
+        ``(contig, block_start, split)`` order so peak RAM at close stays
+        bounded by the ``fetchmany`` chunk rather than the full corpus.
+        The caller handles the top-level comma for this key.
+        """
+        if total_rows == 0:
+            handle.write(f'  "split_manifest": []{trailing_comma}\n')
+            return
+        handle.write('  "split_manifest": [\n')
+        fetch_chunk = 500
+        emitted = 0
+        while True:
+            rows = cursor.fetchmany(fetch_chunk)
+            if not rows:
+                break
+            for locus_id, contig, block_start, block_end, split in rows:
+                entry = {
+                    "block_end": block_end,
+                    "block_start": block_start,
+                    "contig": contig,
+                    "locus_id": locus_id,
+                    "split": split,
+                }
+                body = json.dumps(entry, indent=2, sort_keys=True)
+                indented = "\n".join("    " + line for line in body.splitlines())
+                handle.write(indented)
+                emitted += 1
+                if emitted < total_rows:
+                    handle.write(",\n")
+                else:
+                    handle.write("\n")
+        handle.write(f"  ]{trailing_comma}\n")
+
+    def _build_metadata_head(self) -> dict[str, Any]:
+        """Return the non-``split_manifest`` top-level fields of ``metadata.json``.
+
+        This is a protected **test seam**, not part of the public
+        contract. The streaming metadata writer picks up any keys returned
+        here and emits them alphabetically alongside the streamed
+        ``split_manifest`` array, so a subclass that inserts a forward-
+        compatible field (e.g. ``split_registry``) exercises the alphabetic
+        ordering guarantee end-to-end without a string-splice dependency.
+        Production callers must not override this method.
+        """
+        metadata_provenance = self._resolve_final_provenance()
+        return {
+            "access_pattern": self._contract.access_pattern,
+            "deterministic_partition_keys": list(
+                self._contract.deterministic_partition_keys
+            ),
+            "export_format": self._contract.format,
+            "preserve_coordinates": self._contract.preserve_coordinates,
+            "preserve_raw_windows": self._contract.preserve_raw_windows,
+            "preserve_sequence_hashes": self._contract.preserve_sequence_hashes,
+            "row_group_size": self._contract.row_group_size,
+            "sequence_hash_algorithm": self._contract.sequence_hash_algorithm,
+            "splits": {
+                split: {
+                    "record_count": self._split_record_counts[split],
+                    "files": sorted(
+                        str(path.relative_to(self._output_path)) for path in paths
+                    ),
+                }
+                for split, paths in sorted(self._split_paths.items())
+            },
+            "tokenizer": asdict(metadata_provenance),
+        }
+
+    @property
+    def split_paths(self) -> dict[str, list[Path]]:
+        """Return a copy of the split-to-Parquet-paths mapping written so far.
+
+        Surfaces the per-split file list to the shim so the
+        public ``write_tokenized_dataset`` return value shape remains
+        unchanged for legacy callers.
+        """
+        return {split: list(paths) for split, paths in self._split_paths.items()}
+
+    def _resolve_final_provenance(self) -> TokenizerProvenance:
+        """Resolve the tokenizer provenance to embed in the corpus manifest.
+
+        If at least one non-empty batch was written, the provenance
+        validated at that point is returned. For a writer that never
+        received a non-empty batch, ``provenance`` must have been
+        supplied at construction time, matching the legacy contract
+        where an empty export requires an explicit provenance.
+        """
+        if self._resolved_provenance is not None:
+            return self._resolved_provenance
+        if self._explicit_provenance is None:
+            raise ExportContractError(
+                "Tokenized export metadata requires explicit tokenizer provenance "
+                "when no tokenized windows are available"
+            )
+        _assert_approved_dnabert2_trust_policy(
+            self._explicit_provenance.trust_remote_code
+        )
+        return self._explicit_provenance
+
+
 def write_tokenized_dataset(
     tokenized_windows: tuple[TokenizedWindow, ...],
     output_dir: str | Path,
@@ -1209,16 +1750,18 @@ def write_tokenized_dataset(
     contract: ExportContract = DEFAULT_PARQUET_EXPORT_CONTRACT,
     provenance: TokenizerProvenance | None = None,
 ) -> dict[str, list[Path]]:
-    """Write tokenised windows to a Hive-partitioned Parquet dataset.
+    """Write tokenised windows to a Hive-partitioned Parquet dataset (one-batch shim).
 
-    Records are sorted by ``(split, contig, block_start, window_start,
-    sample_id, source)`` and partitioned by the keys in
-    ``contract.deterministic_partition_keys``.  A ``metadata.json``
-    sidecar is written alongside the Parquet files for downstream
-    auditability.
+    One-batch convenience wrapper used by the consensus pretrain
+    pipeline. This function opens a :class:`TokenizedCorpusWriter`,
+    calls ``write_batch`` once with the supplied windows, and closes.
+    All on-disk artifacts (Hive partition layout, ``metadata.json``
+    schema, return-value shape) are produced by the underlying writer;
+    this function adds no behaviour of its own beyond the single
+    ``write_batch`` call.
 
     Args:
-        tokenized_windows: Records to serialise.
+        tokenized_windows: Records to serialise in a single batch.
         output_dir: Root directory for the Parquet dataset.
         contract: Export settings governing format, partitioning, and
             preservation flags.
@@ -1232,75 +1775,13 @@ def write_tokenized_dataset(
         ExportContractError: If ``contract.format`` is not ``"parquet"``
             or provenance validation fails.
     """
-    if contract.format != "parquet":
-        raise ExportContractError(
-            "write_tokenized_dataset only supports parquet contracts; "
-            "use write_webdataset_shards for webdataset exports"
-        )
-
-    output_path = Path(output_dir)
-    output_path.mkdir(parents=True, exist_ok=True)
-
-    sorted_records = sorted(
-        tokenized_windows,
-        key=lambda item: (
-            item.window.split,
-            item.window.contig,
-            item.window.block_start,
-            item.window.window_start,
-            item.window.sample_id,
-            item.window.source,
-        ),
-    )
-    metadata_provenance = _resolve_export_tokenizer_provenance(
-        tuple(sorted_records),
+    with TokenizedCorpusWriter(
+        output_dir,
+        contract=contract,
         provenance=provenance,
-    )
-    manifest = build_split_manifest(tuple(item.window for item in sorted_records))
-
-    split_paths: dict[str, list[Path]] = defaultdict(list)
-    partitioned_records: dict[tuple[str, str, str], list[TokenizedWindow]] = defaultdict(list)
-    for record in sorted_records:
-        partitioned_records[_partition_tuple(record.window)].append(record)
-
-    parquet_backend: tuple[Any, Any] | None = _load_pyarrow_parquet() if sorted_records else None
-
-    for partition_key in sorted(partitioned_records):
-        split, contig, block_id = partition_key
-        partition_path = output_path / f"split={split}" / f"contig={contig}" / f"block_id={block_id}"
-        partition_path.mkdir(parents=True, exist_ok=True)
-        records = partitioned_records[partition_key]
-        for index in range(0, len(records), contract.row_group_size):
-            row_group = records[index : index + contract.row_group_size]
-            file_path = partition_path / f"part-{index // contract.row_group_size:05d}.parquet"
-            pyarrow, pyarrow_parquet = parquet_backend
-            table = pyarrow.Table.from_pylist(
-                [_export_record(record, contract=contract) for record in row_group]
-            )
-            pyarrow_parquet.write_table(table, file_path, row_group_size=contract.row_group_size)
-            split_paths[split].append(file_path)
-
-    metadata = {
-        "access_pattern": contract.access_pattern,
-        "deterministic_partition_keys": list(contract.deterministic_partition_keys),
-        "export_format": contract.format,
-        "preserve_coordinates": contract.preserve_coordinates,
-        "preserve_raw_windows": contract.preserve_raw_windows,
-        "preserve_sequence_hashes": contract.preserve_sequence_hashes,
-        "row_group_size": contract.row_group_size,
-        "sequence_hash_algorithm": contract.sequence_hash_algorithm,
-        "tokenizer": asdict(metadata_provenance),
-        "splits": {
-            split: {
-                "record_count": len([item for item in sorted_records if item.window.split == split]),
-                "files": [str(path.relative_to(output_path)) for path in paths],
-            }
-            for split, paths in sorted(split_paths.items())
-        },
-        "split_manifest": [asdict(entry) for entry in manifest],
-    }
-    (output_path / "metadata.json").write_text(json.dumps(metadata, indent=2, sort_keys=True), encoding="utf-8")
-    return {split: paths for split, paths in split_paths.items()}
+    ) as writer:
+        writer.write_batch(tokenized_windows)
+    return writer.split_paths
 
 
 def write_webdataset_shards(
