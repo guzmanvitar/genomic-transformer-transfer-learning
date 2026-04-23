@@ -27,18 +27,13 @@ from __future__ import annotations
 import hashlib
 import logging
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable
 from urllib.request import OpenerDirector, build_opener
 
 from ..config import FelidFoundationPipelineConfig, FelidSpeciesEntry
-from .acquisition import (
-    AcquisitionError,
-    DownloadAsset,
-    DownloadResult,
-    download_with_retry,
-)
+from .acquisition import AcquisitionError, DownloadAsset, DownloadResult, download_with_retry
 from .felid_assemblies import APPROVED_FELID_ASSEMBLIES, build_felid_reference_manifest
 
 _LOGGER = logging.getLogger(__name__)
@@ -174,9 +169,7 @@ def acquire_felid_foundation_assemblies(
     reference_dir = Path(output_dir) if output_dir is not None else config.paths.reference_dir
     reference_dir.mkdir(parents=True, exist_ok=True)
 
-    manifest = build_felid_reference_manifest(
-        reference_dir, assemblies=APPROVED_FELID_ASSEMBLIES
-    )
+    manifest = build_felid_reference_manifest(reference_dir, assemblies=APPROVED_FELID_ASSEMBLIES)
     # Rebase destinations so files land directly in ``reference_dir`` rather than
     # the ``reference/`` subdirectory :func:`build_felid_reference_manifest`
     # creates. This keeps the acquire path aligned with
@@ -212,8 +205,7 @@ def acquire_felid_foundation_assemblies(
             actual_md5 = _compute_md5(asset.destination)
             if actual_md5 == asset.checksum:
                 _LOGGER.info(
-                    'skip species=%s accession=%s reason="checksum match" '
-                    "destination=%s",
+                    'skip species=%s accession=%s reason="checksum match" destination=%s',
                     entry.species_slug,
                     entry.accession,
                     asset.destination,
@@ -230,7 +222,7 @@ def acquire_felid_foundation_assemblies(
                 skipped_count += 1
                 continue
             _LOGGER.info(
-                'verify_mismatch_redownload species=%s accession=%s '
+                "verify_mismatch_redownload species=%s accession=%s "
                 'reason="checksum mismatch; hash=%s expected=%s" destination=%s',
                 entry.species_slug,
                 entry.accession,
@@ -296,4 +288,3 @@ def acquire_felid_foundation_assemblies(
         skipped_count=skipped_count,
         redownloaded_count=redownloaded_count,
     )
-

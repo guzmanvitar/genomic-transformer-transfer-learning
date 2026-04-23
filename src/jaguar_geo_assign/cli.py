@@ -15,26 +15,26 @@ branch's error contract.
 from __future__ import annotations
 
 import argparse
+from collections.abc import Sequence
 from pathlib import Path
-from typing import Sequence
 
 from .baselines import BASELINE_EVALUATION_STAGE
 from .config import (
-    check_feline_pipeline_runtime,
     check_felid_foundation_pipeline_runtime,
+    check_feline_pipeline_runtime,
     describe_experiment,
-    describe_feline_pipeline,
     describe_felid_foundation_config,
+    describe_feline_pipeline,
     load_experiment_config,
-    load_feline_pipeline_config,
     load_felid_foundation_pipeline_config,
+    load_feline_pipeline_config,
 )
 from .pretrain import (
     acquire_felid_foundation_assemblies,
-    format_feline_pretrain_result,
     format_felid_foundation_pretrain_result,
-    run_feline_pretrain_pipeline,
+    format_feline_pretrain_result,
     run_felid_foundation_pretrain,
+    run_feline_pretrain_pipeline,
 )
 
 
@@ -64,8 +64,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="jaguar-geo-assign")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    pretrain = subparsers.add_parser("pretrain", help="Run the feline genomics pretraining data pipeline.")
-    pretrain.add_argument("--config", type=Path, required=True, help="Path to the feline pipeline TOML config.")
+    pretrain = subparsers.add_parser(
+        "pretrain", help="Run the feline genomics pretraining data pipeline."
+    )
+    pretrain.add_argument(
+        "--config", type=Path, required=True, help="Path to the feline pipeline TOML config."
+    )
     pretrain.add_argument(
         "--bcftools-executable",
         default="bcftools",
@@ -79,7 +83,9 @@ def build_parser() -> argparse.ArgumentParser:
     validate = subparsers.add_parser("validate-config", help="Validate a bootstrap TOML config.")
     validate.add_argument("config", type=Path)
 
-    describe = subparsers.add_parser("describe-experiment", help="Summarize a bootstrap TOML config.")
+    describe = subparsers.add_parser(
+        "describe-experiment", help="Summarize a bootstrap TOML config."
+    )
     describe.add_argument("config", type=Path)
 
     validate_pipeline = subparsers.add_parser(
@@ -105,13 +111,17 @@ def build_parser() -> argparse.ArgumentParser:
         "felid-foundation-pretrain",
         help="Run the multi-species felid foundation pretraining pipeline.",
     )
-    felid_pretrain.add_argument("config", type=Path, help="Path to the felid foundation pipeline TOML config.")
+    felid_pretrain.add_argument(
+        "config", type=Path, help="Path to the felid foundation pipeline TOML config."
+    )
 
     felid_acquire = subparsers.add_parser(
         "acquire-felid-foundation-assemblies",
         help="Download all six approved felid reference FASTAs with integrity checks.",
     )
-    felid_acquire.add_argument("config", type=Path, help="Path to the felid foundation pipeline TOML config.")
+    felid_acquire.add_argument(
+        "config", type=Path, help="Path to the felid foundation pipeline TOML config."
+    )
 
     felid_validate = subparsers.add_parser(
         "validate-felid-foundation-config",
@@ -246,10 +256,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         except (RuntimeError, ValueError) as error:
             print(str(error))
             return 1
-        print(
-            f"Runtime contract satisfied for '{config.name}': "
-            f"{', '.join(config.runtime.external_tools) if config.runtime.external_tools else 'no external tools required'}"
+        tools_summary = (
+            ", ".join(config.runtime.external_tools)
+            if config.runtime.external_tools
+            else "no external tools required"
         )
+        print(f"Runtime contract satisfied for '{config.name}': {tools_summary}")
         return 0
 
     config_name = None

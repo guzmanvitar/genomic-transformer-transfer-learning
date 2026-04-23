@@ -140,7 +140,8 @@ def test_window_sequences_track_unique_masked_bases_across_overlapping_spans() -
 
 
 def test_window_sequences_count_realized_n_coverage_without_mask_spans() -> None:
-    """Reference inputs without declared mask spans still report ``N`` bases as unique masked coverage."""
+    """Reference inputs without declared mask spans still report ``N`` bases as unique masked
+    coverage."""
     config = PreprocessingConfig(
         min_sequence_length=6,
         max_ambiguity_fraction=1.0,
@@ -166,7 +167,8 @@ def test_window_sequences_count_realized_n_coverage_without_mask_spans() -> None
 
 
 def test_window_sequences_preserve_consensus_provenance_without_sequence_fallback() -> None:
-    """Consensus windows report span-derived masked coverage verbatim so silent ``N`` bases remain auditable.
+    """Consensus windows report span-derived masked coverage verbatim so silent ``N`` bases
+    remain auditable.
 
     The ``source="reference"`` fallback that folds in ``sequence.count("N")``
     must not apply to consensus-sourced windows; otherwise a consensus
@@ -230,7 +232,8 @@ def test_window_sequences_report_consensus_span_coverage_when_spans_declared() -
 
 
 def test_window_sequences_drop_high_ambiguity_windows_from_retained_sequence() -> None:
-    """A retained sequence can still shed individual windows that exceed the per-window ambiguity cap."""
+    """A retained sequence can still shed individual windows that exceed the per-window ambiguity
+    cap."""
     config = PreprocessingConfig(
         min_sequence_length=8,
         max_ambiguity_fraction=0.25,
@@ -384,8 +387,11 @@ def test_window_sequences_rejects_unknown_source_label_on_direct_entry() -> None
         window_sequences(prepared, config)
 
 
-def test_window_sequences_rejects_unknown_source_label_when_all_windows_would_be_length_filtered() -> None:
-    """Regression: invalid direct-entry source raises even when the block overlap is too short for any window.
+def test_window_sequences_rejects_unknown_source_label_when_all_windows_would_be_length_filtered() -> (  # noqa: E501
+    None
+):
+    """Regression: invalid direct-entry source raises even when the block overlap is too short
+    for any window.
 
     Without the up-front source validation, a ``PreparedSequence`` shorter
     than ``window_size`` would cause ``window_sequences`` to silently
@@ -408,8 +414,11 @@ def test_window_sequences_rejects_unknown_source_label_when_all_windows_would_be
         window_sequences(prepared, config)
 
 
-def test_window_sequences_rejects_unknown_source_label_when_all_windows_would_be_ambiguity_filtered() -> None:
-    """Regression: invalid direct-entry source raises even when every candidate window exceeds the ambiguity cap.
+def test_window_sequences_rejects_unknown_source_label_when_all_windows_would_be_ambiguity_filtered() -> (  # noqa: E501
+    None
+):
+    """Regression: invalid direct-entry source raises even when every candidate window exceeds
+    the ambiguity cap.
 
     A high-``N`` direct-entry sequence whose only candidate window would
     be dropped by the per-window ambiguity filter must not let an
@@ -431,8 +440,6 @@ def test_window_sequences_rejects_unknown_source_label_when_all_windows_would_be
         window_sequences(prepared, config)
 
 
-
-
 # ---------------------------------------------------------------------------
 # Streaming tokenized-corpus writer tests
 # ---------------------------------------------------------------------------
@@ -443,10 +450,10 @@ def test_window_sequences_rejects_unknown_source_label_when_all_windows_would_be
 # while keeping the legacy single-shot ``write_tokenized_dataset`` API
 # binary-compatible via a thin one-batch shim.
 
-from dataclasses import replace as _dataclass_replace
-import json as _json
+import json as _json  # noqa: E402
+from dataclasses import replace as _dataclass_replace  # noqa: E402
 
-from jaguar_geo_assign.data.preprocessor import (
+from jaguar_geo_assign.data.preprocessor import (  # noqa: E402
     ExportContract,
     TokenizedCorpusWriter,
     TokenizedWindow,
@@ -546,7 +553,6 @@ def _primary_key(row: dict) -> tuple:
         window["sequence_hash"],
         tuple(row["input_ids"]),
     )
-
 
 
 def test_streaming_writer_round_trip_matches_single_shot(tmp_path) -> None:
@@ -685,7 +691,6 @@ def test_streaming_writer_row_group_size_honoured_per_batch(tmp_path) -> None:
             assert parquet_file.metadata.row_group(index).num_rows <= row_group_size
 
 
-
 def test_streaming_writer_cleans_partial_files_on_mid_stream_exception(tmp_path) -> None:
     """An exception after a successful batch must remove any half-written Parquet artifacts.
 
@@ -710,16 +715,16 @@ def test_streaming_writer_cleans_partial_files_on_mid_stream_exception(tmp_path)
         ),
     )
 
-    class _DeliberateFailure(RuntimeError):
+    class _DeliberateFailureError(RuntimeError):
         """Raised by the test to simulate a mid-stream producer failure."""
 
-    with pytest.raises(_DeliberateFailure):
+    with pytest.raises(_DeliberateFailureError):
         with TokenizedCorpusWriter(tmp_path) as writer:
             writer.write_batch(good_batch)
             assert list(tmp_path.rglob("*.parquet")), (
                 "precondition: first batch must have materialised at least one Parquet file"
             )
-            raise _DeliberateFailure("simulated mid-stream producer error")
+            raise _DeliberateFailureError("simulated mid-stream producer error")
 
     remaining_parquet = list(tmp_path.rglob("*.parquet"))
     assert remaining_parquet == [], (
@@ -848,10 +853,7 @@ def test_tokenized_corpus_writer_bounded_manifest_memory(tmp_path) -> None:
     )
 
 
-
-def test_writer_cleans_up_parquet_when_metadata_write_fails(
-    tmp_path, monkeypatch
-) -> None:
+def test_writer_cleans_up_parquet_when_metadata_write_fails(tmp_path, monkeypatch) -> None:
     """Metadata-write failure must trigger the Parquet+sidecar cleanup path.
 
     Greptile #7 flagged that a raw ``_write_metadata_json`` call

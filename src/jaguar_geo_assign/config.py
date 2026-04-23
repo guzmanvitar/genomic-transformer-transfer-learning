@@ -25,9 +25,9 @@ Design invariants:
 
 from __future__ import annotations
 
+import tomllib
 from dataclasses import dataclass
 from pathlib import Path
-import tomllib
 
 from .baselines import (
     BASELINE_EVALUATION_STAGE,
@@ -400,7 +400,9 @@ def load_experiment_config(path: str | Path) -> ExperimentConfig:
     if primary_task["kind"] != "coordinate_regression":
         raise ValueError("bootstrap configs must use coordinate_regression as the primary task")
     if primary_task["primary_metric"] != "median_geodesic_error_km":
-        raise ValueError("bootstrap configs must use median_geodesic_error_km as the primary metric")
+        raise ValueError(
+            "bootstrap configs must use median_geodesic_error_km as the primary metric"
+        )
     if data["split_unit"] not in {"sample_id", "individual_id"}:
         raise ValueError("split_unit must be sample_id or individual_id")
     if len(stages) != len(set(stages)) or not stages:
@@ -419,7 +421,9 @@ def load_experiment_config(path: str | Path) -> ExperimentConfig:
     if baseline_enabled:
         raise ValueError("bootstrap baseline execution must remain disabled")
     if baseline["extension_point"] != SHARED_BASELINE_EXTENSION_POINT:
-        raise ValueError("bootstrap baseline extension point must remain shared_split_metric_report_contract")
+        raise ValueError(
+            "bootstrap baseline extension point must remain shared_split_metric_report_contract"
+        )
     requires_private_data = _require_boolean_field(
         experiment.get("requires_private_data", False),
         field_name="experiment.requires_private_data",
@@ -535,7 +539,9 @@ def load_feline_pipeline_config(path: str | Path) -> FelinePipelineConfig:
         if context_window <= 0:
             raise ValueError("windowing.context_window must be positive")
         if window_overlap < 0 or window_overlap >= context_window:
-            raise ValueError("windowing.window_overlap must be >= 0 and smaller than context_window")
+            raise ValueError(
+                "windowing.window_overlap must be >= 0 and smaller than context_window"
+            )
         max_ambiguous_fraction = float(windowing["max_ambiguous_fraction"])
         if not 0 <= max_ambiguous_fraction <= 1:
             raise ValueError("windowing.max_ambiguous_fraction must be between 0 and 1")
@@ -551,20 +557,28 @@ def load_feline_pipeline_config(path: str | Path) -> FelinePipelineConfig:
         if split["assignment_stage"] != PRE_WINDOW_ASSIGNMENT_STAGE:
             raise ValueError("split.assignment_stage must assign loci before windowing")
         if split["baseline_policy"] != REFERENCE_BASELINE_POLICY:
-            raise ValueError("split.baseline_policy must reuse locus assignments for the baseline corpus")
+            raise ValueError(
+                "split.baseline_policy must reuse locus assignments for the baseline corpus"
+            )
 
         allowed_alphabet = tuple(tokenizer["allowed_alphabet"])
         if tokenizer["identifier"] != DNABERT2_TOKENIZER_ID:
             raise ValueError("tokenizer.identifier must pin zhihan1996/DNABERT-2-117M")
         if tokenizer["revision"] != DNABERT2_TOKENIZER_REVISION:
-            raise ValueError("tokenizer.revision must pin the approved immutable DNABERT-2 revision")
+            raise ValueError(
+                "tokenizer.revision must pin the approved immutable DNABERT-2 revision"
+            )
         if allowed_alphabet != POST_CONSENSUS_ALLOWED_ALPHABET:
-            raise ValueError("tokenizer.allowed_alphabet must exactly match the post-consensus contract")
+            raise ValueError(
+                "tokenizer.allowed_alphabet must exactly match the post-consensus contract"
+            )
         if tokenizer["unsupported_symbol_policy"] not in {"reject", "normalize_to_n"}:
             raise ValueError("tokenizer.unsupported_symbol_policy must be reject or normalize_to_n")
         max_position_embeddings = int(tokenizer["max_position_embeddings"])
         if max_position_embeddings < context_window:
-            raise ValueError("tokenizer.max_position_embeddings must be >= windowing.context_window")
+            raise ValueError(
+                "tokenizer.max_position_embeddings must be >= windowing.context_window"
+            )
         trust_remote_code = _require_boolean_field(
             tokenizer["trust_remote_code"],
             field_name="tokenizer.trust_remote_code",
@@ -612,7 +626,9 @@ def load_feline_pipeline_config(path: str | Path) -> FelinePipelineConfig:
         if external_tools != REQUIRED_EXTERNAL_TOOLS:
             raise ValueError("runtime.external_tools must explicitly require bcftools")
     except KeyError as exc:
-        raise ValueError(f"Feline pipeline config is missing required field: {exc.args[0]}") from exc
+        raise ValueError(
+            f"Feline pipeline config is missing required field: {exc.args[0]}"
+        ) from exc
 
     return FelinePipelineConfig(
         name=pipeline["name"],
@@ -875,7 +891,6 @@ def describe_feline_pipeline(path: str | Path) -> str:
     )
 
 
-
 def _validate_felid_species_entries(
     raw_species: object,
 ) -> tuple[FelidSpeciesEntry, ...]:
@@ -924,9 +939,7 @@ def _validate_felid_species_entries(
             species_name = item["species"]
             accession = item["accession"]
         except KeyError as exc:
-            raise ValueError(
-                f"species[{index}] is missing required field: {exc.args[0]}"
-            ) from exc
+            raise ValueError(f"species[{index}] is missing required field: {exc.args[0]}") from exc
         if accession in seen_accessions:
             raise ValueError(f"species list contains duplicate accession {accession!r}")
         if accession not in APPROVED_FELID_ACCESSIONS:
@@ -952,7 +965,6 @@ def _validate_felid_species_entries(
 
     entries.sort(key=lambda entry: entry.accession)
     return tuple(entries)
-
 
 
 def load_felid_foundation_pipeline_config(
@@ -1066,7 +1078,9 @@ def load_felid_foundation_pipeline_config(
             raise ValueError("tokenizer.unsupported_symbol_policy must be reject or normalize_to_n")
         max_position_embeddings = int(tokenizer["max_position_embeddings"])
         if max_position_embeddings < context_window:
-            raise ValueError("tokenizer.max_position_embeddings must be >= windowing.context_window")
+            raise ValueError(
+                "tokenizer.max_position_embeddings must be >= windowing.context_window"
+            )
         trust_remote_code = _require_boolean_field(
             tokenizer["trust_remote_code"],
             field_name="tokenizer.trust_remote_code",
@@ -1167,7 +1181,6 @@ def load_felid_foundation_pipeline_config(
     )
 
 
-
 def check_felid_foundation_pipeline_runtime(
     path: str | Path,
 ) -> FelidFoundationPipelineConfig:
@@ -1218,9 +1231,7 @@ def describe_felid_foundation_config(path: str | Path) -> str:
         for entry in config.species
     ]
     external_tools_display = (
-        ", ".join(config.runtime.external_tools)
-        if config.runtime.external_tools
-        else "(none)"
+        ", ".join(config.runtime.external_tools) if config.runtime.external_tools else "(none)"
     )
     return "\n".join(
         [

@@ -12,8 +12,8 @@ faithful even when the corpus grows beyond the preview sample limit.
 import json
 
 import pytest
-import jaguar_geo_assign.reporting.genomics_diagnostics as genomics_diagnostics
 
+import jaguar_geo_assign.reporting.genomics_diagnostics as genomics_diagnostics
 from jaguar_geo_assign.reporting import (
     audit_corpus_integrity,
     build_eda_payload,
@@ -39,7 +39,7 @@ def _build_realistic_records(*, total: int, source: str) -> list[dict[str, objec
                 sequence = reference_sequence[:-1] + "N"
         variant_count = sum(
             1
-            for base, reference_base in zip(sequence, reference_sequence)
+            for base, reference_base in zip(sequence, reference_sequence, strict=False)
             if base != "N" and base != reference_base
         )
         records.append(
@@ -144,7 +144,8 @@ def baseline_records() -> list[dict[str, object]]:
 
 
 def test_summarize_sample_records_reports_observability_metrics(consensus_records) -> None:
-    """Verify per-sample summaries expose the GC/ambiguity/callable metrics used for drift monitoring."""
+    """Verify per-sample summaries expose the GC/ambiguity/callable metrics used for drift
+    monitoring."""
     summary = summarize_sample_records(consensus_records[:1])[0]
 
     assert summary["sample_id"] == "cat-1"
@@ -164,7 +165,8 @@ def test_missingness_heatmap_tracks_n_burden_by_relative_position(consensus_reco
 
 
 def test_summarize_corpus_records_tracks_duplicates_and_near_duplicates(consensus_records) -> None:
-    """Ensure corpus summaries surface duplicate and near-duplicate counts that inflate effective sample size."""
+    """Ensure corpus summaries surface duplicate and near-duplicate counts that inflate effective
+    sample size."""
     summary = summarize_corpus_records(consensus_records)
 
     assert summary["retained_window_count"] == 3
@@ -252,7 +254,8 @@ def test_overlap_aware_integrity_accepts_overlapping_mask_tallies() -> None:
 
 
 def test_overlap_aware_integrity_still_flags_unique_callable_coverage_mismatches() -> None:
-    """Verify the auditor still catches callable + unique-masked totals that cannot cover the sequence."""
+    """Verify the auditor still catches callable + unique-masked totals that cannot cover the
+    sequence."""
     malformed_record = {
         "sample_id": "cat-malformed",
         "locus_id": "chr2:block-malformed",
@@ -286,7 +289,8 @@ def test_overlap_aware_integrity_still_flags_unique_callable_coverage_mismatches
 def test_build_eda_payload_collects_sample_and_baseline_views(
     consensus_records, baseline_records
 ) -> None:
-    """Check the aggregated EDA payload contains sample preview, corpus stats, and baseline comparison."""
+    """Check the aggregated EDA payload contains sample preview, corpus stats, and baseline
+    comparison."""
     payload = build_eda_payload(consensus_records, baseline_records)
 
     assert len(payload["consensus_samples"]) == 3
@@ -309,7 +313,8 @@ def test_summarize_sample_records_rejects_missing_required_fields() -> None:
 
 
 def test_summarize_corpus_records_samples_near_duplicate_analysis_for_large_corpus() -> None:
-    """Ensure near-duplicate analysis switches to sampled mode and reports analyzed vs total counts."""
+    """Ensure near-duplicate analysis switches to sampled mode and reports analyzed vs total
+    counts."""
     realistic_consensus = _build_realistic_records(total=640, source="consensus")
 
     summary = summarize_corpus_records(realistic_consensus, near_duplicate_sample_limit=64)
@@ -340,7 +345,9 @@ def test_summarize_corpus_records_caps_near_duplicate_work_to_sample_limit(monke
         observed["analyzed_sequence_count"] = len(sequences)
         return 0
 
-    monkeypatch.setattr(genomics_diagnostics, "_count_near_duplicate_pairs", fake_count_near_duplicate_pairs)
+    monkeypatch.setattr(
+        genomics_diagnostics, "_count_near_duplicate_pairs", fake_count_near_duplicate_pairs
+    )
 
     summary = summarize_corpus_records(realistic_consensus, near_duplicate_sample_limit=64)
 
@@ -351,7 +358,8 @@ def test_summarize_corpus_records_caps_near_duplicate_work_to_sample_limit(monke
 
 
 def test_summarize_corpus_records_handles_tied_sampling_keys_deterministically(monkeypatch) -> None:
-    """Verify tie-breaking preserves insertion order so sampled near-duplicate sets stay reproducible."""
+    """Verify tie-breaking preserves insertion order so sampled near-duplicate sets stay
+    reproducible."""
     tied_records = _build_realistic_records(total=3, source="consensus")
     observed: dict[str, list[str]] = {}
 
@@ -360,7 +368,9 @@ def test_summarize_corpus_records_handles_tied_sampling_keys_deterministically(m
         return 0
 
     monkeypatch.setattr(genomics_diagnostics, "_near_duplicate_sampling_key", lambda _: "0")
-    monkeypatch.setattr(genomics_diagnostics, "_count_near_duplicate_pairs", fake_count_near_duplicate_pairs)
+    monkeypatch.setattr(
+        genomics_diagnostics, "_count_near_duplicate_pairs", fake_count_near_duplicate_pairs
+    )
 
     summary = summarize_corpus_records(tied_records, near_duplicate_sample_limit=2)
 
@@ -399,7 +409,9 @@ def test_build_eda_payload_bounds_consensus_sample_preview_for_large_corpus() ->
 
 
 def test_build_eda_payload_preserves_full_corpus_mask_totals_beyond_preview_truncation() -> None:
-    """Ensure corpus-level mask category counts reflect every record even when the preview is truncated."""
+    """Ensure corpus-level mask category counts reflect every record even when the preview is
+    truncated."""
+
     def consensus_records():
         reference = "AACCAA"
         for index in range(160):
@@ -497,7 +509,9 @@ def test_build_eda_payload_preserves_full_corpus_mask_totals_beyond_preview_trun
     }
 
 
-def test_write_eda_payload_json_persists_report_payload(tmp_path, consensus_records, baseline_records) -> None:
+def test_write_eda_payload_json_persists_report_payload(
+    tmp_path, consensus_records, baseline_records
+) -> None:
     """Verify the EDA payload round-trips to JSON on disk for downstream reporting consumers."""
     output_path = tmp_path / "reports" / "diagnostics_payload.json"
 
@@ -513,7 +527,9 @@ def test_write_eda_payload_json_persists_report_payload(tmp_path, consensus_reco
     }
     assert payload["consensus_corpus"]["retained_window_count"] == 3
     assert payload["consensus_corpus"]["near_duplicate_analysis"]["mode"] == "exact"
-    assert payload["baseline_comparison"]["deltas"]["near_duplicate_pair_fraction"] == pytest.approx(-1 / 3)
+    assert payload["baseline_comparison"]["deltas"][
+        "near_duplicate_pair_fraction"
+    ] == pytest.approx(-1 / 3)
 
 
 def test_diagnostics_producer_excludes_n_mismatches_from_variant_count() -> None:
@@ -529,9 +545,7 @@ def test_diagnostics_producer_excludes_n_mismatches_from_variant_count() -> None
         TokenizedWindow,
         WindowRecord,
     )
-    from jaguar_geo_assign.pretrain.pipeline import (
-        _tokenized_windows_to_diagnostics_records,
-    )
+    from jaguar_geo_assign.pretrain.pipeline import _tokenized_windows_to_diagnostics_records
 
     window = WindowRecord(
         sample_id="cat-1",
@@ -561,9 +575,7 @@ def test_diagnostics_producer_excludes_n_mismatches_from_variant_count() -> None
     )
     reference_lookup = {("chr1", 0, 8): "ACGTACGT"}
 
-    records = list(
-        _tokenized_windows_to_diagnostics_records((tokenized,), reference_lookup)
-    )
+    records = list(_tokenized_windows_to_diagnostics_records((tokenized,), reference_lookup))
 
     assert len(records) == 1
     record = records[0]

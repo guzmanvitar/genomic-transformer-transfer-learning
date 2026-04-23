@@ -27,7 +27,7 @@ from __future__ import annotations
 import gzip
 import tempfile
 from pathlib import Path
-from urllib.request import build_opener, Request
+from urllib.request import Request, build_opener
 
 import pytest
 
@@ -67,8 +67,7 @@ def test_felid_foundation_integration_panthera_tigris():
         # for the other five species to keep their ``retained_sequence_count``
         # at zero without tripping ``MissingFelidReferenceError``.
         species_roster = [
-            (assembly.species, assembly.accession)
-            for assembly in APPROVED_FELID_ASSEMBLIES
+            (assembly.species, assembly.accession) for assembly in APPROVED_FELID_ASSEMBLIES
         ]
 
         config_path = render_example_config(
@@ -107,9 +106,7 @@ def test_felid_foundation_integration_panthera_tigris():
 
         assert len(result.per_species_stats) == len(APPROVED_FELID_ASSEMBLIES)
         tigris_stats = next(
-            stats
-            for stats in result.per_species_stats
-            if stats.species_slug == pinned_species_slug
+            stats for stats in result.per_species_stats if stats.species_slug == pinned_species_slug
         )
         assert tigris_stats.accession == pinned_accession
         assert tigris_stats.assembly_name == pinned_assembly
@@ -131,4 +128,3 @@ def test_felid_foundation_integration_panthera_tigris():
             assert sum(stats.window_counts_by_split.values()) == 0, (
                 f"placeholder species {stats.species_slug} unexpectedly produced windows"
             )
-

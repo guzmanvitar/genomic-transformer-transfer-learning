@@ -6,4 +6,3 @@ Without this file, pytest's default ``importmode=prepend`` inserts
 ``from tests._felid_fixture import ...`` fails under ``--collect-only``.
 Intentionally empty.
 """
-

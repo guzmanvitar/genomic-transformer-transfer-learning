@@ -24,7 +24,11 @@ from .felid_foundation_pipeline import (
     format_felid_foundation_pretrain_result,
     run_felid_foundation_pretrain,
 )
-from .pipeline import FelinePretrainRunResult, format_feline_pretrain_result, run_feline_pretrain_pipeline
+from .pipeline import (
+    FelinePretrainRunResult,
+    format_feline_pretrain_result,
+    run_feline_pretrain_pipeline,
+)
 
 __all__ = [
     # Feline (consensus) pipeline

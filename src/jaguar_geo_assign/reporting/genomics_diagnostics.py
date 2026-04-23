@@ -15,13 +15,13 @@ Typical usage::
 
 from __future__ import annotations
 
-from collections import Counter, defaultdict
 import json
+from collections import Counter, defaultdict
+from collections.abc import Iterable, Mapping
 from hashlib import sha256
-from heapq import heapreplace, heappush, nsmallest
+from heapq import heappush, heapreplace, nsmallest
 from itertools import combinations
 from pathlib import Path
-from typing import Iterable, Mapping
 
 # The four standard DNA nucleotide bases used to identify canonical positions.
 CANONICAL_BASES = frozenset({"A", "C", "G", "T"})
@@ -209,7 +209,8 @@ def _build_reference_baseline_comparison(
         "baseline": dict(baseline_summary),
         "deltas": {
             "retained_window_count": (
-                consensus_summary["retained_window_count"] - baseline_summary["retained_window_count"]
+                consensus_summary["retained_window_count"]
+                - baseline_summary["retained_window_count"]
             ),
             "ambiguity_fraction": round(
                 consensus_summary["mean_ambiguity_fraction"]
@@ -307,9 +308,11 @@ def audit_corpus_integrity(
         A dict with ``"split_conflicts"`` (list of locus/split pairs) and
         ``"shape_issues"`` (list of per-record violation dicts).
     """
-    summarized_records = list(records) if summarized else [
-        _summarize_record(record, CORPUS_REQUIRED_FIELDS) for record in records
-    ]
+    summarized_records = (
+        list(records)
+        if summarized
+        else [_summarize_record(record, CORPUS_REQUIRED_FIELDS) for record in records]
+    )
     locus_splits: dict[str, set[str]] = defaultdict(set)
     shape_issues: list[dict[str, object]] = []
 
@@ -456,7 +459,9 @@ def _summarize_record(
         "gc_fraction": round(
             _safe_fraction(sum(base in {"G", "C"} for base in sequence), canonical_bases), 6
         ),
-        "ambiguity_fraction": round(_safe_fraction(len(sequence) - canonical_bases, len(sequence)), 6),
+        "ambiguity_fraction": round(
+            _safe_fraction(len(sequence) - canonical_bases, len(sequence)), 6
+        ),
         "callable_fraction": round(_safe_fraction(callable_bases, len(sequence)), 6),
         "filtered_fraction": round(_safe_fraction(filtered_bases, len(sequence)), 6),
         "no_call_fraction": round(_safe_fraction(no_call_bases, len(sequence)), 6),
@@ -464,7 +469,10 @@ def _summarize_record(
         "variant_fraction": round(_safe_fraction(variant_count, len(sequence)), 6),
         "fraction_identical_to_reference": round(
             _safe_fraction(
-                sum(base == reference for base, reference in zip(sequence, reference_sequence)),
+                sum(
+                    base == reference
+                    for base, reference in zip(sequence, reference_sequence, strict=False)
+                ),
                 len(sequence),
             ),
             6,
@@ -534,9 +542,7 @@ def _summarize_near_duplicates(
         # `_stream_corpus_summary()` already handed us a deterministic bounded sample.
         analysis_mode = "sampled"
     elif sample_limit is not None and len(records) > sample_limit:
-        analyzed_records = list(
-            nsmallest(sample_limit, records, key=_near_duplicate_sampling_key)
-        )
+        analyzed_records = list(nsmallest(sample_limit, records, key=_near_duplicate_sampling_key))
         analysis_mode = "sampled"
 
     analyzed_sequences = [str(record["sequence"]) for record in analyzed_records]
@@ -584,7 +590,9 @@ def _build_length_distribution(records: list[dict[str, object]]) -> list[dict[st
     """
     return [
         {"length": length, "count": count}
-        for length, count in sorted(Counter(len(str(record["sequence"])) for record in records).items())
+        for length, count in sorted(
+            Counter(len(str(record["sequence"])) for record in records).items()
+        )
     ]
 
 
@@ -629,7 +637,9 @@ def _build_fraction_distribution(
     ]
 
 
-def _validate_required_fields(record: Mapping[str, object], required_fields: frozenset[str]) -> None:
+def _validate_required_fields(
+    record: Mapping[str, object], required_fields: frozenset[str]
+) -> None:
     """Raise ``ValueError`` listing any keys from *required_fields* absent in *record*.
 
     Args:
@@ -721,7 +731,9 @@ def _coerce_masked_base_counts(
         counts["filtered"] = filtered_bases
     if no_call_bases and "no_call" not in counts:
         counts["no_call"] = no_call_bases
-    if other_masked_bases and not any(category not in {"filtered", "no_call"} for category in counts):
+    if other_masked_bases and not any(
+        category not in {"filtered", "no_call"} for category in counts
+    ):
         counts["other_masked"] = other_masked_bases
     return {category: count for category, count in sorted(counts.items())}
 
@@ -850,9 +862,11 @@ def _stream_corpus_summary(
             )
 
     duplicate_window_count = sum(count - 1 for count in duplicate_counts.values() if count > 1)
-    near_duplicate_records = sampled_records if near_duplicate_sample_limit is None else [
-        item[2] for item in sorted(sampled_heap, key=lambda item: (item[0], item[1]))
-    ]
+    near_duplicate_records = (
+        sampled_records
+        if near_duplicate_sample_limit is None
+        else [item[2] for item in sorted(sampled_heap, key=lambda item: (item[0], item[1]))]
+    )
     near_duplicate_summary = _summarize_near_duplicates(
         near_duplicate_records,
         sample_limit=near_duplicate_sample_limit,
@@ -864,9 +878,15 @@ def _stream_corpus_summary(
         "unique_sample_count": len(unique_samples),
         "unique_locus_count": len(unique_loci),
         "mean_gc_fraction": _safe_mean(metric_sums["gc_fraction"], retained_window_count),
-        "mean_ambiguity_fraction": _safe_mean(metric_sums["ambiguity_fraction"], retained_window_count),
-        "mean_callable_fraction": _safe_mean(metric_sums["callable_fraction"], retained_window_count),
-        "mean_filtered_fraction": _safe_mean(metric_sums["filtered_fraction"], retained_window_count),
+        "mean_ambiguity_fraction": _safe_mean(
+            metric_sums["ambiguity_fraction"], retained_window_count
+        ),
+        "mean_callable_fraction": _safe_mean(
+            metric_sums["callable_fraction"], retained_window_count
+        ),
+        "mean_filtered_fraction": _safe_mean(
+            metric_sums["filtered_fraction"], retained_window_count
+        ),
         "mean_no_call_fraction": _safe_mean(metric_sums["no_call_fraction"], retained_window_count),
         "mean_other_masked_fraction": _safe_mean(
             metric_sums["other_masked_fraction"], retained_window_count
@@ -875,7 +895,9 @@ def _stream_corpus_summary(
         "mean_fraction_identical_to_reference": _safe_mean(
             metric_sums["fraction_identical_to_reference"], retained_window_count
         ),
-        "mean_token_to_base_ratio": _safe_mean(metric_sums["token_to_base_ratio"], retained_window_count),
+        "mean_token_to_base_ratio": _safe_mean(
+            metric_sums["token_to_base_ratio"], retained_window_count
+        ),
         "length_distribution": [
             {"length": length, "count": count} for length, count in sorted(length_counts.items())
         ],
@@ -893,7 +915,8 @@ def _stream_corpus_summary(
             for category, count in sorted(masked_category_counts.items())
         },
         "missingness_heatmap": [
-            round(_safe_fraction(missing_counts[index], total_counts[index]), 6) for index in range(8)
+            round(_safe_fraction(missing_counts[index], total_counts[index]), 6)
+            for index in range(8)
         ],
         "split_conflict_count": sum(1 for splits in locus_splits.values() if len(splits) > 1),
         "shape_issue_count": shape_issue_count,
@@ -939,7 +962,9 @@ def _finalize_fraction_distribution(counts: list[int]) -> list[dict[str, float |
     ]
 
 
-def _update_missingness_counts(sequence: str, missing_counts: list[int], total_counts: list[int]) -> None:
+def _update_missingness_counts(
+    sequence: str, missing_counts: list[int], total_counts: list[int]
+) -> None:
     """Accumulate per-position N-base missingness for a single sequence.
 
     Each base is assigned to a positional bucket and the corresponding

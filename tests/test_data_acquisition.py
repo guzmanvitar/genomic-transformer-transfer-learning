@@ -58,7 +58,9 @@ def test_download_with_retry_resumes_partial_file_and_verifies_checksum(tmp_path
     opener = _FakeOpener([_FakeResponse(payload, status=206)])
 
     result = download_with_retry(
-        DownloadAsset(url="https://example.test/cat.vcf.gz", destination=destination, checksum=checksum),
+        DownloadAsset(
+            url="https://example.test/cat.vcf.gz", destination=destination, checksum=checksum
+        ),
         opener=opener,
         sleep=lambda _: None,
     )

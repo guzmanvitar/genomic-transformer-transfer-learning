@@ -13,9 +13,9 @@ from __future__ import annotations
 
 import multiprocessing
 import queue
-from pathlib import Path
 import stat
 import textwrap
+from pathlib import Path
 
 import pytest
 
@@ -84,7 +84,7 @@ def test_classify_consensus_site_raises_actionable_error_on_malformed_gt(
         )
 
 
-def test_generate_consensus_fasta_preserves_reference_and_masks_multiallelic_indel_and_ambiguous_calls(
+def test_generate_consensus_fasta_preserves_reference_and_masks_multiallelic_indel_and_ambiguous_calls(  # noqa: E501
     tmp_path: Path,
 ) -> None:
     """Check end-to-end that applied homozygous ALTs coexist with ``N``-masked problem sites."""
@@ -175,8 +175,11 @@ def test_generate_consensus_fasta_treats_alt_dot_as_no_alt_site(tmp_path: Path) 
 
 
 @pytest.mark.parametrize("genotype", ["*/*", "?/?"])
-def test_generate_consensus_fasta_fails_fast_on_malformed_gt_tokens(tmp_path: Path, genotype: str) -> None:
-    """Ensure the end-to-end pipeline refuses malformed GT tokens instead of silently dropping them."""
+def test_generate_consensus_fasta_fails_fast_on_malformed_gt_tokens(
+    tmp_path: Path, genotype: str
+) -> None:
+    """Ensure the end-to-end pipeline refuses malformed GT tokens instead of silently dropping
+    them."""
     reference = tmp_path / "reference.fa"
     reference.write_text(
         ">chr1 GCF_000181335.3 Felis_catus_9.0\nAACCAA\n",
@@ -207,8 +210,11 @@ def test_generate_consensus_fasta_fails_fast_on_malformed_gt_tokens(tmp_path: Pa
         )
 
 
-def test_generate_consensus_fasta_fails_fast_on_truncated_vcf_record_with_actionable_context(tmp_path: Path) -> None:
-    """Verify truncated VCF records raise with file/line/column context instead of a cryptic unpack error."""
+def test_generate_consensus_fasta_fails_fast_on_truncated_vcf_record_with_actionable_context(
+    tmp_path: Path,
+) -> None:
+    """Verify truncated VCF records raise with file/line/column context instead of a cryptic
+    unpack error."""
     reference = tmp_path / "reference.fa"
     reference.write_text(
         ">chr1 GCF_000181335.3 Felis_catus_9.0\nAACCAA\n",
@@ -254,7 +260,10 @@ def test_generate_consensus_fasta_fails_fast_on_truncated_vcf_record_with_action
         (None, "missing explicit reference/build metadata"),
         ("##reference=GCF_000181335.3", "does not canonically match expected build evidence"),
         ("##reference=Felis_catus_9.0", "does not canonically match expected build evidence"),
-        ("##reference=GCF_000181335.3_GRCh38", "does not canonically match expected build evidence"),
+        (
+            "##reference=GCF_000181335.3_GRCh38",
+            "does not canonically match expected build evidence",
+        ),
         ("##reference=GRCh38", "does not canonically match expected build evidence"),
     ],
 )
@@ -263,7 +272,8 @@ def test_generate_consensus_fasta_requires_explicit_matching_reference_metadata(
     reference_header: str | None,
     match: str,
 ) -> None:
-    """Reject VCFs whose ``##reference`` header is missing, partial, or points at a different build."""
+    """Reject VCFs whose ``##reference`` header is missing, partial, or points at a different
+    build."""
     reference = tmp_path / "reference.fa"
     reference.write_text(
         ">chr1 GCF_000181335.3 Felis_catus_9.0\nAACCAA\n",
@@ -272,7 +282,7 @@ def test_generate_consensus_fasta_requires_explicit_matching_reference_metadata(
     vcf = tmp_path / "cat_1.vcf"
     header_lines = [
         "##fileformat=VCFv4.2",
-        *( [reference_header] if reference_header is not None else [] ),
+        *([reference_header] if reference_header is not None else []),
         "##contig=<ID=chr1,length=6>",
         "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tcat_1",
         "chr1\t2\t.\tA\tT\t.\tPASS\t.\tGT\t1/1",
@@ -321,7 +331,9 @@ def test_generate_consensus_fasta_rejects_partial_or_inconsistent_fasta_build_ev
     )
     fake_bcftools = _write_fake_bcftools(tmp_path)
 
-    with pytest.raises(ReferenceMismatchError, match="does not canonically match expected build evidence"):
+    with pytest.raises(
+        ReferenceMismatchError, match="does not canonically match expected build evidence"
+    ):
         generate_consensus_fasta(
             sample_id="cat_1",
             reference_fasta=reference,
@@ -332,7 +344,8 @@ def test_generate_consensus_fasta_rejects_partial_or_inconsistent_fasta_build_ev
 
 
 def test_generate_consensus_fasta_fails_fast_on_contig_mismatch(tmp_path: Path) -> None:
-    """Ensure a VCF referencing contigs absent from the reference raises before any consensus is emitted."""
+    """Ensure a VCF referencing contigs absent from the reference raises before any consensus is
+    emitted."""
     reference = tmp_path / "reference.fa"
     reference.write_text(
         ">chr1 GCF_000181335.3 Felis_catus_9.0\nAACCAA\n",
@@ -364,12 +377,15 @@ def test_generate_consensus_fasta_fails_fast_on_contig_mismatch(tmp_path: Path) 
 
 
 def test_ensure_bcftools_available_raises_actionable_error() -> None:
-    """Guard that a missing ``bcftools`` binary surfaces an install hint instead of a raw OSError."""
+    """Guard that a missing ``bcftools`` binary surfaces an install hint instead of a raw
+    OSError."""
     with pytest.raises(MissingToolError, match="install bcftools"):
         ensure_bcftools_available("bcftools-does-not-exist")
 
 
-def test_generate_consensus_fasta_handles_stderr_heavy_subprocess_without_hanging(tmp_path: Path) -> None:
+def test_generate_consensus_fasta_handles_stderr_heavy_subprocess_without_hanging(
+    tmp_path: Path,
+) -> None:
     """Prevent regression where a chatty bcftools stderr would deadlock the subprocess pipes."""
     sequence = "A" * 262_144
     reference = tmp_path / "reference.fa"
@@ -401,7 +417,9 @@ def test_generate_consensus_fasta_handles_stderr_heavy_subprocess_without_hangin
     if process.is_alive():
         process.terminate()
         process.join(timeout=1)
-        pytest.fail("generate_consensus_fasta hung when bcftools emitted stderr before consuming stdin")
+        pytest.fail(
+            "generate_consensus_fasta hung when bcftools emitted stderr before consuming stdin"
+        )
 
     try:
         result = result_queue.get(timeout=1)
@@ -416,7 +434,9 @@ def test_generate_consensus_fasta_handles_stderr_heavy_subprocess_without_hangin
     assert result["sequence_length"] == len(sequence)
 
 
-def _run_generate_consensus_fasta(result_queue, reference: Path, vcf: Path, output_fasta: Path, fake_bcftools: Path) -> None:  # noqa: ANN001
+def _run_generate_consensus_fasta(
+    result_queue, reference: Path, vcf: Path, output_fasta: Path, fake_bcftools: Path
+) -> None:  # noqa: ANN001
     try:
         result = generate_consensus_fasta(
             sample_id="cat_1",
@@ -442,8 +462,7 @@ def _run_generate_consensus_fasta(result_queue, reference: Path, vcf: Path, outp
 def _write_fake_bcftools(tmp_path: Path, *, emit_stderr_before_stdin_bytes: int = 0) -> Path:
     script = tmp_path / "fake_bcftools.py"
     stderr_preamble = (
-        f"sys.stderr.write('E' * {emit_stderr_before_stdin_bytes})\n"
-        "sys.stderr.flush()\n"
+        f"sys.stderr.write('E' * {emit_stderr_before_stdin_bytes})\nsys.stderr.flush()\n"
         if emit_stderr_before_stdin_bytes
         else ""
     )
@@ -499,7 +518,8 @@ def _write_fake_bcftools(tmp_path: Path, *, emit_stderr_before_stdin_bytes: int 
             "        continue\n"
             "    fields = line.split('\\t')\n"
             "    chrom, pos, _id, ref, alt_field, _qual, filt, _info, fmt = fields[:9]\n"
-            "    sample_fields = dict(zip(fmt.split(':'), fields[header.index(sample)].split(':'), strict=False))\n"
+            "    sample_fields = dict(zip(fmt.split(':'),"
+            " fields[header.index(sample)].split(':'), strict=False))\n"
             "    gt = sample_fields.get('GT')\n"
             "    if filt not in {'PASS', '.'} or gt is None:\n"
             "        continue\n"

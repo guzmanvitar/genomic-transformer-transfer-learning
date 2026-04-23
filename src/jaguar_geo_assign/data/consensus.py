@@ -21,15 +21,15 @@ intervals.
 
 from __future__ import annotations
 
-from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
 import gzip
-from pathlib import Path
 import re
 import shutil
 import subprocess
 import tempfile
-from typing import Mapping, Sequence
+from collections.abc import Mapping, Sequence
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
+from pathlib import Path
 
 from .acquisition import AcquisitionError
 
@@ -267,7 +267,9 @@ def classify_consensus_site(
 
     allele_index = int(allele_tokens[0])
     if allele_index == 0:
-        return ConsensusDecision(action="reference", category="homozygous_reference", replacement=ref)
+        return ConsensusDecision(
+            action="reference", category="homozygous_reference", replacement=ref
+        )
     if allele_index > len(normalized_alts):
         return ConsensusDecision(action="mask", category="invalid_alt_index", replacement=None)
     if len(normalized_alts) > 1:
@@ -364,7 +366,8 @@ def _validated_gt_tokens(
         vcf_fragment = f" in VCF {vcf_path}" if vcf_path is not None else ""
         raise MalformedGenotypeError(
             "Malformed non-numeric GT token(s) "
-            f"{malformed_tokens} in GT='{genotype}'{sample_fragment}{locus_fragment}{vcf_fragment}; "
+            f"{malformed_tokens} in GT='{genotype}'"
+            f"{sample_fragment}{locus_fragment}{vcf_fragment}; "
             "expected numeric allele indices or '.' no-call markers."
         )
     return allele_tokens
@@ -426,7 +429,8 @@ def ensure_bcftools_available(executable: str = "bcftools") -> str:
     resolved = shutil.which(executable)
     if not resolved:
         raise MissingToolError(
-            f"Required executable '{executable}' was not found on PATH; install bcftools before consensus generation."
+            f"Required executable '{executable}' was not found on PATH; "
+            "install bcftools before consensus generation."
         )
     return resolved
 
@@ -506,9 +510,10 @@ def generate_consensus_fasta(
         if prepared.mask_bed is not None:
             command.extend(["-m", str(prepared.mask_bed)])
         command.append(str(prepared.filtered_vcf))
-        with _open_maybe_gzip(reference_path) as reference_handle, output_path.open(
-            "w", encoding="utf-8"
-        ) as output_handle:
+        with (
+            _open_maybe_gzip(reference_path) as reference_handle,
+            output_path.open("w", encoding="utf-8") as output_handle,
+        ):
             with subprocess.Popen(
                 command,
                 stdin=subprocess.PIPE,
@@ -518,7 +523,9 @@ def generate_consensus_fasta(
             ) as completed:
                 stdin_handle = completed.stdin
                 if stdin_handle is None:
-                    raise AcquisitionError(f"bcftools consensus did not expose stdin for {sample_id}")
+                    raise AcquisitionError(
+                        f"bcftools consensus did not expose stdin for {sample_id}"
+                    )
 
                 def _write_reference_to_stdin() -> None:
                     """Stream the reference FASTA into bcftools stdin.
@@ -658,7 +665,8 @@ def _prepare_consensus(
     if not _matches_expected_reference_build(reference_evidence, expected_reference_tokens):
         raise ReferenceMismatchError(
             "Reference FASTA "
-            f"{reference_fasta} does not canonically match expected build evidence {expected_reference_tokens}"
+            f"{reference_fasta} does not canonically match expected build evidence "
+            f"{expected_reference_tokens}"
         )
 
     filtered_vcf = work_dir / f"{sample_id}.prepared.vcf"
@@ -685,18 +693,20 @@ def _prepare_consensus(
                     raise AcquisitionError(f"Sample '{sample_id}' not found in VCF {sample_vcf}")
                 if not vcf_reference:
                     raise ReferenceMismatchError(
-                        f"VCF {sample_vcf} is missing explicit reference/build metadata in a ##reference header"
+                        f"VCF {sample_vcf} is missing explicit reference/build metadata "
+                        "in a ##reference header"
                     )
                 if not _matches_expected_reference_build(vcf_reference, expected_reference_tokens):
                     raise ReferenceMismatchError(
-                        "VCF "
-                        f"{sample_vcf} declares reference '{vcf_reference}', which does not canonically match "
+                        f"VCF {sample_vcf} declares reference '{vcf_reference}', "
+                        "which does not canonically match "
                         f"expected build evidence {expected_reference_tokens}"
                     )
                 if header_contigs and not header_contigs.issubset(contig_headers.keys()):
                     missing_contigs = sorted(header_contigs.difference(contig_headers.keys()))
                     raise ContigMismatchError(
-                        f"VCF {sample_vcf} references contigs absent from {reference_fasta}: {missing_contigs[:5]}"
+                        f"VCF {sample_vcf} references contigs absent from "
+                        f"{reference_fasta}: {missing_contigs[:5]}"
                     )
                 sample_index = columns.index(sample_id)
                 sink.write(line)
@@ -720,9 +730,13 @@ def _prepare_consensus(
                 )
             chrom, pos_str, _, ref, alt_field, _, filter_value, _, format_field = fields[:9]
             if chrom not in contig_headers:
-                raise ContigMismatchError(f"Contig '{chrom}' from {sample_vcf} is absent from {reference_fasta}")
+                raise ContigMismatchError(
+                    f"Contig '{chrom}' from {sample_vcf} is absent from {reference_fasta}"
+                )
             alts = _normalize_alt_alleles(alt_field.split(",") if alt_field else [])
-            sample_format = dict(zip(format_field.split(":"), fields[sample_index].split(":"), strict=False))
+            sample_format = dict(
+                zip(format_field.split(":"), fields[sample_index].split(":"), strict=False)
+            )
             decision = classify_consensus_site(
                 ref,
                 alts,
@@ -756,7 +770,9 @@ def _prepare_consensus(
                 )
             )
         if not total_records:
-            raise AcquisitionError(f"VCF {sample_vcf} does not contain any records for sample {sample_id}")
+            raise AcquisitionError(
+                f"VCF {sample_vcf} does not contain any records for sample {sample_id}"
+            )
 
     if mask_spans:
         with mask_bed.open("w", encoding="utf-8") as handle:
@@ -814,11 +830,15 @@ def _read_fasta_headers(reference_fasta: Path) -> dict[str, str]:
                 full_header = line[1:].strip()
                 headers[full_header.split()[0]] = full_header
     if not headers:
-        raise AcquisitionError(f"Reference FASTA {reference_fasta} did not contain any contig headers")
+        raise AcquisitionError(
+            f"Reference FASTA {reference_fasta} did not contain any contig headers"
+        )
     return headers
 
 
-def _matches_expected_reference_build(evidence: str, expected_reference_tokens: Sequence[str]) -> bool:
+def _matches_expected_reference_build(
+    evidence: str, expected_reference_tokens: Sequence[str]
+) -> bool:
     """Check whether *evidence* contains all expected reference build tokens.
 
     Both the evidence string and each token are canonicalized (lowercased,
@@ -836,7 +856,8 @@ def _matches_expected_reference_build(evidence: str, expected_reference_tokens: 
     """
     canonical_evidence = _canonicalize_reference_evidence(evidence)
     return all(
-        _canonicalize_reference_evidence(token) in canonical_evidence for token in expected_reference_tokens
+        _canonicalize_reference_evidence(token) in canonical_evidence
+        for token in expected_reference_tokens
     )
 
 
@@ -864,5 +885,8 @@ def _open_maybe_gzip(path: Path):
     Returns:
         A text-mode file handle (UTF-8).
     """
-    return gzip.open(path, "rt", encoding="utf-8") if path.suffix == ".gz" else path.open("r", encoding="utf-8")
-
+    return (
+        gzip.open(path, "rt", encoding="utf-8")
+        if path.suffix == ".gz"
+        else path.open("r", encoding="utf-8")
+    )

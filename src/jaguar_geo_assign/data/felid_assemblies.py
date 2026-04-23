@@ -20,10 +20,10 @@ produces typed plans. Actual transfer is handled by consumers via the existing
 
 from __future__ import annotations
 
+import re
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-import re
-from typing import Mapping, Sequence
 
 from jaguar_geo_assign.data.acquisition import DownloadAsset
 
@@ -166,4 +166,3 @@ def build_felid_reference_manifest(
         "every felid reference download must be MD5-verified"
     )
     return tuple(assets)
-

@@ -9,8 +9,9 @@ the prepare → window → tokenize cascade.
 from __future__ import annotations
 
 import gzip
+from collections.abc import Iterable
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any
 
 from ..data.preprocessor import (
     ExportContract,
@@ -105,7 +106,11 @@ def _resolve_path(base_dir: Path, path: str | Path, *, prefer_cwd: bool = False)
     cwd_candidate = (Path.cwd() / candidate).resolve()
     base_candidate = (base_dir / candidate).resolve()
     if prefer_cwd:
-        return cwd_candidate if cwd_candidate.exists() or not base_candidate.exists() else base_candidate
+        return (
+            cwd_candidate
+            if cwd_candidate.exists() or not base_candidate.exists()
+            else base_candidate
+        )
     return base_candidate if base_candidate.exists() else cwd_candidate
 
 
@@ -118,7 +123,11 @@ def _open_maybe_gzip(path: Path):
     Returns:
         A text-mode file handle (UTF-8).
     """
-    return gzip.open(path, "rt", encoding="utf-8") if path.suffix == ".gz" else path.open("r", encoding="utf-8")
+    return (
+        gzip.open(path, "rt", encoding="utf-8")
+        if path.suffix == ".gz"
+        else path.open("r", encoding="utf-8")
+    )
 
 
 def _iter_fasta_sequences(path: str | Path) -> Iterable[tuple[str, str]]:
@@ -153,7 +162,9 @@ def _iter_fasta_sequences(path: str | Path) -> Iterable[tuple[str, str]]:
                 current_parts = []
                 continue
             if current_name is None:
-                raise ValueError(f"FASTA {fasta_path} contains sequence data before the first header")
+                raise ValueError(
+                    f"FASTA {fasta_path} contains sequence data before the first header"
+                )
             current_parts.append(line)
     if current_name is None:
         raise ValueError(f"FASTA {fasta_path} did not contain any sequences")
@@ -179,12 +190,15 @@ def _require_runtime_boolean(value: object, *, field_name: str) -> bool:
         RuntimeError: If *value* is not exactly ``True`` or ``False``.
     """
     if type(value) is not bool:
-        raise RuntimeError(f"{field_name} must be an actual boolean, got {value!r} ({type(value).__name__})")
+        raise RuntimeError(
+            f"{field_name} must be an actual boolean, got {value!r} ({type(value).__name__})"
+        )
     return value
 
 
 def _build_preprocessing_config(config: Any) -> PreprocessingConfig:
-    """Derive a ``PreprocessingConfig`` from any pipeline config with windowing/split/tokenizer sections.
+    """Derive a ``PreprocessingConfig`` from any pipeline config with windowing/split/tokenizer
+    sections.
 
     The consensus and felid-foundation configs share the same
     windowing/split/tokenizer shape even though their top-level dataclass
@@ -204,7 +218,9 @@ def _build_preprocessing_config(config: Any) -> PreprocessingConfig:
         A ``PreprocessingConfig`` ready for sequence preparation.
     """
     return PreprocessingConfig(
-        min_sequence_length=config.windowing.context_window if config.windowing.drop_short_sequences else 1,
+        min_sequence_length=config.windowing.context_window
+        if config.windowing.drop_short_sequences
+        else 1,
         max_ambiguity_fraction=config.windowing.max_ambiguous_fraction,
         window_size=config.windowing.context_window,
         window_stride=config.windowing.context_window - config.windowing.window_overlap,
@@ -256,14 +272,18 @@ def _assert_tokenizer_matches_config(config: Any, provenance: TokenizerProvenanc
     """
     if provenance.identifier != config.tokenizer.identifier:
         raise RuntimeError(
-            f"Tokenizer loader returned {provenance.identifier}, expected {config.tokenizer.identifier}"
+            f"Tokenizer loader returned {provenance.identifier}, "
+            f"expected {config.tokenizer.identifier}"
         )
     if provenance.revision != config.tokenizer.revision:
         raise RuntimeError(
-            f"Tokenizer loader returned revision {provenance.revision}, expected {config.tokenizer.revision}"
+            f"Tokenizer loader returned revision {provenance.revision}, "
+            f"expected {config.tokenizer.revision}"
         )
     if tuple(provenance.allowed_alphabet) != config.tokenizer.allowed_alphabet:
-        raise RuntimeError("Tokenizer loader returned an alphabet that does not match the config contract")
+        raise RuntimeError(
+            "Tokenizer loader returned an alphabet that does not match the config contract"
+        )
     if provenance.max_position_embeddings != config.tokenizer.max_position_embeddings:
         raise RuntimeError(
             "Tokenizer loader max_position_embeddings does not match the approved config"
@@ -281,9 +301,7 @@ def _assert_tokenizer_matches_config(config: Any, provenance: TokenizerProvenanc
         field_name="Tokenizer loader trust_remote_code",
     )
     if actual_trust_remote_code is not expected_trust_remote_code:
-        raise RuntimeError(
-            "Tokenizer loader trust_remote_code does not match the approved config"
-        )
+        raise RuntimeError("Tokenizer loader trust_remote_code does not match the approved config")
 
 
 def _build_export_contract(config: Any) -> ExportContract:
@@ -342,4 +360,3 @@ def _tokenize_sequence_records(
             continue
         tokenized_windows.extend(tokenize_windows(windows, tokenizer, provenance=provenance))
     return tuple(tokenized_windows)
-

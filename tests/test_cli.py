@@ -10,19 +10,24 @@ aggregator stays bounded, streaming-friendly, and faithful to the
 underlying mask-category and baseline-alignment bookkeeping.
 """
 
-from dataclasses import replace
 import gzip
-from pathlib import Path
 import json
 import stat
 import textwrap
+from dataclasses import replace
+from pathlib import Path
 
 import pytest
 
 from jaguar_geo_assign.cli import main
-from jaguar_geo_assign.data.consensus import ConsensusDiagnostics, ConsensusResult
 from jaguar_geo_assign.data import preprocessor as preprocessor_module
-from jaguar_geo_assign.data.preprocessor import ExportContractError, TokenizedWindow, TokenizerProvenance, WindowRecord
+from jaguar_geo_assign.data.consensus import ConsensusDiagnostics, ConsensusResult
+from jaguar_geo_assign.data.preprocessor import (
+    ExportContractError,
+    TokenizedWindow,
+    TokenizerProvenance,
+    WindowRecord,
+)
 from jaguar_geo_assign.pretrain import pipeline as pretrain_pipeline
 
 
@@ -36,7 +41,8 @@ def test_validate_config_reports_success(capsys) -> None:
 
 
 def test_describe_experiment_reports_deferred_baseline(capsys) -> None:
-    """Check that ``describe-experiment`` surfaces the deferred-baseline stage wiring to operators."""
+    """Check that ``describe-experiment`` surfaces the deferred-baseline stage wiring to
+    operators."""
     exit_code = main(["describe-experiment", "configs/examples/regression_transfer.toml"])
 
     captured = capsys.readouterr()
@@ -72,7 +78,9 @@ def test_validate_feline_config_rejects_non_boolean_trust_remote_code(
     """Reject truthy int values for ``trust_remote_code`` to prevent silent TOML type coercion."""
     invalid_config = tmp_path / "invalid_trust_remote_code.toml"
     invalid_config.write_text(
-        Path("configs/examples/feline_pretrain.toml").read_text(encoding="utf-8").replace(
+        Path("configs/examples/feline_pretrain.toml")
+        .read_text(encoding="utf-8")
+        .replace(
             "trust_remote_code = true",
             "trust_remote_code = 1",
         ),
@@ -96,7 +104,9 @@ def test_validate_feline_config_rejects_non_boolean_consensus_mismatch_guards(
     """Guard that assembly/contig-match flags must be TOML booleans rather than truthy ints."""
     invalid_config = tmp_path / f"invalid_{field_name}.toml"
     invalid_config.write_text(
-        Path("configs/examples/feline_pretrain.toml").read_text(encoding="utf-8").replace(
+        Path("configs/examples/feline_pretrain.toml")
+        .read_text(encoding="utf-8")
+        .replace(
             f"{field_name} = true",
             f"{field_name} = 1",
             1,
@@ -121,12 +131,13 @@ def test_describe_feline_config_reports_split_contract(capsys) -> None:
     captured = capsys.readouterr()
     assert exit_code == 0
     assert "Split contract: global_locus_block via contig, block_id" in captured.out
-    assert "Tokenizer: zhihan1996/DNABERT-2-117M@7bce263b15377fc15361f52cfab88f8b586abda0" in captured.out
+    assert (
+        "Tokenizer: zhihan1996/DNABERT-2-117M@7bce263b15377fc15361f52cfab88f8b586abda0"
+        in captured.out
+    )
 
 
-def test_check_feline_runtime_reports_missing_tool(
-    monkeypatch: pytest.MonkeyPatch, capsys
-) -> None:
+def test_check_feline_runtime_reports_missing_tool(monkeypatch: pytest.MonkeyPatch, capsys) -> None:
     """Ensure the runtime probe fails with an actionable message when external tools are absent."""
     monkeypatch.setattr("shutil.which", lambda _: None)
 
@@ -144,7 +155,8 @@ def test_check_feline_runtime_reports_missing_tool(
 def test_feline_cli_inspection_commands_report_actionable_config_errors(
     command: str, capsys
 ) -> None:
-    """Guard that every feline inspection command rejects a non-feline config without a traceback."""
+    """Guard that every feline inspection command rejects a non-feline config without a
+    traceback."""
     exit_code = main([command, "configs/examples/fine_tune.toml"])
 
     captured = capsys.readouterr()
@@ -157,7 +169,8 @@ def test_feline_cli_inspection_commands_report_actionable_config_errors(
 def test_pretrain_cli_smoke_path_runs_fixture_pipeline(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys
 ) -> None:
-    """Smoke-test the full pretrain CLI against fixture inputs and verify artifacts + diagnostics."""
+    """Smoke-test the full pretrain CLI against fixture inputs and verify artifacts +
+    diagnostics."""
     reference = tmp_path / "reference.fa"
     reference.write_text(
         ">chr1 GCF_000181335.3 Felis_catus_9.0\nAACCAA\n",
@@ -196,11 +209,11 @@ def test_pretrain_cli_smoke_path_runs_fixture_pipeline(
             reference_fasta = "{reference}"
             sample_manifest = "{sample_manifest}"
             source_vcf = "{sample_vcf}"
-            raw_dir = "{tmp_path / 'raw'}"
-            processed_dir = "{tmp_path / 'processed'}"
-            baseline_dir = "{tmp_path / 'baseline'}"
-            artifact_dir = "{tmp_path / 'artifacts'}"
-            report_dir = "{tmp_path / 'reports'}"
+            raw_dir = "{tmp_path / "raw"}"
+            processed_dir = "{tmp_path / "processed"}"
+            baseline_dir = "{tmp_path / "baseline"}"
+            artifact_dir = "{tmp_path / "artifacts"}"
+            report_dir = "{tmp_path / "reports"}"
 
             [consensus]
             assembly = "Felis_catus_9.0"
@@ -308,12 +321,18 @@ def test_pretrain_cli_smoke_path_runs_fixture_pipeline(
         for split in baseline_metadata["splits"].values()
         for relative_path in split["files"]
     ]
-    assert consensus_files and all(path.suffix == ".parquet" and path.exists() for path in consensus_files)
-    assert baseline_files and all(path.suffix == ".parquet" and path.exists() for path in baseline_files)
+    assert consensus_files and all(
+        path.suffix == ".parquet" and path.exists() for path in consensus_files
+    )
+    assert baseline_files and all(
+        path.suffix == ".parquet" and path.exists() for path in baseline_files
+    )
     exported_consensus_rows = json.loads(consensus_files[0].read_text(encoding="utf-8"))["rows"]
     assert exported_consensus_rows[0]["window"]["sequence_hash"]
     assert "sequence" not in exported_consensus_rows[0]["window"]
-    diagnostics = json.loads((tmp_path / "reports" / "eda_payload.json").read_text(encoding="utf-8"))
+    diagnostics = json.loads(
+        (tmp_path / "reports" / "eda_payload.json").read_text(encoding="utf-8")
+    )
     assert diagnostics["consensus_generation"]["cat_1"]["applied_variant_count"] == 1
     assert diagnostics["consensus_sample_overview"] == {
         "total_record_count": 1,
@@ -332,7 +351,8 @@ def test_pretrain_cli_smoke_path_runs_fixture_pipeline(
 
 
 def test_build_reference_sequence_records_deduplicates_identical_baseline_sequences() -> None:
-    """Verify baseline reference records are keyed by contig so identical samples do not double-count."""
+    """Verify baseline reference records are keyed by contig so identical samples do not
+    double-count."""
     records = pretrain_pipeline._build_reference_sequence_records(
         {"chr1": "AACCAA", "chr2": "TTGGCC"},
         (
@@ -362,7 +382,8 @@ def test_pretrain_pipeline_does_not_inflate_identical_reference_baseline_counts(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    """Guard that the baseline corpus is deduped per contig even across many samples sharing references."""
+    """Guard that the baseline corpus is deduped per contig even across many samples sharing
+    references."""
     reference = tmp_path / "reference.fa"
     reference.write_text(
         ">chr1 GCF_000181335.3 Felis_catus_9.0\nAACCAA\n",
@@ -416,11 +437,11 @@ def test_pretrain_pipeline_does_not_inflate_identical_reference_baseline_counts(
             reference_fasta = "{reference}"
             sample_manifest = "{sample_manifest}"
             source_vcf = "{sample_vcf_1}"
-            raw_dir = "{tmp_path / 'raw'}"
-            processed_dir = "{tmp_path / 'processed'}"
-            baseline_dir = "{tmp_path / 'baseline'}"
-            artifact_dir = "{tmp_path / 'artifacts'}"
-            report_dir = "{tmp_path / 'reports'}"
+            raw_dir = "{tmp_path / "raw"}"
+            processed_dir = "{tmp_path / "processed"}"
+            baseline_dir = "{tmp_path / "baseline"}"
+            artifact_dir = "{tmp_path / "artifacts"}"
+            report_dir = "{tmp_path / "reports"}"
 
             [consensus]
             assembly = "Felis_catus_9.0"
@@ -506,7 +527,9 @@ def test_pretrain_pipeline_does_not_inflate_identical_reference_baseline_counts(
         for relative_path in split["files"]
     ]
     baseline_rows = json.loads(baseline_files[0].read_text(encoding="utf-8"))["rows"]
-    diagnostics = json.loads((tmp_path / "reports" / "eda_payload.json").read_text(encoding="utf-8"))
+    diagnostics = json.loads(
+        (tmp_path / "reports" / "eda_payload.json").read_text(encoding="utf-8")
+    )
 
     assert result.sample_count == 2
     assert result.consensus_window_count == 2
@@ -525,7 +548,8 @@ def test_pretrain_pipeline_streams_fasta_records_and_prunes_only_non_emittable_b
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    """Verify FASTA records stream one-at-a-time and only sub-window-sized contigs are pruned from baseline."""
+    """Verify FASTA records stream one-at-a-time and only sub-window-sized contigs are pruned
+    from baseline."""
     reference = tmp_path / "reference.fa"
     reference.write_text(
         ">chr1 GCF_000181335.3 Felis_catus_9.0\nAACCAA\n"
@@ -585,11 +609,11 @@ def test_pretrain_pipeline_streams_fasta_records_and_prunes_only_non_emittable_b
             reference_fasta = "{reference}"
             sample_manifest = "{sample_manifest}"
             source_vcf = "{sample_vcf_1}"
-            raw_dir = "{tmp_path / 'raw'}"
-            processed_dir = "{tmp_path / 'processed'}"
-            baseline_dir = "{tmp_path / 'baseline'}"
-            artifact_dir = "{tmp_path / 'artifacts'}"
-            report_dir = "{tmp_path / 'reports'}"
+            raw_dir = "{tmp_path / "raw"}"
+            processed_dir = "{tmp_path / "processed"}"
+            baseline_dir = "{tmp_path / "baseline"}"
+            artifact_dir = "{tmp_path / "artifacts"}"
+            report_dir = "{tmp_path / "reports"}"
 
             [consensus]
             assembly = "Felis_catus_9.0"
@@ -667,7 +691,9 @@ def test_pretrain_pipeline_streams_fasta_records_and_prunes_only_non_emittable_b
     monkeypatch.setattr(
         pretrain_pipeline,
         "_load_fasta_sequences",
-        lambda *_args, **_kwargs: pytest.fail("run_feline_pretrain_pipeline should stream FASTA records"),
+        lambda *_args, **_kwargs: pytest.fail(
+            "run_feline_pretrain_pipeline should stream FASTA records"
+        ),
     )
     monkeypatch.setattr(preprocessor_module, "_load_pyarrow_parquet", _fake_pyarrow_parquet_backend)
 
@@ -689,7 +715,9 @@ def test_pretrain_pipeline_streams_fasta_records_and_prunes_only_non_emittable_b
         for file_path in baseline_files
         for row in json.loads(file_path.read_text(encoding="utf-8"))["rows"]
     ]
-    diagnostics = json.loads((tmp_path / "reports" / "eda_payload.json").read_text(encoding="utf-8"))
+    diagnostics = json.loads(
+        (tmp_path / "reports" / "eda_payload.json").read_text(encoding="utf-8")
+    )
 
     assert result.sample_count == 2
     assert result.consensus_window_count == 4
@@ -743,11 +771,11 @@ def test_pretrain_cli_smoke_path_accepts_gzip_fasta_inputs(
             reference_fasta = "{reference}"
             sample_manifest = "{sample_manifest}"
             source_vcf = "{sample_vcf}"
-            raw_dir = "{tmp_path / 'raw'}"
-            processed_dir = "{tmp_path / 'processed'}"
-            baseline_dir = "{tmp_path / 'baseline'}"
-            artifact_dir = "{tmp_path / 'artifacts'}"
-            report_dir = "{tmp_path / 'reports'}"
+            raw_dir = "{tmp_path / "raw"}"
+            processed_dir = "{tmp_path / "processed"}"
+            baseline_dir = "{tmp_path / "baseline"}"
+            artifact_dir = "{tmp_path / "artifacts"}"
+            report_dir = "{tmp_path / "reports"}"
 
             [consensus]
             assembly = "Felis_catus_9.0"
@@ -840,7 +868,9 @@ def test_pretrain_cli_smoke_path_accepts_gzip_fasta_inputs(
     )
     assert consensus_metadata["export_format"] == "parquet"
     assert baseline_metadata["export_format"] == "parquet"
-    diagnostics = json.loads((tmp_path / "reports" / "eda_payload.json").read_text(encoding="utf-8"))
+    diagnostics = json.loads(
+        (tmp_path / "reports" / "eda_payload.json").read_text(encoding="utf-8")
+    )
     assert diagnostics["consensus_generation"]["cat_1"]["applied_variant_count"] == 1
     assert diagnostics["consensus_samples"][0]["no_call_bases"] == 1
     assert diagnostics["consensus_samples"][0]["other_masked_bases"] == 1
@@ -849,9 +879,14 @@ def test_pretrain_cli_smoke_path_accepts_gzip_fasta_inputs(
 
 
 def test_runtime_diagnostics_payload_is_bounded_and_provenance_faithful() -> None:
-    """Check the runtime payload caps preview size while keeping corpus-wide mask tallies faithful."""
-    consensus_windows = tuple(_synthetic_tokenized_window(index=index, source="consensus") for index in range(192))
-    baseline_windows = tuple(_synthetic_tokenized_window(index=index, source="reference") for index in range(192))
+    """Check the runtime payload caps preview size while keeping corpus-wide mask tallies
+    faithful."""
+    consensus_windows = tuple(
+        _synthetic_tokenized_window(index=index, source="consensus") for index in range(192)
+    )
+    baseline_windows = tuple(
+        _synthetic_tokenized_window(index=index, source="reference") for index in range(192)
+    )
 
     payload = pretrain_pipeline._build_diagnostics_payload(
         tokenized_consensus=consensus_windows,
@@ -892,7 +927,10 @@ def test_runtime_diagnostics_payload_is_bounded_and_provenance_faithful() -> Non
         "multiallelic": round(21 / 1152, 6),
         "no_call": round(64 / 1152, 6),
     }
-    assert len(payload["consensus_samples"]) == pretrain_pipeline.DEFAULT_RUNTIME_DIAGNOSTIC_SAMPLE_LIMIT
+    assert (
+        len(payload["consensus_samples"])
+        == pretrain_pipeline.DEFAULT_RUNTIME_DIAGNOSTIC_SAMPLE_LIMIT
+    )
     assert payload["consensus_sample_overview"] == {
         "total_record_count": 192,
         "returned_record_count": pretrain_pipeline.DEFAULT_RUNTIME_DIAGNOSTIC_SAMPLE_LIMIT,
@@ -914,10 +952,13 @@ def test_runtime_diagnostics_payload_is_bounded_and_provenance_faithful() -> Non
 def test_runtime_diagnostics_passes_streaming_records_into_aggregation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Guard that aggregated records are passed as generators so memory stays bounded on large corpora."""
+    """Guard that aggregated records are passed as generators so memory stays bounded on large
+    corpora."""
     captured_types: dict[str, str] = {}
 
-    def fake_build_eda_payload(consensus_records, baseline_records, **_: object) -> dict[str, object]:
+    def fake_build_eda_payload(
+        consensus_records, baseline_records, **_: object
+    ) -> dict[str, object]:
         captured_types["consensus"] = type(consensus_records).__name__
         captured_types["baseline"] = type(baseline_records).__name__
         assert next(iter(consensus_records))["sample_id"] == "cat-1"
@@ -938,8 +979,12 @@ def test_runtime_diagnostics_passes_streaming_records_into_aggregation(
     monkeypatch.setattr(pretrain_pipeline, "build_eda_payload", fake_build_eda_payload)
 
     payload = pretrain_pipeline._build_diagnostics_payload(
-        tokenized_consensus=tuple(_synthetic_tokenized_window(index=index, source="consensus") for index in range(4)),
-        tokenized_baseline=tuple(_synthetic_tokenized_window(index=index, source="reference") for index in range(4)),
+        tokenized_consensus=tuple(
+            _synthetic_tokenized_window(index=index, source="consensus") for index in range(4)
+        ),
+        tokenized_baseline=tuple(
+            _synthetic_tokenized_window(index=index, source="reference") for index in range(4)
+        ),
         consensus_results={},
     )
 
@@ -948,7 +993,8 @@ def test_runtime_diagnostics_passes_streaming_records_into_aggregation(
 
 
 def test_runtime_diagnostics_records_unmatched_consensus_windows_without_crashing() -> None:
-    """Ensure consensus windows with no baseline match are counted and annotated rather than raising."""
+    """Ensure consensus windows with no baseline match are counted and annotated rather than
+    raising."""
     unmatched_consensus = replace(
         _synthetic_tokenized_window(index=2, source="consensus"),
         window=replace(
@@ -963,7 +1009,9 @@ def test_runtime_diagnostics_records_unmatched_consensus_windows_without_crashin
             _synthetic_tokenized_window(index=1, source="consensus"),
             unmatched_consensus,
         ),
-        tokenized_baseline=tuple(_synthetic_tokenized_window(index=index, source="reference") for index in range(2)),
+        tokenized_baseline=tuple(
+            _synthetic_tokenized_window(index=index, source="reference") for index in range(2)
+        ),
         consensus_results={},
     )
 
@@ -978,8 +1026,11 @@ def test_runtime_diagnostics_records_unmatched_consensus_windows_without_crashin
     assert unmatched_sample["variant_count"] == 0
 
 
-def test_runtime_diagnostics_handles_overlapping_mask_categories_without_callable_underflow() -> None:
-    """Verify overlapping mask tallies do not drive the callable-base counter below zero in the payload."""
+def test_runtime_diagnostics_handles_overlapping_mask_categories_without_callable_underflow() -> (
+    None
+):
+    """Verify overlapping mask tallies do not drive the callable-base counter below zero in the
+    payload."""
     overlapping_mask_window = replace(
         _synthetic_tokenized_window(index=0, source="consensus"),
         window=replace(
@@ -1007,11 +1058,15 @@ def test_runtime_diagnostics_handles_overlapping_mask_categories_without_callabl
     assert sample["no_call_bases"] == 4
     assert sample["masked_base_counts"] == {"filtered": 4, "no_call": 4}
     assert payload["consensus_corpus"]["shape_issue_count"] == 0
-    assert payload["consensus_corpus"]["masked_category_base_counts"] == {"filtered": 4, "no_call": 4}
+    assert payload["consensus_corpus"]["masked_category_base_counts"] == {
+        "filtered": 4,
+        "no_call": 4,
+    }
 
 
 def test_runtime_diagnostics_accepts_retained_reference_window_with_realized_n_coverage() -> None:
-    """Check retained reference windows whose sequences already contain ``N`` do not register as shape issues."""
+    """Check retained reference windows whose sequences already contain ``N`` do not register as
+    shape issues."""
     config = preprocessor_module.PreprocessingConfig(
         min_sequence_length=6,
         max_ambiguity_fraction=1.0,
@@ -1062,7 +1117,8 @@ def test_runtime_diagnostics_accepts_retained_reference_window_with_realized_n_c
 
 
 def test_runtime_diagnostics_flags_inconsistent_unique_masked_coverage() -> None:
-    """Guard that callable + unique-masked totals shorter than the sequence are reported as shape issues."""
+    """Guard that callable + unique-masked totals shorter than the sequence are reported as shape
+    issues."""
     malformed_window = replace(
         _synthetic_tokenized_window(index=0, source="consensus"),
         window=replace(
@@ -1090,7 +1146,8 @@ def test_runtime_diagnostics_flags_inconsistent_unique_masked_coverage() -> None
 
 
 def test_runtime_diagnostics_accepts_valid_consensus_window_from_producer() -> None:
-    """End-to-end guard: a consensus window with an ``N`` covered by a mask span passes the coverage invariant.
+    """End-to-end guard: a consensus window with an ``N`` covered by a mask span passes the
+    coverage invariant.
 
     This exercises the producer path (``window_sequences``) rather than a
     hand-authored ``replace`` so it proves Option B's source-aware producer
@@ -1142,7 +1199,8 @@ def test_runtime_diagnostics_accepts_valid_consensus_window_from_producer() -> N
 
 
 def test_runtime_diagnostics_flags_corrupted_consensus_provenance_from_producer() -> None:
-    """End-to-end guard: a consensus window whose ``N`` bases are not covered by mask spans fails loudly.
+    """End-to-end guard: a consensus window whose ``N`` bases are not covered by mask spans fails
+    loudly.
 
     This is the critical Option B invariant: the producer must NOT silently
     reconcile a VCF→FASTA provenance gap by falling back to
@@ -1194,7 +1252,8 @@ def test_runtime_diagnostics_flags_corrupted_consensus_provenance_from_producer(
 
 
 def test_pretrain_cli_reports_actionable_config_error(capsys) -> None:
-    """Ensure ``pretrain`` rejects a non-feline config with an operator-readable message (no traceback)."""
+    """Ensure ``pretrain`` rejects a non-feline config with an operator-readable message (no
+    traceback)."""
     exit_code = main(["pretrain", "--config", "configs/examples/fine_tune.toml"])
 
     captured = capsys.readouterr()
@@ -1205,7 +1264,8 @@ def test_pretrain_cli_reports_actionable_config_error(capsys) -> None:
 def test_pretrain_cli_reports_actionable_parquet_dependency_error(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys
 ) -> None:
-    """Verify a missing pyarrow backend surfaces the ``uv add pyarrow`` hint rather than an import error."""
+    """Verify a missing pyarrow backend surfaces the ``uv add pyarrow`` hint rather than an
+    import error."""
     reference = tmp_path / "reference.fa"
     reference.write_text(">chr1 GCF_000181335.3 Felis_catus_9.0\nAACCAA\n", encoding="utf-8")
     sample_vcf = tmp_path / "cat_1.vcf"
@@ -1239,11 +1299,11 @@ def test_pretrain_cli_reports_actionable_parquet_dependency_error(
             reference_fasta = "{reference}"
             sample_manifest = "{sample_manifest}"
             source_vcf = "{sample_vcf}"
-            raw_dir = "{tmp_path / 'raw'}"
-            processed_dir = "{tmp_path / 'processed'}"
-            baseline_dir = "{tmp_path / 'baseline'}"
-            artifact_dir = "{tmp_path / 'artifacts'}"
-            report_dir = "{tmp_path / 'reports'}"
+            raw_dir = "{tmp_path / "raw"}"
+            processed_dir = "{tmp_path / "processed"}"
+            baseline_dir = "{tmp_path / "baseline"}"
+            artifact_dir = "{tmp_path / "artifacts"}"
+            report_dir = "{tmp_path / "reports"}"
 
             [consensus]
             assembly = "Felis_catus_9.0"
@@ -1410,7 +1470,8 @@ def _write_fake_bcftools(tmp_path: Path) -> Path:
             "        continue\n"
             "    fields = line.split('\\t')\n"
             "    chrom, pos, _id, ref, alt_field, _qual, filt, _info, fmt = fields[:9]\n"
-            "    sample_fields = dict(zip(fmt.split(':'), fields[header.index(sample)].split(':'), strict=False))\n"
+            "    sample_fields = dict(zip(fmt.split(':'),"
+            " fields[header.index(sample)].split(':'), strict=False))\n"
             "    gt = sample_fields.get('GT')\n"
             "    if filt not in {'PASS', '.'} or gt is None:\n"
             "        continue\n"
@@ -1521,7 +1582,9 @@ def test_felid_foundation_cli_smoke_help_exits_zero(command: str) -> None:
 
 def test_validate_felid_foundation_config_reports_success(capsys) -> None:
     """Verify the approved felid foundation config passes the strict validator."""
-    exit_code = main(["validate-felid-foundation-config", "configs/examples/felid_foundation_pretrain.toml"])
+    exit_code = main(
+        ["validate-felid-foundation-config", "configs/examples/felid_foundation_pretrain.toml"]
+    )
 
     captured = capsys.readouterr()
     assert exit_code == 0
@@ -1530,7 +1593,9 @@ def test_validate_felid_foundation_config_reports_success(capsys) -> None:
 
 def test_describe_felid_foundation_config_reports_species(capsys) -> None:
     """Check the describe command surfaces the species roster."""
-    exit_code = main(["describe-felid-foundation-config", "configs/examples/felid_foundation_pretrain.toml"])
+    exit_code = main(
+        ["describe-felid-foundation-config", "configs/examples/felid_foundation_pretrain.toml"]
+    )
 
     captured = capsys.readouterr()
     assert exit_code == 0

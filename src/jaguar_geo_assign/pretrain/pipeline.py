@@ -26,16 +26,15 @@ Key fragility flags
 from __future__ import annotations
 
 import csv
-from dataclasses import asdict, dataclass
 import json
+from collections.abc import Callable, Iterable
+from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Callable, Iterable
 
 from ..config import FelinePipelineConfig, load_feline_pipeline_config
 from ..data.consensus import ConsensusResult, generate_consensus_fastas
 from ..data.pipeline_contract import REQUIRED_SAMPLE_MANIFEST_FIELDS
 from ..data.preprocessor import (
-    ExportContract,
     PreprocessingConfig,
     SequenceRecord,
     TokenizedWindow,
@@ -53,9 +52,7 @@ from ._shared import (
     _build_preprocessing_config,
     _build_tokenizer_provenance,
     _iter_fasta_sequences,
-    _open_maybe_gzip,
     _require_existing_file,
-    _require_runtime_boolean,
     _resolve_path,
 )
 
@@ -98,7 +95,9 @@ callable lets tests or alternative pipelines provide mock or non-HuggingFace
 tokenizers without modifying orchestration logic.
 """
 
-ExportWriter = Callable[[tuple[TokenizedWindow, ...], Path, FelinePipelineConfig, TokenizerProvenance], Path]
+ExportWriter = Callable[
+    [tuple[TokenizedWindow, ...], Path, FelinePipelineConfig, TokenizerProvenance], Path
+]
 """Dependency-injection hook for corpus serialisation.
 
 A callable that persists a tuple of ``TokenizedWindow`` objects to disk and
@@ -255,12 +254,22 @@ def run_feline_pretrain_pipeline(
         provenance,
     )
     if not tokenized_consensus:
-        raise RuntimeError("No consensus windows survived preprocessing; check sequence length and ambiguity filters")
+        raise RuntimeError(
+            "No consensus windows survived preprocessing; "
+            "check sequence length and ambiguity filters"
+        )
     if not tokenized_baseline:
-        raise RuntimeError("No baseline windows survived preprocessing; check the reference FASTA and window settings")
+        raise RuntimeError(
+            "No baseline windows survived preprocessing; "
+            "check the reference FASTA and window settings"
+        )
 
-    consensus_export = export_writer(tokenized_consensus, processed_dir / "consensus_tokens", config, provenance)
-    baseline_export = export_writer(tokenized_baseline, baseline_dir / "reference_tokens", config, provenance)
+    consensus_export = export_writer(
+        tokenized_consensus, processed_dir / "consensus_tokens", config, provenance
+    )
+    baseline_export = export_writer(
+        tokenized_baseline, baseline_dir / "reference_tokens", config, provenance
+    )
 
     diagnostics_payload = _build_diagnostics_payload(
         tokenized_consensus=tokenized_consensus,
@@ -269,7 +278,9 @@ def run_feline_pretrain_pipeline(
     )
     report_dir.mkdir(parents=True, exist_ok=True)
     diagnostics_path = report_dir / "eda_payload.json"
-    diagnostics_path.write_text(json.dumps(diagnostics_payload, indent=2, sort_keys=True), encoding="utf-8")
+    diagnostics_path.write_text(
+        json.dumps(diagnostics_payload, indent=2, sort_keys=True), encoding="utf-8"
+    )
 
     artifact_dir.mkdir(parents=True, exist_ok=True)
     summary_path = artifact_dir / "pretrain_run_summary.json"
@@ -281,7 +292,8 @@ def run_feline_pretrain_pipeline(
                 "consensus_window_count": len(tokenized_consensus),
                 "baseline_window_count": len(tokenized_baseline),
                 "consensus_fastas": [
-                    str(consensus_results[entry.sample_id].output_fasta) for entry in manifest_entries
+                    str(consensus_results[entry.sample_id].output_fasta)
+                    for entry in manifest_entries
                 ],
                 "consensus_export": str(consensus_export),
                 "baseline_export": str(baseline_export),
@@ -298,7 +310,9 @@ def run_feline_pretrain_pipeline(
         sample_count=len(manifest_entries),
         consensus_window_count=len(tokenized_consensus),
         baseline_window_count=len(tokenized_baseline),
-        consensus_fastas=tuple(consensus_results[entry.sample_id].output_fasta for entry in manifest_entries),
+        consensus_fastas=tuple(
+            consensus_results[entry.sample_id].output_fasta for entry in manifest_entries
+        ),
         artifacts=FelinePretrainArtifacts(
             consensus_dir=consensus_dir,
             consensus_export=consensus_export,
@@ -361,7 +375,9 @@ def load_feline_sample_manifest(path: str | Path) -> tuple[FelineSampleManifestE
         reader = csv.DictReader(handle, delimiter="\t")
         if reader.fieldnames is None:
             raise ValueError(f"Sample manifest {manifest_path} must include a header row")
-        missing_fields = [field for field in REQUIRED_SAMPLE_MANIFEST_FIELDS if field not in reader.fieldnames]
+        missing_fields = [
+            field for field in REQUIRED_SAMPLE_MANIFEST_FIELDS if field not in reader.fieldnames
+        ]
         if missing_fields:
             raise ValueError(
                 "Sample manifest must include columns: "
@@ -377,7 +393,8 @@ def load_feline_sample_manifest(path: str | Path) -> tuple[FelineSampleManifestE
             vcf_path_raw = (row.get("vcf_path") or "").strip()
             if not sample_id or not individual_id or not vcf_path_raw:
                 raise ValueError(
-                    f"Sample manifest row {row_number} must define sample_id, individual_id, and vcf_path"
+                    f"Sample manifest row {row_number} must define "
+                    "sample_id, individual_id, and vcf_path"
                 )
             if sample_id in seen_sample_ids:
                 raise ValueError(f"Sample manifest contains duplicate sample_id '{sample_id}'")
@@ -463,7 +480,9 @@ def _iter_consensus_sequence_records(
     for sample_id, result in sorted(consensus_results.items()):
         mask_spans_by_contig: dict[str, list[tuple[int, int, str]]] = {}
         for span in result.mask_spans:
-            mask_spans_by_contig.setdefault(span.contig, []).append((span.start, span.end, span.category))
+            mask_spans_by_contig.setdefault(span.contig, []).append(
+                (span.start, span.end, span.category)
+            )
         for contig, sequence in _iter_fasta_sequences(result.output_fasta):
             yield SequenceRecord(
                 sample_id=sample_id,
@@ -560,14 +579,18 @@ def _build_diagnostics_payload(
         for record in tokenized_baseline
     }
     unmatched_consensus_window_count = sum(
-        1 for record in tokenized_consensus if _tokenized_window_lookup_key(record) not in reference_lookup
+        1
+        for record in tokenized_consensus
+        if _tokenized_window_lookup_key(record) not in reference_lookup
     )
     return {
         "consensus_generation": {
-            sample_id: asdict(result.diagnostics) for sample_id, result in sorted(consensus_results.items())
+            sample_id: asdict(result.diagnostics)
+            for sample_id, result in sorted(consensus_results.items())
         },
         "baseline_window_alignment": {
-            "matched_consensus_window_count": len(tokenized_consensus) - unmatched_consensus_window_count,
+            "matched_consensus_window_count": len(tokenized_consensus)
+            - unmatched_consensus_window_count,
             "unmatched_consensus_window_count": unmatched_consensus_window_count,
         },
         **build_eda_payload(
@@ -638,7 +661,9 @@ def _tokenized_windows_to_diagnostics_records(
         if reference_window_matched:
             variant_count = sum(
                 1
-                for base, reference_base in zip(record.window.sequence, reference_sequence)
+                for base, reference_base in zip(
+                    record.window.sequence, reference_sequence, strict=False
+                )
                 if base != "N" and base != reference_base
             )
         yield {
@@ -682,5 +707,3 @@ def _load_fasta_sequences(path: str | Path) -> dict[str, str]:
         A mapping of contig name to nucleotide string.
     """
     return dict(_iter_fasta_sequences(path))
-
-
