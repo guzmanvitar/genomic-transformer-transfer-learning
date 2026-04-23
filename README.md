@@ -80,11 +80,11 @@ Check runtime prerequisites:
 
 **Step 1 — acquire the six approved felid reference FASTAs** (MD5 verify-before-skip, idempotent, logs structured events):
 
-- `uv run python -m jaguar_geo_assign.cli acquire-felid-foundation-assemblies --config configs/examples/felid_foundation_pretrain.toml`
+- `uv run python -m jaguar_geo_assign.cli acquire-felid-foundation-assemblies configs/examples/felid_foundation_pretrain.toml`
 
 **Step 2 — run pretraining** (fails loudly with a diagnostic pointing back to `acquire-felid-foundation-assemblies` if any expected FASTA is missing):
 
-- `uv run python -m jaguar_geo_assign.cli felid-foundation-pretrain --config configs/examples/felid_foundation_pretrain.toml`
+- `uv run python -m jaguar_geo_assign.cli felid-foundation-pretrain configs/examples/felid_foundation_pretrain.toml`
 
 Peak RAM is bounded by the largest single species: the streaming Parquet writer holds at most one species' windows in memory before the next species begins.
 
