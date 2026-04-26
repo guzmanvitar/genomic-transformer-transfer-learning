@@ -8,7 +8,8 @@ classifier sees both haplotype contributions instead of losing the locus to
 masking. Reference-only homozygotes carry no signal vs. the reference and are
 dropped to keep the training corpus informative.
 
-VCF parsing helpers (filter gating, allele normalization, GT validation) are
+VCF parsing helpers (filter gating, allele normalization, GT validation,
+malformed-record diagnostics) and reference-build validation primitives are
 imported from ``consensus.py`` to keep the two pipelines' interpretation of
 "valid record" in lockstep; diverging here would silently let one pipeline
 accept records the other rejects.
@@ -17,21 +18,75 @@ accept records the other rejects.
 from __future__ import annotations
 
 import json
-from collections.abc import Mapping
+from collections.abc import Iterable, Iterator, Mapping, Sequence
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
 from .acquisition import AcquisitionError
 from .consensus import (
     PASSING_FILTER_VALUES,
+    ContigMismatchError,
+    ReferenceMismatchError,
+    _matches_expected_reference_build,
     _normalize_alt_alleles,
     _open_maybe_gzip,
+    _raise_malformed_vcf_record,
     _validated_gt_tokens,
 )
 
 WINDOW_SIZE = 512
 UPSTREAM_BASES = 256
 DOWNSTREAM_BASES = 255
+
+EXPECTED_REFERENCE_TOKENS = ("GCF_028533385.1", "Panthera_onca_HiC")
+"""Default canonical build tokens for the jaguar fine-tuning reference.
+
+The fine-tuning VCF is called against the jaguar assembly, so the default
+differs from ``consensus.py``'s felid-foundation tokens. Callers operating on
+a different reference (e.g. unit-test fixtures or a re-call against a future
+assembly) must override via the ``expected_reference_tokens`` kwarg.
+"""
+
+ALLOWED_NUCLEOTIDES = frozenset("ACGTN")
+"""Whitelist of nucleotide tokens DNABERT-2 can ingest without surprises.
+
+Intentionally narrower than the full IUPAC ambiguity alphabet: any REF/ALT
+allele outside this set (e.g. ``*`` spanning-deletion sentinels, IUPAC codes
+like ``Y``/``R``, or stray symbols) is rejected before a window is emitted so
+the model never sees a token its tokenizer cannot map.
+"""
+
+
+class ReferenceBaseMismatchError(AcquisitionError):
+    """The FASTA base at a VCF locus disagrees with the VCF ``REF`` allele.
+
+    Raised before a window is emitted whenever the reference sequence at the
+    1-based ``locus_pos`` does not match (case-insensitive) the ``REF``
+    column of the VCF record. This typically indicates that the FASTA and
+    VCF were derived from different assemblies even when build-token
+    validation passes (e.g. same accession, different patch level).
+    """
+
+
+class PloidyError(AcquisitionError):
+    """A VCF ``GT`` field has unexpected ploidy for the diploid jaguar pipeline.
+
+    Raised when the genotype contains anything other than exactly two allele
+    tokens. The fine-tuning heterozygote-doubling logic is mathematically
+    defined only for diploid calls, so haploid (e.g. ``"1"``), triploid
+    (e.g. ``"0/1/1"``) or higher-ploidy records must fail loudly rather than
+    be reinterpreted via ``set(tokens)`` collapsing.
+    """
+
+
+class InvalidAlleleAlphabetError(AcquisitionError):
+    """A VCF ``REF`` or ``ALT`` allele uses characters outside :data:`ALLOWED_NUCLEOTIDES`.
+
+    Raised eagerly so a single ``*`` spanning-deletion or stray IUPAC
+    ambiguity code never reaches :func:`extract_fasta_window` (where it
+    would otherwise be silently substituted into a training window the
+    tokenizer cannot represent).
+    """
 
 
 @dataclass(frozen=True)
@@ -75,6 +130,32 @@ class FinetuneWindow:
     filter_status: str
 
 
+@dataclass(frozen=True)
+class ReferenceIndex:
+    """Cached, validated FASTA reference loaded once for many-sample reuse.
+
+    Bundles the per-contig sequences with the headers and source path used
+    to perform reference-build validation. Construct via
+    :func:`load_reference_index` so the (one-time) build-token check runs
+    exactly once per object; callers can then thread the same index through
+    many :func:`iter_locus_windows_from_vcf` calls without re-reading the
+    multi-gigabyte FASTA per sample.
+
+    Attributes:
+        fasta_path: Path the FASTA was loaded from. Retained for
+            diagnostic error messages emitted by per-locus validators.
+        contig_sequences: Mapping of contig name → full reference sequence
+            (case preserved as on disk; callers uppercase on read).
+        contig_headers: Mapping of contig name → full FASTA header line
+            (without the leading ``>``). Used by the build-token check
+            and surfaced in error messages.
+    """
+
+    fasta_path: Path
+    contig_sequences: Mapping[str, str]
+    contig_headers: Mapping[str, str]
+
+
 def extract_fasta_window(
     *,
     contig_sequence: str,
@@ -96,7 +177,8 @@ def extract_fasta_window(
         contig_sequence: Full reference sequence for the contig containing
             the locus (any case; output is uppercased).
         locus_pos: 1-based VCF position of the SNP.
-        allele: Single-base allele to place at the locus position.
+        allele: Single-base allele to place at the locus position. Must be
+            in :data:`ALLOWED_NUCLEOTIDES` once uppercased.
         upstream: Number of bases to include before the locus (default 256).
         downstream: Number of bases to include after the locus (default 255).
 
@@ -105,12 +187,20 @@ def extract_fasta_window(
         coordinates, or ``None`` if the window extends beyond the contig.
 
     Raises:
-        ValueError: If ``allele`` is not a single base (multi-base variants
-            cannot be substituted into a fixed-width window without shifting
-            the flank coordinates).
+        ValueError: If ``allele`` is not exactly one character.
+        InvalidAlleleAlphabetError: If ``allele`` is single-character but
+            outside :data:`ALLOWED_NUCLEOTIDES` (case-insensitive); guards
+            spanning-deletion ``*`` sentinels and IUPAC ambiguity codes
+            from leaking into a training window.
     """
     if len(allele) != 1:
         raise ValueError(f"extract_fasta_window only supports single-base alleles; got {allele!r}")
+    upper_allele = allele.upper()
+    if upper_allele not in ALLOWED_NUCLEOTIDES:
+        raise InvalidAlleleAlphabetError(
+            f"Allele {allele!r} is outside the allowed nucleotide alphabet "
+            f"{sorted(ALLOWED_NUCLEOTIDES)}; refusing to write it into a training window."
+        )
     locus_idx = locus_pos - 1
     window_start = locus_idx - upstream
     window_end = locus_idx + 1 + downstream
@@ -118,31 +208,414 @@ def extract_fasta_window(
         return None
     upstream_seq = contig_sequence[window_start:locus_idx].upper()
     downstream_seq = contig_sequence[locus_idx + 1 : window_end].upper()
-    sequence = f"{upstream_seq}{allele.upper()}{downstream_seq}"
+    sequence = f"{upstream_seq}{upper_allele}{downstream_seq}"
     return sequence, window_start, window_end
 
 
-def _read_fasta_sequences(path: Path) -> dict[str, str]:
-    """Load every contig's full sequence into memory keyed by contig name.
+def _read_fasta_sequences(path: Path) -> tuple[dict[str, str], dict[str, str]]:
+    """Load every contig's full sequence and header line into memory.
 
     Trades memory for O(1) random access at every locus; the alternative
     (re-streaming the FASTA per locus) would dominate runtime for VCFs with
-    tens of thousands of records. For the jaguar reference (~2.5GB) this fits
-    in RAM on the target machines; if that ever changes, swap this for an
-    indexed FASTA reader without touching ``extract_fasta_window``.
+    tens of thousands of records. Both the sequence map and the header map
+    are returned so callers can do build-token validation without a second
+    pass over the file.
+
+    Returns:
+        Pair ``(contig_sequences, contig_headers)`` keyed by the first
+        whitespace token of each FASTA header.
+
+    Raises:
+        AcquisitionError: If the file contains no ``>`` headers.
     """
     sequences: dict[str, list[str]] = {}
+    headers: dict[str, str] = {}
     current: str | None = None
     with _open_maybe_gzip(path) as handle:
         for line in handle:
             if line.startswith(">"):
-                current = line[1:].split()[0]
+                full_header = line[1:].strip()
+                current = full_header.split()[0]
                 sequences[current] = []
+                headers[current] = full_header
             elif current is not None:
                 sequences[current].append(line.strip())
     if not sequences:
         raise AcquisitionError(f"Reference FASTA {path} did not contain any contig headers")
-    return {name: "".join(parts) for name, parts in sequences.items()}
+    return {name: "".join(parts) for name, parts in sequences.items()}, headers
+
+
+def load_reference_index(
+    reference_fasta: str | Path,
+    *,
+    expected_reference_tokens: Sequence[str] = EXPECTED_REFERENCE_TOKENS,
+) -> ReferenceIndex:
+    """Load and validate a reference FASTA exactly once for many-sample reuse.
+
+    Performs the same build-token sanity check that ``consensus.py``
+    enforces (filename + header lines must jointly contain every expected
+    token), then returns a :class:`ReferenceIndex` callers thread through
+    every per-sample :func:`iter_locus_windows_from_vcf` call. This is the
+    seam that prevents the production 57-sample workflow from re-reading
+    the ~2.5 GB FASTA per sample.
+
+    Args:
+        reference_fasta: Path to the reference FASTA (plain or gzipped).
+        expected_reference_tokens: Canonical build tokens that must
+            appear in either the filename or any header line.
+
+    Returns:
+        A :class:`ReferenceIndex` ready for streaming window extraction.
+
+    Raises:
+        ReferenceMismatchError: If the FASTA filename + header evidence
+            does not jointly match every expected build token.
+        AcquisitionError: Propagated from :func:`_read_fasta_sequences`
+            if the FASTA contains no contig headers.
+    """
+    fasta_path = Path(reference_fasta)
+    contig_sequences, contig_headers = _read_fasta_sequences(fasta_path)
+    reference_evidence = " ".join((fasta_path.name, *contig_headers.values()))
+    if not _matches_expected_reference_build(reference_evidence, expected_reference_tokens):
+        raise ReferenceMismatchError(
+            f"Reference FASTA {fasta_path} does not canonically match expected build evidence "
+            f"{tuple(expected_reference_tokens)}"
+        )
+    return ReferenceIndex(
+        fasta_path=fasta_path,
+        contig_sequences=contig_sequences,
+        contig_headers=contig_headers,
+    )
+
+
+def _validate_diploid_tokens(
+    tokens: list[str],
+    *,
+    sample_id: str,
+    contig: str,
+    locus_pos: int,
+    genotype: str,
+    vcf_path: Path,
+) -> None:
+    """Reject any genotype whose ploidy is not exactly two.
+
+    The heterozygote-doubling contract (one ref-allele copy plus one
+    alt-allele copy) is mathematically defined only for diploid calls;
+    haploid or polyploid records would silently collapse via
+    ``set(tokens)`` and emit the wrong number of windows.
+    """
+    if len(tokens) != 2:
+        raise PloidyError(
+            f"Non-diploid genotype GT='{genotype}' (ploidy={len(tokens)}) for sample "
+            f"'{sample_id}' at {contig}:{locus_pos} in VCF {vcf_path}; the fine-tuning "
+            "pipeline requires exactly diploid calls."
+        )
+
+
+def _validate_allele_alphabet(
+    *,
+    ref: str,
+    alt: str,
+    sample_id: str,
+    contig: str,
+    locus_pos: int,
+    vcf_path: Path,
+) -> None:
+    """Reject REF/ALT alleles outside :data:`ALLOWED_NUCLEOTIDES`.
+
+    Invoked before window extraction so that ``*`` spanning-deletion
+    sentinels and IUPAC ambiguity codes raise with full locus context
+    rather than triggering a later, opaque
+    :class:`InvalidAlleleAlphabetError` inside :func:`extract_fasta_window`.
+    """
+    for label, allele in (("REF", ref), ("ALT", alt)):
+        if allele.upper() not in ALLOWED_NUCLEOTIDES:
+            raise InvalidAlleleAlphabetError(
+                f"{label} allele {allele!r} for sample '{sample_id}' at "
+                f"{contig}:{locus_pos} in VCF {vcf_path} is outside the allowed alphabet "
+                f"{sorted(ALLOWED_NUCLEOTIDES)}."
+            )
+
+
+def _validate_reference_base(
+    *,
+    reference: ReferenceIndex,
+    contig: str,
+    locus_pos: int,
+    ref_allele: str,
+    sample_id: str,
+    vcf_path: Path,
+) -> None:
+    """Assert the FASTA base at ``locus_pos`` matches the VCF ``REF`` allele.
+
+    Case-insensitive: real FASTAs ship soft-masked (lowercase) flanks, so
+    the comparison must canonicalise both sides. Without this guard, a
+    silently mis-matched FASTA (e.g. wrong patch level even though build
+    tokens agree) would still produce plausible-looking 512bp windows
+    with the wrong genomic context.
+    """
+    sequence = reference.contig_sequences[contig]
+    if not 1 <= locus_pos <= len(sequence):
+        raise ReferenceBaseMismatchError(
+            f"Locus position {locus_pos} for sample '{sample_id}' is outside contig "
+            f"{contig!r} (length {len(sequence)}) in reference {reference.fasta_path}; "
+            f"VCF {vcf_path} disagrees with the reference."
+        )
+    fasta_base = sequence[locus_pos - 1].upper()
+    if fasta_base != ref_allele.upper():
+        raise ReferenceBaseMismatchError(
+            f"REF allele mismatch for sample '{sample_id}' at {contig}:{locus_pos}: "
+            f"VCF REF={ref_allele!r} but reference FASTA base={fasta_base!r}; "
+            f"FASTA={reference.fasta_path}, VCF={vcf_path}."
+        )
+
+
+def iter_locus_windows_from_vcf(
+    *,
+    sample_id: str,
+    sample_vcf: str | Path,
+    reference: ReferenceIndex,
+    expected_reference_tokens: Sequence[str] = EXPECTED_REFERENCE_TOKENS,
+) -> Iterator[FinetuneWindow]:
+    """Stream windows for one sample without materialising the full list.
+
+    The production-scaling entry point: callers iterate the generator and
+    write each window to disk (e.g. via :func:`write_locus_windows_jsonl`)
+    so peak memory stays bounded by a single record regardless of how many
+    loci the VCF contains.
+
+    Validation contract (each guard prevents a silent-failure mode):
+        * ``##reference`` header must be present and match the expected
+          build tokens (lockstep with ``consensus.py``).
+        * Every ``##contig=<ID=...>`` declaration must exist in the
+          reference FASTA; raises :class:`ContigMismatchError` otherwise.
+        * Every per-record ``CHROM`` must exist in the reference; raises
+          :class:`ContigMismatchError` instead of silently skipping.
+        * Truncated rows raise :class:`AcquisitionError` with line
+          context (no silent drop).
+        * ``GT`` must appear in the per-record ``FORMAT`` schema.
+        * Genotype ploidy must be exactly two.
+        * REF/ALT alleles must be in :data:`ALLOWED_NUCLEOTIDES`.
+        * The FASTA base at every emitted locus must equal the VCF
+          ``REF`` (case-insensitive).
+
+    Args:
+        sample_id: VCF column to read genotypes from.
+        sample_vcf: Path to the input VCF (plain or gzipped).
+        reference: Pre-loaded :class:`ReferenceIndex` (call
+            :func:`load_reference_index` once, reuse across samples).
+        expected_reference_tokens: Build tokens enforced on the VCF
+            ``##reference`` header (must match those used to load the
+            reference index).
+
+    Yields:
+        :class:`FinetuneWindow` instances in VCF record order, with
+        heterozygote pairs emitted consecutively (ref-allele copy first).
+    """
+    vcf_path = Path(sample_vcf)
+    contig_sequences = reference.contig_sequences
+    fasta_contigs = set(contig_sequences.keys())
+    with _open_maybe_gzip(vcf_path) as source:
+        sample_index: int | None = None
+        header_contigs: set[str] = set()
+        vcf_reference = ""
+        for line_number, line in enumerate(source, start=1):
+            if line.startswith("##"):
+                if line.startswith("##contig=<ID="):
+                    header_contigs.add(line.split("ID=", 1)[1].split(",", 1)[0].rstrip(">\n"))
+                if line.startswith("##reference="):
+                    vcf_reference = line.split("=", 1)[1].strip()
+                continue
+            if line.startswith("#CHROM"):
+                columns = line.rstrip("\n").split("\t")
+                if sample_id not in columns[9:]:
+                    raise AcquisitionError(f"Sample '{sample_id}' not found in VCF {vcf_path}")
+                if not vcf_reference:
+                    raise ReferenceMismatchError(
+                        f"VCF {vcf_path} is missing explicit reference/build metadata "
+                        "in a ##reference header"
+                    )
+                if not _matches_expected_reference_build(vcf_reference, expected_reference_tokens):
+                    raise ReferenceMismatchError(
+                        f"VCF {vcf_path} declares reference '{vcf_reference}', "
+                        "which does not canonically match expected build evidence "
+                        f"{tuple(expected_reference_tokens)}"
+                    )
+                if header_contigs and not header_contigs.issubset(fasta_contigs):
+                    missing_contigs = sorted(header_contigs.difference(fasta_contigs))
+                    raise ContigMismatchError(
+                        f"VCF {vcf_path} references contigs absent from "
+                        f"{reference.fasta_path}: {missing_contigs[:5]}"
+                    )
+                sample_index = columns.index(sample_id)
+                continue
+            if sample_index is None:
+                raise AcquisitionError(f"VCF {vcf_path} is missing a #CHROM header row")
+            yield from _parse_vcf_record_to_windows(
+                raw_line=line,
+                line_number=line_number,
+                fields_count_min=max(9, sample_index + 1),
+                sample_id=sample_id,
+                sample_index=sample_index,
+                reference=reference,
+                fasta_contigs=fasta_contigs,
+                vcf_path=vcf_path,
+            )
+
+
+def _parse_vcf_record_to_windows(
+    *,
+    raw_line: str,
+    line_number: int,
+    fields_count_min: int,
+    sample_id: str,
+    sample_index: int,
+    reference: ReferenceIndex,
+    fasta_contigs: set[str],
+    vcf_path: Path,
+) -> Iterator[FinetuneWindow]:
+    """Parse one VCF data row and yield 0, 1, or 2 windows from it.
+
+    Split out of :func:`iter_locus_windows_from_vcf` to keep the streaming
+    loop readable: the validation contract documented on the parent
+    function is enforced *here* per record, while the parent only handles
+    header bookkeeping.
+    """
+    raw_record = raw_line.rstrip("\n")
+    fields = raw_record.split("\t")
+    if len(fields) < fields_count_min:
+        _raise_malformed_vcf_record(
+            sample_vcf=vcf_path,
+            sample_id=sample_id,
+            line_number=line_number,
+            raw_record=raw_record,
+            observed_columns=len(fields),
+            expected_min_columns=fields_count_min,
+        )
+    chrom, pos_str, _, ref, alt_field, _, filter_value, _, format_field = fields[:9]
+
+    if chrom not in fasta_contigs:
+        raise ContigMismatchError(
+            f"Contig '{chrom}' from {vcf_path} is absent from {reference.fasta_path}"
+        )
+    if filter_value not in PASSING_FILTER_VALUES:
+        return
+
+    alts = _normalize_alt_alleles(alt_field.split(",") if alt_field else [])
+    if len(alts) != 1:
+        return
+    alt = alts[0]
+    if len(ref) != 1 or len(alt) != 1:
+        return
+
+    locus_pos = int(pos_str)
+    _validate_allele_alphabet(
+        ref=ref,
+        alt=alt,
+        sample_id=sample_id,
+        contig=chrom,
+        locus_pos=locus_pos,
+        vcf_path=vcf_path,
+    )
+
+    format_keys = format_field.split(":")
+    if "GT" not in format_keys:
+        raise AcquisitionError(
+            f"VCF {vcf_path} record at {chrom}:{locus_pos} for sample '{sample_id}' "
+            f"is missing 'GT' in FORMAT schema {format_keys!r}; the fine-tuning "
+            "pipeline cannot derive zygosity without it."
+        )
+    sample_format = dict(zip(format_keys, fields[sample_index].split(":"), strict=False))
+    genotype_raw = sample_format.get("GT")
+    tokens = _validated_gt_tokens(
+        genotype_raw,
+        sample_id=sample_id,
+        contig=chrom,
+        position=locus_pos,
+        vcf_path=vcf_path,
+    )
+    if tokens is None:
+        return
+    _validate_diploid_tokens(
+        tokens,
+        sample_id=sample_id,
+        contig=chrom,
+        locus_pos=locus_pos,
+        genotype=genotype_raw or "",
+        vcf_path=vcf_path,
+    )
+
+    unique_indices = set(tokens)
+    is_heterozygous = len(unique_indices) != 1
+    if is_heterozygous:
+        if unique_indices != {"0", "1"}:
+            return
+        alleles_to_emit: tuple[str, ...] = (ref, alt)
+    else:
+        allele_index = int(tokens[0])
+        if allele_index != 1:
+            return
+        alleles_to_emit = (alt,)
+
+    _validate_reference_base(
+        reference=reference,
+        contig=chrom,
+        locus_pos=locus_pos,
+        ref_allele=ref,
+        sample_id=sample_id,
+        vcf_path=vcf_path,
+    )
+    contig_seq = reference.contig_sequences[chrom]
+    for emitted_allele in alleles_to_emit:
+        window = extract_fasta_window(
+            contig_sequence=contig_seq,
+            locus_pos=locus_pos,
+            allele=emitted_allele,
+        )
+        if window is None:
+            continue
+        sequence, window_start, window_end = window
+        yield FinetuneWindow(
+            sample_id=sample_id,
+            contig=chrom,
+            locus_pos=locus_pos,
+            window_start=window_start,
+            window_end=window_end,
+            sequence=sequence,
+            ref_allele=ref,
+            alt_allele=emitted_allele,
+            is_heterozygous=is_heterozygous,
+            genotype=genotype_raw or "",
+            filter_status=filter_value,
+        )
+
+
+def write_locus_windows_jsonl(
+    windows: Iterable[FinetuneWindow],
+    output_jsonl: str | Path,
+) -> int:
+    """Stream windows to a JSONL file without buffering them in memory.
+
+    Pairs with :func:`iter_locus_windows_from_vcf` to give the production
+    pipeline an O(1)-memory write path: parent directories are created
+    once, then each window is serialised and flushed in record order.
+
+    Args:
+        windows: Iterable of :class:`FinetuneWindow` (typically the
+            generator returned by :func:`iter_locus_windows_from_vcf`).
+        output_jsonl: Destination path; parent directories are created.
+
+    Returns:
+        Number of records written (useful for diagnostics / smoke tests).
+    """
+    output_path = Path(output_jsonl)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    written = 0
+    with output_path.open("w", encoding="utf-8") as handle:
+        for window in windows:
+            handle.write(json.dumps(asdict(window)) + "\n")
+            written += 1
+    return written
 
 
 def extract_locus_windows_from_vcf(
@@ -150,125 +623,43 @@ def extract_locus_windows_from_vcf(
     sample_id: str,
     sample_vcf: str | Path,
     contig_sequences: Mapping[str, str],
+    reference_path: str | Path | None = None,
+    expected_reference_tokens: Sequence[str] = EXPECTED_REFERENCE_TOKENS,
 ) -> list[FinetuneWindow]:
-    """Stream a VCF and emit one ``FinetuneWindow`` per (locus, observed allele) pair.
+    """Materialise all windows for one sample as a list (test-scale convenience).
 
-    The decision tree is intentionally narrower than ``classify_consensus_site``:
-    only single-base biallelic PASS records produce output, because anything
-    else (indels, multi-allelics, filtered, no-call) cannot be represented as
-    a clean single-base substitution into a fixed-width window. Heterozygous
-    biallelic records produce **two** windows (ref-allele then alt-allele
-    copy) so that both haplotypes contribute training signal.
-    Homozygous-reference records are dropped because they carry no signal
-    beyond the reference.
+    Wraps :func:`iter_locus_windows_from_vcf` for callers that already
+    hold a ``contig_sequences`` mapping (e.g. unit tests reusing a
+    cached reference). Production-scale callers should prefer
+    :func:`iter_locus_windows_from_vcf` directly so peak memory stays
+    bounded by a single window.
 
     Args:
-        sample_id: VCF column to read genotypes from. Must appear in the
-            ``#CHROM`` header row.
+        sample_id: VCF column to read genotypes from.
         sample_vcf: Path to the input VCF (plain or gzipped).
-        contig_sequences: Mapping of contig name → full reference sequence.
-            Records on contigs absent from this mapping are skipped silently;
-            this mirrors how the integration test will subset to a few
-            contigs without having to filter the VCF first.
+        contig_sequences: Pre-loaded contig name to sequence mapping.
+        reference_path: Optional path used in error messages; defaults
+            to ``"<in-memory>"`` when sequences are synthesised.
+        expected_reference_tokens: Build tokens enforced on the VCF
+            ``##reference`` header.
 
     Returns:
-        Windows in VCF record order. Heterozygote pairs are emitted
-        consecutively (ref-allele copy first, then alt-allele copy).
-
-    Raises:
-        AcquisitionError: If ``sample_id`` is not a column in the VCF or the
-            VCF lacks a ``#CHROM`` header before the first data record.
-        MalformedGenotypeError: Propagated from ``_validated_gt_tokens`` when
-            a GT field contains non-numeric, non-missing tokens.
+        Windows in VCF record order; heterozygote pairs are consecutive.
     """
-    vcf_path = Path(sample_vcf)
-    windows: list[FinetuneWindow] = []
-    with _open_maybe_gzip(vcf_path) as source:
-        sample_index: int | None = None
-        for line in source:
-            if line.startswith("##"):
-                continue
-            if line.startswith("#CHROM"):
-                columns = line.rstrip("\n").split("\t")
-                if sample_id not in columns[9:]:
-                    raise AcquisitionError(f"Sample '{sample_id}' not found in VCF {vcf_path}")
-                sample_index = columns.index(sample_id)
-                continue
-            if sample_index is None:
-                raise AcquisitionError(f"VCF {vcf_path} is missing a #CHROM header row")
-
-            fields = line.rstrip("\n").split("\t")
-            if len(fields) < max(9, sample_index + 1):
-                continue
-            chrom, pos_str, _, ref, alt_field, _, filter_value, _, format_field = fields[:9]
-
-            if filter_value not in PASSING_FILTER_VALUES:
-                continue
-            if chrom not in contig_sequences:
-                continue
-
-            alts = _normalize_alt_alleles(alt_field.split(",") if alt_field else [])
-            if len(alts) != 1:
-                continue
-            alt = alts[0]
-            if len(ref) != 1 or len(alt) != 1:
-                continue
-
-            locus_pos = int(pos_str)
-            sample_format = dict(
-                zip(format_field.split(":"), fields[sample_index].split(":"), strict=False)
-            )
-            genotype_raw = sample_format.get("GT")
-            tokens = _validated_gt_tokens(
-                genotype_raw,
-                sample_id=sample_id,
-                contig=chrom,
-                position=locus_pos,
-                vcf_path=vcf_path,
-            )
-            if tokens is None:
-                continue
-
-            unique_indices = set(tokens)
-            is_heterozygous = len(unique_indices) != 1
-            if is_heterozygous:
-                if unique_indices != {"0", "1"}:
-                    continue
-                alleles_to_emit: tuple[str, ...] = (ref, alt)
-            else:
-                allele_index = int(tokens[0])
-                if allele_index == 0:
-                    continue
-                if allele_index != 1:
-                    continue
-                alleles_to_emit = (alt,)
-
-            contig_seq = contig_sequences[chrom]
-            for emitted_allele in alleles_to_emit:
-                window = extract_fasta_window(
-                    contig_sequence=contig_seq,
-                    locus_pos=locus_pos,
-                    allele=emitted_allele,
-                )
-                if window is None:
-                    continue
-                sequence, window_start, window_end = window
-                windows.append(
-                    FinetuneWindow(
-                        sample_id=sample_id,
-                        contig=chrom,
-                        locus_pos=locus_pos,
-                        window_start=window_start,
-                        window_end=window_end,
-                        sequence=sequence,
-                        ref_allele=ref,
-                        alt_allele=emitted_allele,
-                        is_heterozygous=is_heterozygous,
-                        genotype=genotype_raw or "",
-                        filter_status=filter_value,
-                    )
-                )
-    return windows
+    fasta_path = Path(reference_path) if reference_path is not None else Path("<in-memory>")
+    reference = ReferenceIndex(
+        fasta_path=fasta_path,
+        contig_sequences=contig_sequences,
+        contig_headers={name: name for name in contig_sequences},
+    )
+    return list(
+        iter_locus_windows_from_vcf(
+            sample_id=sample_id,
+            sample_vcf=sample_vcf,
+            reference=reference,
+            expected_reference_tokens=expected_reference_tokens,
+        )
+    )
 
 
 def extract_fasta_windows_for_sample(
@@ -277,33 +668,41 @@ def extract_fasta_windows_for_sample(
     reference_fasta: str | Path,
     sample_vcf: str | Path,
     output_jsonl: str | Path | None = None,
+    expected_reference_tokens: Sequence[str] = EXPECTED_REFERENCE_TOKENS,
 ) -> list[FinetuneWindow]:
-    """Orchestrate FASTA loading and VCF extraction for a single sample.
+    """Single-sample convenience wrapper. **Test/small-workload use only.**
 
-    Optionally serializes windows to a newline-delimited JSON file. Keeping
-    the serialization here (rather than in the caller) prevents drift between
-    the dataclass schema and the on-disk format consumed by the training
-    loader.
+    .. warning::
+
+       This wrapper re-loads the entire reference FASTA on every call.
+       For the production 57-sample jaguar workflow, call
+       :func:`load_reference_index` **once**, then thread the resulting
+       :class:`ReferenceIndex` through :func:`iter_locus_windows_from_vcf`
+       and :func:`write_locus_windows_jsonl` per sample. Doing so cuts
+       peak memory and I/O by a factor of ``num_samples``.
 
     Args:
         sample_id: VCF column to extract genotypes for.
         reference_fasta: Path to the reference FASTA (plain or gzipped).
         sample_vcf: Path to the input VCF (plain or gzipped).
         output_jsonl: Optional path to write one JSON record per window.
+        expected_reference_tokens: Build tokens enforced on both the
+            FASTA evidence and the VCF ``##reference`` header.
 
     Returns:
         All windows extracted for ``sample_id``, in VCF record order.
     """
-    contig_sequences = _read_fasta_sequences(Path(reference_fasta))
-    windows = extract_locus_windows_from_vcf(
-        sample_id=sample_id,
-        sample_vcf=Path(sample_vcf),
-        contig_sequences=contig_sequences,
+    reference = load_reference_index(
+        reference_fasta, expected_reference_tokens=expected_reference_tokens
+    )
+    windows = list(
+        iter_locus_windows_from_vcf(
+            sample_id=sample_id,
+            sample_vcf=Path(sample_vcf),
+            reference=reference,
+            expected_reference_tokens=expected_reference_tokens,
+        )
     )
     if output_jsonl is not None:
-        output_path = Path(output_jsonl)
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        with output_path.open("w", encoding="utf-8") as handle:
-            for window in windows:
-                handle.write(json.dumps(asdict(window)) + "\n")
+        write_locus_windows_jsonl(windows, output_jsonl)
     return windows

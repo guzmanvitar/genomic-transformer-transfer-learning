@@ -45,7 +45,9 @@ from jaguar_geo_assign.data.finetune_windows import (
     DOWNSTREAM_BASES,
     UPSTREAM_BASES,
     WINDOW_SIZE,
-    extract_fasta_windows_for_sample,
+    iter_locus_windows_from_vcf,
+    load_reference_index,
+    write_locus_windows_jsonl,
 )
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -153,25 +155,45 @@ def _write_subset_vcf(
     target_contig: str,
     samples: tuple[str, ...],
     max_records: int,
+    reference_token: str,
 ) -> int:
     """Project ``source_vcf`` to ``samples`` x ``target_contig`` x first ``max_records`` PASS rows.
 
-    Returns the number of data records written. The header is preserved
-    verbatim except the ``#CHROM`` row, where non-requested sample columns
-    are dropped so the per-test VCF is small enough to write atomically and
-    to inspect by hand if a regression appears.
+    Header rewriting contract (required by the strict data-contract guards
+    in :mod:`jaguar_geo_assign.data.finetune_windows`):
+        * ``##reference=`` lines are rewritten to ``reference_token`` so
+          the build-token check sees a deterministic value matching the
+          subset FASTA filename.
+        * ``##contig=<ID=...>`` lines are filtered to retain only the
+          target contig, since the subset FASTA only contains that contig.
+        * Non-requested sample columns are dropped from ``#CHROM``.
+
+    Returns the number of data records written.
     """
     sample_indices: list[int] = []
     written = 0
+    saw_reference_header = False
     with (
         source_vcf.open("rt", encoding="utf-8") as src,
         destination.open("wt", encoding="utf-8") as dst,
     ):
         for line in src:
+            if line.startswith("##reference"):
+                dst.write(f"##reference={reference_token}\n")
+                saw_reference_header = True
+                continue
+            if line.startswith("##contig=<ID="):
+                contig_id = line.split("ID=", 1)[1].split(",", 1)[0].rstrip(">\n")
+                if contig_id != target_contig:
+                    continue
+                dst.write(line)
+                continue
             if line.startswith("##"):
                 dst.write(line)
                 continue
             if line.startswith("#CHROM"):
+                if not saw_reference_header:
+                    dst.write(f"##reference={reference_token}\n")
                 columns = line.rstrip("\n").split("\t")
                 missing = [s for s in samples if s not in columns[9:]]
                 if missing:
@@ -222,6 +244,9 @@ def test_finetune_windows_pipeline_on_real_jaguar_data(
           in-memory dataclass, since the on-disk format is what the
           training loader will consume.
     """
+    # Subset FASTA filename embeds the target contig token so it doubles
+    # as the build-token evidence consumed by ``load_reference_index``.
+    expected_tokens = (_TARGET_CONTIG,)
     subset_fasta = tmp_path / f"{_TARGET_CONTIG}.fa"
     _write_subset_reference_for_contig(jaguar_reference_fasta, _TARGET_CONTIG, subset_fasta)
     contig_seq_length = sum(
@@ -239,24 +264,31 @@ def test_finetune_windows_pipeline_on_real_jaguar_data(
         target_contig=_TARGET_CONTIG,
         samples=_SAMPLES_UNDER_TEST,
         max_records=MAX_VCF_RECORDS,
+        reference_token=_TARGET_CONTIG,
     )
     assert written > 0, (
         f"No PASS records on {_TARGET_CONTIG} found in {_VCF_PATH}; "
         "the source VCF or contig naming may have changed"
     )
 
+    # Production-style usage: load the reference index *once*, then thread
+    # it through one streaming-iterator call per sample. Validates the
+    # scaling refactor (no per-sample re-read of the FASTA).
+    reference = load_reference_index(subset_fasta, expected_reference_tokens=expected_tokens)
     output_jsonl = tmp_path / "windows.jsonl"
     windows = []
     for sample_id in _SAMPLES_UNDER_TEST:
         per_sample_jsonl = tmp_path / f"{sample_id}.jsonl"
-        windows.extend(
-            extract_fasta_windows_for_sample(
+        per_sample_windows = list(
+            iter_locus_windows_from_vcf(
                 sample_id=sample_id,
-                reference_fasta=subset_fasta,
                 sample_vcf=subset_vcf,
-                output_jsonl=per_sample_jsonl,
+                reference=reference,
+                expected_reference_tokens=expected_tokens,
             )
         )
+        write_locus_windows_jsonl(per_sample_windows, per_sample_jsonl)
+        windows.extend(per_sample_windows)
         assert per_sample_jsonl.exists(), f"JSONL not written for {sample_id}"
 
     assert windows, (
@@ -307,11 +339,14 @@ def test_finetune_windows_pipeline_on_real_jaguar_data(
             "logic must produce two distinct bases"
         )
 
-    extract_fasta_windows_for_sample(
-        sample_id=_SAMPLES_UNDER_TEST[0],
-        reference_fasta=subset_fasta,
-        sample_vcf=subset_vcf,
-        output_jsonl=output_jsonl,
+    write_locus_windows_jsonl(
+        iter_locus_windows_from_vcf(
+            sample_id=_SAMPLES_UNDER_TEST[0],
+            sample_vcf=subset_vcf,
+            reference=reference,
+            expected_reference_tokens=expected_tokens,
+        ),
+        output_jsonl,
     )
     jsonl_lines = output_jsonl.read_text(encoding="utf-8").splitlines()
     sample0_window_count = sum(1 for w in windows if w.sample_id == _SAMPLES_UNDER_TEST[0])
