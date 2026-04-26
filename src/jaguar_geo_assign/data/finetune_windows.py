@@ -18,6 +18,8 @@ accept records the other rejects.
 from __future__ import annotations
 
 import json
+import logging
+import warnings
 from collections.abc import Iterable, Iterator, Mapping, Sequence
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -33,6 +35,8 @@ from .consensus import (
     _raise_malformed_vcf_record,
     _validated_gt_tokens,
 )
+
+_LOGGER = logging.getLogger(__name__)
 
 WINDOW_SIZE = 512
 UPSTREAM_BASES = 256
@@ -399,6 +403,18 @@ def iter_locus_windows_from_vcf(
         * The FASTA base at every emitted locus must equal the VCF
           ``REF`` (case-insensitive).
 
+    Emission policy (records that pass validation but yield no window):
+        * Non-PASS ``FILTER`` values, multi-allelic ALT fields, indels
+          (``len(REF) != 1`` or ``len(ALT) != 1``), and reference-only
+          homozygotes (``0/0``) are dropped silently because they carry
+          no informative signal vs. the reference.
+        * Heterozygotes whose unique genotype indices are not exactly
+          ``{0, 1}`` (e.g. ``1/2`` against a multi-allelic REF/ALT site
+          that survived earlier filtering) are also skipped, since the
+          ref/alt window-pair contract requires a biallelic 0/1 layout.
+          A ``DEBUG``-level log is emitted at each such skip for
+          observability.
+
     Args:
         sample_id: VCF column to read genotypes from.
         sample_vcf: Path to the input VCF (plain or gzipped).
@@ -549,6 +565,15 @@ def _parse_vcf_record_to_windows(
     is_heterozygous = len(unique_indices) != 1
     if is_heterozygous:
         if unique_indices != {"0", "1"}:
+            _LOGGER.debug(
+                "Skipping non-{0,1} heterozygote at %s:%d for sample %s "
+                "(genotype=%r, vcf=%s); only biallelic 0/1 hets are emitted as window pairs.",
+                chrom,
+                locus_pos,
+                sample_id,
+                genotype_raw,
+                vcf_path,
+            )
             return
         alleles_to_emit: tuple[str, ...] = (ref, alt)
     else:
@@ -692,6 +717,14 @@ def extract_fasta_windows_for_sample(
     Returns:
         All windows extracted for ``sample_id``, in VCF record order.
     """
+    warnings.warn(
+        "extract_fasta_windows_for_sample() reloads the full reference FASTA "
+        "(~2.5 GB for the jaguar build) on every call and is intended for tests "
+        "and small workloads only. For multi-sample production runs, call "
+        "load_reference_index() once and thread the resulting ReferenceIndex "
+        "through iter_locus_windows_from_vcf() per sample.",
+        stacklevel=2,
+    )
     reference = load_reference_index(
         reference_fasta, expected_reference_tokens=expected_reference_tokens
     )

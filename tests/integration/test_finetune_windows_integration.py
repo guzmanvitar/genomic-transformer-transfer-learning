@@ -71,9 +71,17 @@ def _jaguar_assembly_name() -> str:
 
     Drift between this test's pinned ``_JAGUAR_ASSEMBLY`` and
     ``APPROVED_FELID_ASSEMBLIES`` would silently produce a 404 at download
-    time; this lookup turns that into an immediate ``StopIteration``.
+    time; this lookup surfaces that drift up front via ``pytest.fail`` with
+    the missing accession instead of letting an opaque ``StopIteration``
+    escape the helper.
     """
-    assembly = next(a for a in APPROVED_FELID_ASSEMBLIES if a.accession == _JAGUAR_ACCESSION)
+    try:
+        assembly = next(a for a in APPROVED_FELID_ASSEMBLIES if a.accession == _JAGUAR_ACCESSION)
+    except StopIteration:
+        pytest.fail(
+            f"Accession {_JAGUAR_ACCESSION!r} not found in APPROVED_FELID_ASSEMBLIES; "
+            "the registry has drifted from this test's pinned jaguar build."
+        )
     return assembly.assembly_name
 
 
