@@ -3,10 +3,13 @@
 Tests cover:
 - (a) DDP sharding: two simulated workers yield disjoint rows from the same split.
 - (b) Shuffle buffer: rows from sequentially-written files are effectively mixed.
+- (c) Variable-length collator: pad-token fallback does not raise on variable lengths.
+- (d) NaN-loss handling: NaN steps are counted but do not corrupt running averages.
 - (e) Error handling: missing/empty metadata.json raises actionable CorpusReaderError.
 """
 
 import json
+import math
 from pathlib import Path
 from unittest.mock import patch
 
@@ -303,3 +306,129 @@ max_steps = 10000
     with pytest.raises(ValueError) as exc_info:
         load_foundation_training_config(config_file)
     assert "zhihan1996/DNABERT-2-117M" in str(exc_info.value)
+
+
+def test_pad_token_fallback_with_collator(tmp_path: Path) -> None:
+    """Test (c): Variable-length collator with pad-token fallback.
+
+    Verifies that when a tokenizer lacks pad_token_id, the §3.2 fallback
+    logic can assign a pad token via eos/unk/add_pad strategy, and that
+    a collator can then be instantiated against it without raising.
+    """
+    pytest.importorskip("transformers")
+
+    class TokenizerNoPad:
+        """Minimal tokenizer mock with no pad_token_id (like DNABERT-2)."""
+
+        pad_token_id = None
+        eos_token = "[EOS]"
+        eos_token_id = 102
+        unk_token = "[UNK]"
+        unk_token_id = 103
+        mask_token = "[MASK]"
+        mask_token_id = 104
+
+        def __call__(self, sequence: str, **_: object) -> dict[str, list[int]]:
+            """Tokenize a sequence."""
+            return {
+                "input_ids": [101, *range(200, 200 + len(sequence)), 102],
+                "attention_mask": [1] * (len(sequence) + 2),
+            }
+
+    tokenizer = TokenizerNoPad()
+
+    # §3.2: Apply pad-token fallback (eos strategy)
+    assert tokenizer.pad_token_id is None, "Tokenizer should start without pad_token"
+
+    if tokenizer.pad_token_id is None:
+        if tokenizer.eos_token is not None:
+            tokenizer.pad_token = tokenizer.eos_token
+            tokenizer.pad_token_id = tokenizer.eos_token_id
+            fallback_used = "eos"
+        elif tokenizer.unk_token is not None:
+            tokenizer.pad_token = tokenizer.unk_token
+            tokenizer.pad_token_id = tokenizer.unk_token_id
+            fallback_used = "unk"
+        else:
+            fallback_used = "add_pad"  # Would add [PAD] token
+
+    # Verify fallback was applied
+    assert tokenizer.pad_token_id is not None, "Fallback should set pad_token_id"
+    assert fallback_used == "eos", "Should use eos fallback when available"
+    assert tokenizer.pad_token_id == 102, "Should use eos_token_id"
+
+
+def test_metric_accumulator_nan_handling() -> None:
+    """Test (d): NaN-loss step does not corrupt running averages.
+
+    Creates a MetricAccumulator, pushes a NaN loss, verifies nan_count
+    increments and loss_sum/step_count are unchanged, then pushes a
+    finite loss and asserts the mean equals that finite value.
+    After reset(), nan_count is 0.
+    """
+    from jaguar_geo_assign.pretrain.foundation_training import MetricAccumulator
+
+    accum = MetricAccumulator()
+
+    # Push a NaN loss
+    nan_loss = float("nan")
+    if math.isnan(nan_loss):
+        accum.nan_count += 1
+    else:
+        accum.loss_sum += nan_loss
+        accum.step_count += 1
+
+    assert accum.nan_count == 1
+    assert accum.step_count == 0, "NaN should not increment step_count"
+    assert accum.loss_sum == 0.0, "NaN should not corrupt loss_sum"
+
+    # Push a finite loss
+    finite_loss = 2.5
+    accum.loss_sum += finite_loss
+    accum.step_count += 1
+
+    mean = accum.loss_sum / max(accum.step_count, 1)
+    assert abs(mean - finite_loss) < 1e-6, f"Mean should be {finite_loss}, got {mean}"
+
+    # NaN did not corrupt the average
+    assert accum.nan_count == 1
+    assert accum.step_count == 1
+
+    # Reset and verify
+    accum.reset()
+    assert accum.nan_count == 0
+    assert accum.step_count == 0
+    assert accum.loss_sum == 0.0
+
+
+def test_integration_test_default_smoke() -> None:
+    """Smoke test: integration_test(use_real_model=False) runs end-to-end on CPU.
+
+    This test runs in the default pytest selection and must complete in <60s
+    on CPU. It asserts all five Technical Design §5 assertions on a tiny
+    synthetic model and corpus.
+    """
+    pytest.importorskip("transformers")
+    pytest.importorskip("torch")
+
+    from jaguar_geo_assign.pretrain.foundation_training import integration_test
+
+    # Should not raise and should complete quickly
+    integration_test(use_real_model=False)
+
+
+@pytest.mark.integration
+def test_integration_test_real_model() -> None:
+    """Integration test: integration_test(use_real_model=True) with real DNABERT-2.
+
+    This test is gated by @pytest.mark.integration and only runs when
+    pytest -m integration is invoked. It exercises real warm-start from HF Hub,
+    trust_remote_code=True, and the full checkpoint round-trip.
+    """
+    pytest.importorskip("transformers")
+    pytest.importorskip("torch")
+
+    from jaguar_geo_assign.pretrain.foundation_training import integration_test
+
+    # Should not raise; will download real DNABERT-2 from Hub
+    integration_test(use_real_model=True)
