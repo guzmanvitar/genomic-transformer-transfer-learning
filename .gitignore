@@ -220,3 +220,6 @@ __marimo__/
 # AI dev
 dev_docs
 .intent
+
+# Foundation training checkpoints and logs
+models/foundation_felid/
