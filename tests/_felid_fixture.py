@@ -97,12 +97,25 @@ def write_placeholder_fastas(reference_dir: Path, padded_identifiers: list[str])
 
 
 def placeholder_fasta_checksum(identifier: str) -> str:
-    """Return the MD5 of the placeholder FASTA written by :func:`write_placeholder_fastas`."""
+    """Return the checksum of the placeholder FASTA written by :func:`write_placeholder_fastas`.
+
+    The algorithm matches the assembly's declared ``checksum_name``.
+    """
+    from jaguar_geo_assign.data.felid_assemblies import APPROVED_FELID_ASSEMBLIES
+
+    assembly = next(a for a in APPROVED_FELID_ASSEMBLIES if a.identifier == identifier)
     if "Panthera_onca" in identifier:
         contigs = {identifier: "A" * 128, "HiC_scaffold_1": "A" * 128}
     else:
         contigs = {identifier: "A" * 128}
-    return hashlib.md5(build_fixture_fasta(contigs)).hexdigest()
+
+    fasta_bytes = build_fixture_fasta(contigs)
+    if assembly.checksum_name == "sha256":
+        return hashlib.sha256(fasta_bytes).hexdigest()
+    elif assembly.checksum_name == "md5":
+        return hashlib.md5(fasta_bytes).hexdigest()
+    else:
+        raise ValueError(f"Unknown checksum algorithm {assembly.checksum_name!r}")
 
 
 def pad_species_to_full_roster(

@@ -331,5 +331,8 @@ def test_validate_felid_species_entries_rejects_legacy_accession_key() -> None:
         {"species": "Panthera pardus", "identifier": "GCF_001857705.1"},
         {"species": "Panthera onca", "accession": "DNAZOO_Panthera_onca_HiC"},
     ]
-    with pytest.raises(ValueError, match="renamed to 'identifier'"):
+    import re
+
+    with pytest.raises(ValueError, match="renamed to 'identifier'") as exc_info:
         _validate_felid_species_entries(raw_species)
+    assert not re.search(r"<[A-Z][A-Z-]*>", str(exc_info.value))

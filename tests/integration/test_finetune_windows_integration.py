@@ -293,7 +293,7 @@ def test_finetune_windows_pipeline_on_real_jaguar_data(
                 sample_id=sample_id,
                 sample_vcf=subset_vcf,
                 reference=reference,
-                expected_reference_tokens=expected_tokens,
+                positive_reference_tokens=expected_tokens,
             )
         )
         write_locus_windows_jsonl(per_sample_windows, per_sample_jsonl)
@@ -353,7 +353,7 @@ def test_finetune_windows_pipeline_on_real_jaguar_data(
             sample_id=_SAMPLES_UNDER_TEST[0],
             sample_vcf=subset_vcf,
             reference=reference,
-            expected_reference_tokens=expected_tokens,
+            positive_reference_tokens=expected_tokens,
         ),
         output_jsonl,
     )

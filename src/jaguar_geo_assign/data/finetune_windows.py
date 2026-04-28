@@ -436,7 +436,8 @@ def iter_locus_windows_from_vcf(
     sample_id: str,
     sample_vcf: str | Path,
     reference: ReferenceIndex,
-    expected_reference_tokens: Sequence[str] = POSITIVE_REFERENCE_TOKENS,
+    positive_reference_tokens: Sequence[str] = POSITIVE_REFERENCE_TOKENS,
+    negative_reference_tokens: Sequence[str] = NEGATIVE_REFERENCE_TOKENS,
 ) -> Iterator[FinetuneWindow]:
     """Stream windows for one sample without materialising the full list.
 
@@ -477,9 +478,11 @@ def iter_locus_windows_from_vcf(
         sample_vcf: Path to the input VCF (plain or gzipped).
         reference: Pre-loaded :class:`ReferenceIndex` (call
             :func:`load_reference_index` once, reuse across samples).
-        expected_reference_tokens: Build tokens enforced on the VCF
+        positive_reference_tokens: Build tokens enforced on the VCF
             ``##reference`` header (must match those used to load the
             reference index).
+        negative_reference_tokens: Build tokens that must NOT appear in the
+            VCF ``##reference`` header.
 
     Yields:
         :class:`FinetuneWindow` instances in VCF record order, with
@@ -508,12 +511,17 @@ def iter_locus_windows_from_vcf(
                         f"VCF {vcf_path} is missing explicit reference/build metadata "
                         "in a ##reference header"
                     )
-                if not _matches_expected_reference_build(vcf_reference, expected_reference_tokens):
+                try:
+                    _validate_finetune_reference_evidence(
+                        vcf_reference,
+                        positive_tokens=positive_reference_tokens,
+                        negative_tokens=negative_reference_tokens,
+                    )
+                except ReferenceMismatchError as e:
                     raise ReferenceMismatchError(
                         f"VCF {vcf_path} declares reference '{vcf_reference}', "
-                        "which does not canonically match expected build evidence "
-                        f"{tuple(expected_reference_tokens)}"
-                    )
+                        f"which failed build evidence validation: {e}"
+                    ) from e
                 if header_contigs and not header_contigs.issubset(fasta_contigs):
                     missing_contigs = sorted(header_contigs.difference(fasta_contigs))
                     raise ContigMismatchError(
@@ -723,8 +731,10 @@ def extract_locus_windows_from_vcf(
         contig_sequences: Pre-loaded contig name to sequence mapping.
         reference_path: Optional path used in error messages; defaults
             to ``"<in-memory>"`` when sequences are synthesised.
-        expected_reference_tokens: Build tokens enforced on the VCF
+        positive_reference_tokens: Build tokens enforced on the VCF
             ``##reference`` header.
+        negative_reference_tokens: Build tokens that must NOT appear in the
+            VCF ``##reference`` header.
 
     Returns:
         Windows in VCF record order; heterozygote pairs are consecutive.
@@ -740,7 +750,8 @@ def extract_locus_windows_from_vcf(
             sample_id=sample_id,
             sample_vcf=sample_vcf,
             reference=reference,
-            expected_reference_tokens=positive_reference_tokens,
+            positive_reference_tokens=positive_reference_tokens,
+            negative_reference_tokens=negative_reference_tokens,
         )
     )
 
@@ -770,8 +781,10 @@ def extract_fasta_windows_for_sample(
         reference_fasta: Path to the reference FASTA (plain or gzipped).
         sample_vcf: Path to the input VCF (plain or gzipped).
         output_jsonl: Optional path to write one JSON record per window.
-        expected_reference_tokens: Build tokens enforced on both the
+        positive_reference_tokens: Build tokens enforced on both the
             FASTA evidence and the VCF ``##reference`` header.
+        negative_reference_tokens: Build tokens that must NOT appear in the
+            VCF ``##reference`` header.
 
     Returns:
         All windows extracted for ``sample_id``, in VCF record order.
@@ -794,7 +807,8 @@ def extract_fasta_windows_for_sample(
             sample_id=sample_id,
             sample_vcf=Path(sample_vcf),
             reference=reference,
-            expected_reference_tokens=positive_reference_tokens,
+            positive_reference_tokens=positive_reference_tokens,
+            negative_reference_tokens=negative_reference_tokens,
         )
     )
     if output_jsonl is not None:

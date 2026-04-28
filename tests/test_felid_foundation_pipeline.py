@@ -94,7 +94,7 @@ def _build_full_mock_manifest(
                 url=f"http://fake.ncbi.nlm.nih.gov/{filename}",
                 destination=reference_dir / filename,
                 checksum=checksum,
-                checksum_name="md5",
+                checksum_name=assembly.checksum_name,
                 kind="reference",
                 mirror_url=assembly.mirror_url,
                 expected_size=assembly.expected_size,
@@ -814,3 +814,10 @@ def test_acquisition_forwards_mirror_and_size(tmp_path: Path) -> None:
             assert jaguar_call is not None, "Jaguar asset was not downloaded"
             assert "huggingface.co" in (jaguar_call.mirror_url or ""), "mirror_url was dropped"
             assert jaguar_call.expected_size == 745951926, "expected_size was dropped"
+
+
+def test_build_full_mock_manifest_jaguar_checksum_name():
+    """Mock manifest for jaguar has checksum_name='sha256'."""
+    manifest = _build_full_mock_manifest(Path("/fake"))
+    jaguar_asset = next(a for a in manifest if "Panthera_onca" in a.destination.name)
+    assert jaguar_asset.checksum_name == "sha256"

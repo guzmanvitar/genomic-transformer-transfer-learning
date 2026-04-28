@@ -937,8 +937,8 @@ def _validate_felid_species_entries(
             )
         if "accession" in item:
             raise ValueError(
-                "TOML key 'accession' was renamed to 'identifier' in <PR-NUMBER>. "
-                "Update your config; see CHANGELOG."
+                "TOML key 'accession' was renamed to 'identifier'. "
+                "Update your config file to use 'identifier = ...' instead."
             )
         try:
             species_name = item["species"]
