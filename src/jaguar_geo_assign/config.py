@@ -1285,6 +1285,7 @@ class FoundationTrainingConfig:
         weight_decay: L2 regularization coefficient.
         warmup_steps: Linear warmup steps before cosine decay.
         eval_every: Validation frequency (steps).
+        eval_max_steps: Max validation steps per epoch (auto-derived if None).
         save_every: Checkpoint save frequency (steps).
         log_every: Logging frequency (steps).
         gradient_clip: Gradient norm clipping value.
@@ -1309,6 +1310,7 @@ class FoundationTrainingConfig:
     weight_decay: float = 0.01
     warmup_steps: int = 1000
     eval_every: int = 500
+    eval_max_steps: int | None = None
     save_every: int = 1000
     log_every: int = 10
     gradient_clip: float = 1.0
@@ -1357,6 +1359,8 @@ def load_foundation_training_config(path: str | Path) -> FoundationTrainingConfi
         weight_decay = float(training.get("weight_decay", 0.01))
         warmup_steps = int(training.get("warmup_steps", 1000))
         eval_every = int(training.get("eval_every", 500))
+        eval_max_steps_raw = training.get("eval_max_steps")
+        eval_max_steps = int(eval_max_steps_raw) if eval_max_steps_raw is not None else None
         save_every = int(training.get("save_every", 1000))
         log_every = int(training.get("log_every", 10))
         gradient_clip = float(training.get("gradient_clip", 1.0))
@@ -1406,6 +1410,7 @@ def load_foundation_training_config(path: str | Path) -> FoundationTrainingConfi
         weight_decay=weight_decay,
         warmup_steps=warmup_steps,
         eval_every=eval_every,
+        eval_max_steps=eval_max_steps,
         save_every=save_every,
         log_every=log_every,
         gradient_clip=gradient_clip,
