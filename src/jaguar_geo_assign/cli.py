@@ -291,7 +291,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
         try:
             if args.integration_test:
-                integration_test(use_real_model=True)
+                integration_test(use_real_model=False)
             else:
                 run_felid_foundation_training(args.config)
         except (RuntimeError, ValueError) as error:

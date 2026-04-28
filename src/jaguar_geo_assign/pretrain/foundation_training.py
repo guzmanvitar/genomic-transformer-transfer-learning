@@ -42,7 +42,10 @@ from transformers import (
 
 from jaguar_geo_assign.config import FoundationTrainingConfig
 from jaguar_geo_assign.data.preprocessor import load_dnabert2_tokenizer
-from jaguar_geo_assign.data.tokenized_corpus_reader import TokenizedCorpusReader
+from jaguar_geo_assign.data.tokenized_corpus_reader import (
+    TokenizedCorpusReader,
+    _get_distributed_state,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -290,6 +293,8 @@ def _build_dataloaders(
         mlm_probability=config.mlm_probability,
     )
 
+    _, world_size, _, _ = _get_distributed_state()
+
     # Build training dataloader
     train_reader = TokenizedCorpusReader(
         config.corpus_metadata_path,
@@ -299,6 +304,8 @@ def _build_dataloaders(
         shuffle_buffer_size=config.shuffle_buffer_size,
         seed=config.seed,
         drop_last=False,
+        world_size=world_size,
+        num_workers=config.num_workers,
     )
     train_loader = DataLoader(
         train_reader,
@@ -318,6 +325,8 @@ def _build_dataloaders(
             shuffle_buffer_size=1,  # Ignored for validation
             seed=config.seed,
             drop_last=False,
+            world_size=world_size,
+            num_workers=config.num_workers,
         )
         eval_loader = DataLoader(
             eval_reader,
@@ -391,43 +400,51 @@ def atomic_dir_replace(target: Path) -> Iterator[Path]:
         raise
 
 
-def _save_checkpoint_atomically(
+def _recover_atomic_dir(target: Path) -> bool:
+    """Recover from a mid-replace crash by restoring the most recent .old_* directory."""
+    if target.exists():
+        return False
+
+    # TRADE-OFF: During mid-rename crash, target is lost but .old_ retains previous valid state.
+    # Restoring .old_ is crash-safe but inherently reverts to previous state.
+    # Search for siblings matching `.old_<target.name>_*`
+    candidates = list(target.parent.glob(f".old_{target.name}_*"))
+    if not candidates:
+        return False
+
+    # Pick the most recent by mtime
+    most_recent = max(candidates, key=lambda p: p.stat().st_mtime)
+    os.replace(str(most_recent), str(target))
+    logger.warning("Recovered checkpoint from %s due to mid-rename crash", most_recent)
+    return True
+
+
+def _save_json_atomically(
     path: Path,
     content: dict[str, Any],
-    as_json: bool = False,
 ) -> None:
-    """Write checkpoint atomically via temp file or directory per §3.8.
-
-    For JSON sidecars: writes to a temporary file then atomically renames.
-    For directories (accelerate state): uses directory-based atomic write.
+    """Write checkpoint sidecar atomically via temp file per §3.8.
 
     Args:
-        path: Target file or directory path.
-        content: If as_json=True, dict to serialize; else ignored (use with accelerator.save_state).
-        as_json: Whether to write JSON file (True) or save directory via accelerate (False).
+        path: Target file path.
+        content: dict to serialize to JSON.
 
     Raises:
         OSError: If atomic write fails.
     """
     path.parent.mkdir(parents=True, exist_ok=True)
 
-    if as_json:
-        # Fix #14: Write JSON as a FILE with atomic rename.
-        # Use unique tmp suffix per PID to be crash-safe during concurrent writes.
-        tmp_path = path.with_name(f"{path.name}.{os.getpid()}.tmp")
-        try:
-            tmp_path.write_text(json.dumps(content))
-            # Atomically rename temp file to target
-            os.replace(str(tmp_path), str(path))
-        except Exception:
-            # Cleanup temp file on failure
-            tmp_path.unlink(missing_ok=True)
-            raise
-    else:
-        # Directory-based atomic write for accelerate state.
-        # Write to temp dir, then atomically replace the target directory.
-        with atomic_dir_replace(path):
-            pass  # Caller populates the path independently if they don't use the yield
+    # Fix #14: Write JSON as a FILE with atomic rename.
+    # Use unique tmp suffix per PID to be crash-safe during concurrent writes.
+    tmp_path = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+    try:
+        tmp_path.write_text(json.dumps(content))
+        # Atomically rename temp file to target
+        os.replace(str(tmp_path), str(path))
+    except Exception:
+        # Cleanup temp file on failure
+        tmp_path.unlink(missing_ok=True)
+        raise
 
 
 def _startup_probe_metrics(
@@ -526,6 +543,12 @@ def run_felid_foundation_training(
 
     # Check for resumed state
     latest_state_path = output_dir / "latest" / "accelerate_state"
+
+    # Fix 28: Recover from mid-rename crash
+    _recover_atomic_dir(latest_state_path)
+    _recover_atomic_dir(output_dir / "latest" / "hf_model")
+    _recover_atomic_dir(output_dir / "best" / "hf_model")
+
     resumed = latest_state_path.exists()
     # Fix #16: Align read path with write path (both in output_dir / "best" / "best_eval_loss.json")
     best_eval_loss_file = output_dir / "best" / "best_eval_loss.json"
@@ -569,7 +592,7 @@ def run_felid_foundation_training(
 
     # Training loop
     step = 0
-    best_eval_loss = best_eval_loss or float("inf")
+    best_eval_loss = float("inf") if best_eval_loss is None else float(best_eval_loss)
     train_metric = MetricAccumulator()
     eval_metric = MetricAccumulator()
 
@@ -746,29 +769,25 @@ def run_felid_foundation_training(
                                 preds = outputs.logits.argmax(dim=-1)
                                 labels = eval_batch.get("labels")
                                 if labels is not None:
-                                    mask = labels != -100
-                                    eval_metric.token_correct += (
-                                        ((preds == labels) & mask).sum().item()
-                                    )
-                                    eval_metric.token_masked += mask.sum().item()
+                                    gathered_preds = accelerator.gather_for_metrics(preds)
+                                    gathered_labels = accelerator.gather_for_metrics(labels)
+                                    gathered_mask = gathered_labels != -100
+                                    if accelerator.is_main_process:
+                                        eval_metric.token_correct += (
+                                            ((gathered_preds == gathered_labels) & gathered_mask)
+                                            .sum()
+                                            .item()
+                                        )
+                                        eval_metric.token_masked += gathered_mask.sum().item()
 
                         model.train()
                         mean_eval_loss = eval_metric.loss_sum / max(eval_metric.step_count, 1)
 
-                        local_eval_counts = torch.tensor(
-                            [eval_metric.token_correct, eval_metric.token_masked],
-                            dtype=torch.float32,
-                            device=accelerator.device,
-                        )
-                        global_eval_counts = accelerator.reduce(local_eval_counts, reduction="sum")
-                        global_eval_correct = global_eval_counts[0].item()
-                        global_eval_masked = global_eval_counts[1].item()
-
                         # §3.6 (Fix #12): NaN convention for eval token_accuracy
                         eval_token_acc = (
                             float("nan")
-                            if global_eval_masked == 0
-                            else global_eval_correct / global_eval_masked
+                            if eval_metric.token_masked == 0
+                            else eval_metric.token_correct / eval_metric.token_masked
                         )
                         eval_ppl = (
                             float("nan")
@@ -795,30 +814,46 @@ def run_felid_foundation_training(
                             accelerator.save_state(str(tmp_best_accel_state))
 
                             accelerator.wait_for_everyone()
+                            save_failed = False
                             if accelerator.is_main_process:
-                                with atomic_dir_replace(
-                                    best_dir / "accelerate_state"
-                                ) as swap_target:
-                                    swap_target.rmdir()
-                                    os.replace(str(tmp_best_accel_state), str(swap_target))
+                                try:
+                                    with atomic_dir_replace(
+                                        best_dir / "accelerate_state"
+                                    ) as swap_target:
+                                        swap_target.rmdir()
+                                        os.replace(str(tmp_best_accel_state), str(swap_target))
 
-                                _save_checkpoint_atomically(
-                                    best_dir / "best_eval_loss.json",
-                                    {
-                                        "step": step,
-                                        "eval_loss": best_eval_loss,
-                                    },
-                                    as_json=True,
-                                )
-                                unwrapped_model = accelerator.unwrap_model(model)
-                                with atomic_dir_replace(best_dir / "hf_model") as tmp_model_dir:
-                                    unwrapped_model.save_pretrained(
-                                        str(tmp_model_dir),
-                                        safe_serialization=True,
+                                    _save_json_atomically(
+                                        best_dir / "best_eval_loss.json",
+                                        {
+                                            "step": step,
+                                            "eval_loss": best_eval_loss,
+                                        },
                                     )
-                                with atomic_dir_replace(best_dir / "tokenizer") as tmp_tok_dir:
-                                    tokenizer.save_pretrained(str(tmp_tok_dir))
+                                    unwrapped_model = accelerator.unwrap_model(model)
+                                    with atomic_dir_replace(best_dir / "hf_model") as tmp_model_dir:
+                                        unwrapped_model.save_pretrained(
+                                            str(tmp_model_dir),
+                                            safe_serialization=True,
+                                        )
+                                    with atomic_dir_replace(best_dir / "tokenizer") as tmp_tok_dir:
+                                        tokenizer.save_pretrained(str(tmp_tok_dir))
+                                except Exception as e:
+                                    # TRADE-OFF: Rank-0 exception broadcasted
+                                    # via set_trigger to prevent ranks deadlocking.
+                                    logger.error(
+                                        "Rank-0 checkpoint save failed: %s", e, exc_info=True
+                                    )
+                                    accelerator.set_trigger()
+                                    save_failed = True
                             accelerator.wait_for_everyone()
+                            if accelerator.check_trigger():
+                                raise RuntimeError(
+                                    "Distributed checkpoint save failed on rank-0; aborting "
+                                    "to allow torchrun cleanup. Inspect rank-0 logs."
+                                )
+                            if save_failed:
+                                raise
 
                         eval_metric.reset()
 
@@ -831,11 +866,27 @@ def run_felid_foundation_training(
                         accelerator.save_state(str(tmp_accel_state))
 
                         accelerator.wait_for_everyone()
+                        save_failed = False
                         if accelerator.is_main_process:
-                            with atomic_dir_replace(latest_dir / "accelerate_state") as swap_target:
-                                swap_target.rmdir()
-                                os.replace(str(tmp_accel_state), str(swap_target))
+                            try:
+                                with atomic_dir_replace(
+                                    latest_dir / "accelerate_state"
+                                ) as swap_target:
+                                    swap_target.rmdir()
+                                    os.replace(str(tmp_accel_state), str(swap_target))
+                            except Exception as e:
+                                # TRADE-OFF: Rank-0 checkpoint exception is caught and broadcasted
+                                logger.error("Rank-0 checkpoint save failed: %s", e, exc_info=True)
+                                accelerator.set_trigger()
+                                save_failed = True
                         accelerator.wait_for_everyone()
+                        if accelerator.check_trigger():
+                            raise RuntimeError(
+                                "Distributed checkpoint save failed on rank-0; aborting "
+                                "to allow torchrun cleanup. Inspect rank-0 logs."
+                            )
+                        if save_failed:
+                            raise
 
             if step >= config.max_steps:
                 break

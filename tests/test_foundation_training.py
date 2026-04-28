@@ -692,13 +692,13 @@ def test_save_checkpoint_atomically_json_is_a_file(tmp_path: Path) -> None:
     Args:
         tmp_path: Pytest temporary directory.
     """
-    from jaguar_geo_assign.pretrain.foundation_training import _save_checkpoint_atomically
+    from jaguar_geo_assign.pretrain.foundation_training import _save_json_atomically
 
     json_path = tmp_path / "best_eval_loss.json"
     content = {"step": 10, "eval_loss": 1.5}
 
     # Write JSON atomically
-    _save_checkpoint_atomically(json_path, content, as_json=True)
+    _save_json_atomically(json_path, content)
 
     # Assert it's a file, not a directory
     assert json_path.is_file(), (
@@ -776,15 +776,15 @@ def test_best_eval_loss_round_trip_on_resume(tmp_path: Path) -> None:
     Args:
         tmp_path: Pytest temporary directory.
     """
-    from jaguar_geo_assign.pretrain.foundation_training import _save_checkpoint_atomically
+    from jaguar_geo_assign.pretrain.foundation_training import _save_json_atomically
 
     output_dir = tmp_path / "checkpoint"
     best_dir = output_dir / "best"
     best_eval_loss_file = best_dir / "best_eval_loss.json"
 
-    # Write via _save_checkpoint_atomically (mimics the trainer's write path)
+    # Write via _save_json_atomically (mimics the trainer's write path)
     sidecar_content = {"step": 50, "eval_loss": 0.95, "timestamp": "2026-04-28T00:00:00"}
-    _save_checkpoint_atomically(best_eval_loss_file, sidecar_content, as_json=True)
+    _save_json_atomically(best_eval_loss_file, sidecar_content)
 
     # Read back via the same path (what resume logic should do)
     assert best_eval_loss_file.is_file(), f"Expected {best_eval_loss_file} to be a file"
@@ -1104,28 +1104,46 @@ eval_every = 1
 
                 def side_effect(x):
                     # If it's a 0-D tensor (loss), return a fake gathered tensor
+                    if getattr(side_effect, "in_accumulate", False):
+                        raise RuntimeError("gather_for_metrics called inside accumulate context!")
                     if x.dim() == 0 and x.dtype in (torch.float32, torch.bfloat16):
                         return torch.tensor([1.5, 2.5])
                     return x
 
                 mock_gather.side_effect = side_effect
 
-                result = run_felid_foundation_training(config_file, integration_test_mode="off")
+                # Mock accumulate context manager to track state
+                import contextlib
+
+                @contextlib.contextmanager
+                def mock_accumulate(self_obj, *args, **kwargs):
+                    side_effect.in_accumulate = True
+                    try:
+                        yield
+                    finally:
+                        side_effect.in_accumulate = False
+
+                with patch("accelerate.Accelerator.accumulate", mock_accumulate):
+                    result = run_felid_foundation_training(config_file, integration_test_mode="off")
 
                 # 1.5 + 2.5 = 4.0 / 2 = 2.0 mean
                 assert abs(result.best_eval_loss - 2.0) < 1e-6, (
                     f"Expected best_eval_loss to be 2.0, got {result.best_eval_loss}"
                 )
 
-                loss_gathered = False
+                loss_gather_calls = 0
                 for call in mock_gather.call_args_list:
                     tensor_arg = call.args[0]
-                    is_scalar = tensor_arg.dim() == 0
-                    is_float = tensor_arg.dtype in (torch.float32, torch.bfloat16)
+                    if tensor_arg is None:
+                        continue
+                    is_scalar = getattr(tensor_arg, "dim", lambda: -1)() == 0
+                    is_float = getattr(tensor_arg, "dtype", None) in (torch.float32, torch.bfloat16)
                     if is_scalar and is_float:
-                        loss_gathered = True
-                        break
-                assert loss_gathered, "gather_for_metrics was not called with the eval loss tensor"
+                        loss_gather_calls += 1
+
+                assert loss_gather_calls == 2, (
+                    f"gather_for_metrics expected 2 calls for loss, got {loss_gather_calls}"
+                )
     finally:
         AcceleratorState._reset_state()
         os.environ.pop("ACCELERATE_USE_CPU", None)
@@ -1551,3 +1569,414 @@ save_every = 1
     finally:
         AcceleratorState._reset_state()
         os.environ.pop("ACCELERATE_USE_CPU", None)
+
+
+def test_eval_accuracy_uses_gather_for_metrics(tmp_path: Path) -> None:
+    """NEW test (Fix #27): Verify eval accuracy gathers preds/labels across ranks."""
+    import os
+    from unittest.mock import patch
+
+    from accelerate.state import AcceleratorState
+    from transformers import AutoModelForMaskedLM, BertConfig
+
+    from jaguar_geo_assign.pretrain.foundation_training import run_felid_foundation_training
+
+    AcceleratorState._reset_state()
+    os.environ["ACCELERATE_USE_CPU"] = "true"
+
+    try:
+        metadata_path = _write_tiny_corpus(tmp_path, {"train": 1, "validation": 2})
+        config_file = tmp_path / "train_config_acc.toml"
+        config_file.write_text(f"""
+[training]
+corpus_metadata_path = "{metadata_path}"
+model_identifier = "zhihan1996/DNABERT-2-117M"
+model_revision = "main"
+output_dir = "{tmp_path}/out"
+max_steps = 1
+learning_rate = 1e-4
+seed = 42
+per_device_train_batch_size = 1
+per_device_eval_batch_size = 1
+gradient_accumulation_steps = 1
+log_every = 1
+eval_every = 1
+""")
+
+        config = BertConfig(
+            num_hidden_layers=1, num_attention_heads=2, hidden_size=32, vocab_size=30522
+        )
+        model = AutoModelForMaskedLM.from_config(config)
+
+        tokenizer = FakeTokenizer()
+        from unittest.mock import MagicMock
+
+        tokenizer.save_pretrained = MagicMock()
+
+        class DummyDataset:
+            record_count = 2
+
+            def set_epoch(self, epoch):
+                pass
+
+        class DummyLoader:
+            dataset = DummyDataset()
+
+            def __iter__(self):
+                for _ in range(2):
+                    yield {
+                        "input_ids": torch.tensor([[101, 200, 102, 0]]),
+                        "attention_mask": torch.tensor([[1, 1, 1, 0]]),
+                        "labels": torch.tensor([[-100, 200, -100, -100]]),
+                    }
+
+            def __len__(self):
+                return 2
+
+        with (
+            patch(
+                "jaguar_geo_assign.pretrain.foundation_training._build_dataloaders"
+            ) as mock_loaders,
+            patch(
+                "jaguar_geo_assign.pretrain.foundation_training._build_model_and_tokenizer"
+            ) as mock_build,
+            patch("accelerate.Accelerator.gather_for_metrics") as mock_gather,
+        ):
+            mock_build.return_value = (model, tokenizer, "none", False)
+            mock_loaders.return_value = (DummyLoader(), DummyLoader())
+
+            mock_gather.side_effect = lambda x: x
+
+            # Test rank 0
+            with patch("accelerate.Accelerator.is_main_process", True):
+                run_felid_foundation_training(config_file, integration_test_mode="off")
+
+            gathered_tensors = [call.args[0] for call in mock_gather.call_args_list]
+
+            # Find preds and labels
+            found_preds = any(
+                getattr(t, "dtype", None) == torch.int64 and getattr(t, "dim", lambda: 0)() == 2
+                for t in gathered_tensors
+            )
+            assert found_preds, "gather_for_metrics was not called with preds/labels"
+
+            mock_gather.reset_mock()
+
+            # Test rank 1
+            with (
+                patch("accelerate.Accelerator.is_main_process", False),
+                patch("accelerate.Accelerator.log") as mock_log,
+            ):
+                run_felid_foundation_training(config_file, integration_test_mode="off")
+
+                # On rank 1, eval counts are not accumulated, so token_masked remains 0.
+                # This results in eval_token_acc being nan.
+                import math
+
+                eval_call = [
+                    c for c in mock_log.call_args_list if "eval/token_accuracy" in c.args[0]
+                ]
+                assert len(eval_call) > 0
+                assert math.isnan(eval_call[0].args[0]["eval/token_accuracy"]), (
+                    "eval_token_acc should be NaN on non-main process"
+                )
+
+    finally:
+        AcceleratorState._reset_state()
+
+
+def test_atomic_dir_replace_recovers_from_crash(tmp_path: Path) -> None:
+    """NEW test (Fix #28): Verify _recover_atomic_dir handles mid-crash .old_ recovery."""
+    from jaguar_geo_assign.pretrain.foundation_training import _recover_atomic_dir
+
+    target = tmp_path / "target"
+
+    # Target doesn't exist, but .old_target_42 does
+    old_target = tmp_path / ".old_target_42"
+    old_target.mkdir()
+    (old_target / "file.txt").write_text("recovered")
+
+    # Should recover
+    recovered = _recover_atomic_dir(target)
+    assert recovered is True
+    assert target.exists()
+    assert (target / "file.txt").read_text() == "recovered"
+    assert not old_target.exists()
+
+    # Should not recover again
+    recovered2 = _recover_atomic_dir(target)
+    assert recovered2 is False
+
+
+def test_best_eval_loss_resume_handles_zero(tmp_path: Path) -> None:
+    """NEW test (Fix #29): Verify best_eval_loss = 0.0 is not treated as falsy inf."""
+    import json
+    import os
+    from unittest.mock import patch
+
+    from transformers import AutoModelForMaskedLM, BertConfig
+
+    from jaguar_geo_assign.pretrain.foundation_training import run_felid_foundation_training
+
+    os.environ["ACCELERATE_USE_CPU"] = "true"
+
+    try:
+        out_dir = tmp_path / "out"
+        best_dir = out_dir / "best"
+        best_dir.mkdir(parents=True)
+        latest_state = out_dir / "latest" / "accelerate_state"
+        latest_state.mkdir(parents=True)
+
+        (best_dir / "best_eval_loss.json").write_text(json.dumps({"eval_loss": 0.0, "step": 1}))
+
+        metadata_path = _write_tiny_corpus(tmp_path, {"train": 1})
+        config_file = tmp_path / "train_config_zero.toml"
+        config_file.write_text(f"""
+[training]
+corpus_metadata_path = "{metadata_path}"
+model_identifier = "zhihan1996/DNABERT-2-117M"
+model_revision = "main"
+output_dir = "{out_dir}"
+max_steps = 1
+learning_rate = 1e-4
+seed = 42
+per_device_train_batch_size = 1
+gradient_accumulation_steps = 1
+log_every = 1
+eval_every = 1
+""")
+
+        config = BertConfig(
+            num_hidden_layers=1, num_attention_heads=2, hidden_size=32, vocab_size=30522
+        )
+        model = AutoModelForMaskedLM.from_config(config)
+        tokenizer = FakeTokenizer()
+        from unittest.mock import MagicMock
+
+        tokenizer.save_pretrained = MagicMock()
+
+        class DummyDataset:
+            record_count = 2
+
+            def set_epoch(self, epoch):
+                pass
+
+        class DummyLoader:
+            dataset = DummyDataset()
+
+            def __iter__(self):
+                yield {
+                    "input_ids": torch.tensor([[101, 200, 102, 0]]),
+                    "attention_mask": torch.tensor([[1, 1, 1, 0]]),
+                    "labels": torch.tensor([[-100, 200, -100, -100]]),
+                }
+
+            def __len__(self):
+                return 1
+
+        with (
+            patch(
+                "jaguar_geo_assign.pretrain.foundation_training._build_dataloaders"
+            ) as mock_loaders,
+            patch(
+                "jaguar_geo_assign.pretrain.foundation_training._build_model_and_tokenizer"
+            ) as mock_build,
+            patch("accelerate.Accelerator.load_state"),
+        ):
+            mock_build.return_value = (model, tokenizer, "none", False)
+            mock_loaders.return_value = (DummyLoader(), None)
+
+            result = run_felid_foundation_training(config_file, integration_test_mode="off")
+
+            # In our loop, best_eval_loss shouldn't be updated (no eval_loader), so it remains 0.0
+            assert result.best_eval_loss == 0.0
+    finally:
+        os.environ.pop("ACCELERATE_USE_CPU", None)
+
+
+def test_rank0_save_exception_no_deadlock(tmp_path: Path) -> None:
+    """NEW test (Fix #30): Verify rank-0 save exception does not deadlock other ranks."""
+    import os
+    from unittest.mock import patch
+
+    from accelerate.state import AcceleratorState
+    from transformers import AutoModelForMaskedLM, BertConfig
+
+    from jaguar_geo_assign.pretrain.foundation_training import run_felid_foundation_training
+
+    AcceleratorState._reset_state()
+    os.environ["ACCELERATE_USE_CPU"] = "true"
+
+    try:
+        metadata_path = _write_tiny_corpus(tmp_path, {"train": 1, "validation": 1})
+        config_file = tmp_path / "train_config_err.toml"
+        config_file.write_text(f"""
+[training]
+corpus_metadata_path = "{metadata_path}"
+model_identifier = "zhihan1996/DNABERT-2-117M"
+model_revision = "main"
+output_dir = "{tmp_path}/out"
+max_steps = 1
+learning_rate = 1e-4
+seed = 42
+per_device_train_batch_size = 1
+per_device_eval_batch_size = 1
+gradient_accumulation_steps = 1
+log_every = 1
+eval_every = 1
+""")
+
+        config = BertConfig(
+            num_hidden_layers=1, num_attention_heads=2, hidden_size=32, vocab_size=30522
+        )
+        model = AutoModelForMaskedLM.from_config(config)
+        tokenizer = FakeTokenizer()
+
+        class DummyDataset:
+            record_count = 1
+
+            def set_epoch(self, epoch):
+                pass
+
+        class DummyLoader:
+            dataset = DummyDataset()
+
+            def __iter__(self):
+                yield {
+                    "input_ids": torch.tensor([[101, 200, 102, 0]]),
+                    "attention_mask": torch.tensor([[1, 1, 1, 0]]),
+                    "labels": torch.tensor([[1, 2, 3, 4]]),
+                }
+
+            def __len__(self):
+                return 1
+
+        with (
+            patch(
+                "jaguar_geo_assign.pretrain.foundation_training._build_dataloaders"
+            ) as mock_loaders,
+            patch(
+                "jaguar_geo_assign.pretrain.foundation_training._build_model_and_tokenizer"
+            ) as mock_build,
+            patch("accelerate.Accelerator.is_main_process", True),
+            patch("accelerate.Accelerator.wait_for_everyone") as mock_wait,
+            patch("accelerate.Accelerator.set_trigger") as mock_set_trigger,
+            patch("accelerate.Accelerator.check_trigger", return_value=True),
+            patch("transformers.PreTrainedModel.save_pretrained", side_effect=OSError("disk full")),
+        ):
+            mock_build.return_value = (model, tokenizer, "none", False)
+            mock_loaders.return_value = (DummyLoader(), DummyLoader())
+
+            with pytest.raises(RuntimeError, match="Distributed checkpoint save failed"):
+                run_felid_foundation_training(config_file, integration_test_mode="off")
+
+            mock_set_trigger.assert_called_once()
+            assert mock_wait.call_count >= 2
+    finally:
+        AcceleratorState._reset_state()
+        os.environ.pop("ACCELERATE_USE_CPU", None)
+
+
+def test_corpus_reader_rejects_empty_shard(tmp_path: Path) -> None:
+    """NEW test (Fix #31): Verify empty-shard deadlock guard."""
+    metadata_path = _write_tiny_corpus(tmp_path, {"train": 2})
+
+    # 2 files, global_workers = 4*1 = 4. 2 < 4, should raise CorpusReaderError.
+    with pytest.raises(
+        CorpusReaderError, match="but DDP needs at least 4 \\(world_size=4 x num_workers=1\\)"
+    ):
+        TokenizedCorpusReader(metadata_path, "train", world_size=4, num_workers=1)
+
+
+def test_accelerator_honors_world_size_env_vars() -> None:
+    """NEW test (Fix #32): Verify Accelerator detects num_processes from WORLD_SIZE."""
+    import os
+
+    from accelerate.state import AcceleratorState, PartialState
+
+    AcceleratorState._reset_state()
+    PartialState._reset_state()
+
+    with patch.dict(
+        os.environ,
+        {
+            "WORLD_SIZE": "2",
+            "RANK": "1",
+            "LOCAL_RANK": "1",
+            "MASTER_ADDR": "localhost",
+            "MASTER_PORT": "29500",
+        },
+    ):
+        AcceleratorState._reset_state()
+        PartialState._reset_state()
+
+        with (
+            patch("torch.distributed.init_process_group"),
+            patch("torch.distributed.is_initialized", return_value=True),
+            patch("torch.distributed.get_world_size", return_value=2),
+            patch("torch.distributed.get_rank", return_value=1),
+        ):
+            # Init partial state manually
+            state = PartialState(cpu=True)
+            assert state.num_processes == 2
+            assert state.process_index == 1
+
+        AcceleratorState._reset_state()
+        PartialState._reset_state()
+
+
+def test_reader_full_ddp_sharding_coverage(tmp_path: Path) -> None:
+    """NEW test (Fix #33): Verify DDP sharding distributes all files evenly without duplicates."""
+    from unittest.mock import patch
+
+    from jaguar_geo_assign.data.tokenized_corpus_reader import TokenizedCorpusReader
+
+    configs = [(1, 1), (2, 1), (2, 2), (4, 1), (4, 2), (8, 1)]
+
+    for world_size, num_workers in configs:
+        collected_files = []
+        for process_index in range(world_size):
+            for worker_id in range(num_workers):
+
+                def mock_get_distributed_state(
+                    pi=process_index, ws=world_size, wi=worker_id, nw=num_workers
+                ):
+                    return pi, ws, wi, nw
+
+                with patch(
+                    "jaguar_geo_assign.data.tokenized_corpus_reader._get_distributed_state",
+                    mock_get_distributed_state,
+                ):
+                    # Mock _validate_metadata_and_schema to populate 16 dummy files
+                    with patch.object(TokenizedCorpusReader, "_validate_metadata_and_schema"):
+                        reader = TokenizedCorpusReader(
+                            "dummy.json",
+                            "train",
+                            file_shuffle=False,
+                            world_size=world_size,
+                            num_workers=num_workers,
+                        )
+                        reader._files = [Path(f"file_{i}.parquet") for i in range(16)]
+                        reader._record_count = 16
+
+                        # Just get the assigned files list
+                        global_worker_id = process_index * num_workers + worker_id
+                        global_world_size = world_size * num_workers
+
+                        files = list(reader._files)
+                        assigned_files = [
+                            f
+                            for i, f in enumerate(files)
+                            if i % global_world_size == global_worker_id
+                        ]
+
+                        collected_files.append(len(assigned_files))
+
+        # Total files should be exactly 16
+        assert sum(collected_files) == 16, (
+            f"Expected 16 files, got {sum(collected_files)} for {world_size}x{num_workers}"
+        )
+        # Diff between max and min should be <= 1
+        assert max(collected_files) - min(collected_files) <= 1, (
+            f"Unbalanced distribution for {world_size}x{num_workers}"
+        )

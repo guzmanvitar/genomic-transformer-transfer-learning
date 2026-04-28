@@ -1648,4 +1648,22 @@ def test_train_felid_foundation_with_integration_test_flag_calls_integration_tes
     assert exit_code == 0
     assert len(called) == 1
     assert called[0][0] == "integration_test"
-    assert called[0][1] is True  # use_real_model=True
+    assert called[0][1] is False  # use_real_model=False
+
+
+def test_integration_test_flag_uses_tiny_model(capsys) -> None:
+    """NEW test (Fix #36): Verify --integration-test flag invokes tiny model mode."""
+    from unittest.mock import patch
+
+    with patch(
+        "jaguar_geo_assign.pretrain.foundation_training.integration_test"
+    ) as mock_integration:
+        # Prevent actually loading training configs
+        with patch("jaguar_geo_assign.config.load_foundation_training_config"):
+            # We must pass a dummy config path to satisfy the required arg
+            exit_code = main(
+                ["train-felid-foundation", "--config", "dummy.toml", "--integration-test"]
+            )
+
+    assert exit_code == 0
+    mock_integration.assert_called_once_with(use_real_model=False)

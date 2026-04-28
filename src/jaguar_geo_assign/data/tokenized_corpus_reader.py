@@ -119,6 +119,8 @@ class TokenizedCorpusReader(IterableDataset):
         shuffle_buffer_size: int = 8192,
         seed: int = 42,
         drop_last: bool = False,
+        world_size: int = 1,
+        num_workers: int = 0,
     ) -> None:
         """Initialize the corpus reader.
 
@@ -148,9 +150,9 @@ class TokenizedCorpusReader(IterableDataset):
         self.file_shuffle = file_shuffle and (split != "validation")
 
         # Cold-start guards: validate metadata and files
-        self._validate_metadata_and_schema()
+        self._validate_metadata_and_schema(world_size, num_workers)
 
-    def _validate_metadata_and_schema(self) -> None:
+    def _validate_metadata_and_schema(self, world_size: int, num_workers: int) -> None:
         """Validate metadata.json exists, split is present, and Parquet schema is sound.
 
         Raises:
@@ -194,6 +196,17 @@ class TokenizedCorpusReader(IterableDataset):
 
         self._files = [self.corpus_root / f for f in files]
         self._record_count = record_count
+
+        global_workers = max(1, world_size) * max(1, num_workers)
+        if len(self._files) < global_workers:
+            # TRADE-OFF: Empty-shard deadlock guard catches configurations that would
+            # result in a trailing rank receiving 0 batches, which deadlocks DDP.
+            raise CorpusReaderError(
+                f"Found {len(self._files)} files in {self.corpus_root} but DDP needs at least "
+                f"{global_workers} (world_size={world_size} x num_workers={num_workers}). "
+                f"Either reduce world_size/num_workers or add more shards to the corpus. "
+                f"Producer: `uv run jaguar-geo-assign felid-foundation-pretrain ...`"
+            )
 
         # Probe first Parquet file for schema
         if self._files:
