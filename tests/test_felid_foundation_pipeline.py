@@ -96,6 +96,8 @@ def _build_full_mock_manifest(
                 checksum=checksum,
                 checksum_name="md5",
                 kind="reference",
+                mirror_url=assembly.mirror_url,
+                expected_size=assembly.expected_size,
             )
         )
     return assets
@@ -759,3 +761,56 @@ def test_acquisition_failure_preserves_root_cause(tmp_path):
             assert "ConnectionResetError" in error_message
             assert "kaboom" in error_message
             assert "GCF_000181335.3" in error_message
+
+
+def test_acquisition_forwards_mirror_and_size(tmp_path: Path) -> None:
+    """rebases paths but forwards mirror_url and expected_size."""
+    config_path = _build_fixture_config(
+        tmp_path,
+        [("Panthera onca", "DNAZOO_Panthera_onca_HiC")],
+    )
+    config = load_felid_foundation_pipeline_config(config_path)
+    reference_dir = tmp_path / "reference"
+
+    def fake_opener():
+        pass
+
+    from unittest.mock import patch
+
+    with patch(
+        "jaguar_geo_assign.data.felid_acquisition.build_felid_reference_manifest"
+    ) as mock_manifest:
+        # Mock manifest sets mirror_url and expected_size for jaguar.
+        mock_manifest.return_value = _build_full_mock_manifest(
+            reference_dir,
+            overrides={"DNAZOO_Panthera_onca_HiC": "mocked_checksum"},
+        )
+
+        with patch("jaguar_geo_assign.data.felid_acquisition.download_with_retry") as mock_download:
+            # We mock download_with_retry so it succeeds
+            def fake_download(asset, *args, **kwargs):
+                asset.destination.write_bytes(b"content")
+                return DownloadResult(
+                    path=asset.destination,
+                    attempts=1,
+                    resumed=False,
+                    skipped_existing=False,
+                    bytes_written=7,
+                )
+
+            mock_download.side_effect = fake_download
+
+            acquire_felid_foundation_assemblies(config, opener=fake_opener)
+
+            # Assert that download_with_retry was called with the jaguar asset containing
+            # mirror_url and expected_size
+            jaguar_call = None
+            for call in mock_download.call_args_list:
+                asset = call.args[0]
+                if asset.destination.name.startswith("DNAZOO_Panthera_onca_HiC"):
+                    jaguar_call = asset
+                    break
+
+            assert jaguar_call is not None, "Jaguar asset was not downloaded"
+            assert "huggingface.co" in (jaguar_call.mirror_url or ""), "mirror_url was dropped"
+            assert jaguar_call.expected_size == 745951926, "expected_size was dropped"

@@ -39,7 +39,7 @@ ALL_APPROVED_FELIDS: tuple[tuple[str, str], ...] = (
     ("Felis catus", "GCF_000181335.3"),
     ("Panthera leo", "GCF_018350215.1"),
     ("Panthera tigris", "GCF_000464555.1"),
-    ("Panthera onca", "GCF_028533385.1"),
+    ("Panthera onca", "DNAZOO_Panthera_onca_HiC"),
     ("Puma concolor", "GCF_003327715.1"),
     ("Panthera pardus", "GCF_001857705.1"),
 )

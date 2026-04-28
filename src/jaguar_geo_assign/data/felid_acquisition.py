@@ -79,8 +79,8 @@ class FelidAcquisitionSummary:
     redownloaded_count: int
 
 
-def _compute_md5(path: Path) -> str:
-    """Return the lowercase hex MD5 of *path* using streaming reads.
+def _compute_checksum(path: Path, algorithm: str) -> str:
+    """Return the lowercase hex digest of *path* using streaming reads.
 
     Felid assemblies are multi-hundred-MB ``.fna.gz`` blobs.
     Loading the whole file into memory to hash it would make the acquire
@@ -88,7 +88,7 @@ def _compute_md5(path: Path) -> str:
     keeps the hash cost bounded and matches the chunk size already used
     by :func:`download_with_retry`.
     """
-    hasher = hashlib.md5()
+    hasher = hashlib.new(algorithm)
     with path.open("rb") as handle:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             hasher.update(chunk)
@@ -182,6 +182,8 @@ def acquire_felid_foundation_assemblies(
             checksum_name=asset.checksum_name,
             sample_id=asset.sample_id,
             kind=asset.kind,
+            mirror_url=asset.mirror_url,
+            expected_size=asset.expected_size,
         )
         for asset in manifest
     )
@@ -202,8 +204,8 @@ def acquire_felid_foundation_assemblies(
 
         redownloaded = False
         if asset.destination.exists():
-            actual_md5 = _compute_md5(asset.destination)
-            if actual_md5 == asset.checksum:
+            actual_checksum = _compute_checksum(asset.destination, asset.checksum_name)
+            if actual_checksum == asset.checksum:
                 _LOGGER.info(
                     'skip species=%s identifier=%s reason="checksum match" destination=%s',
                     entry.species_slug,
@@ -226,7 +228,7 @@ def acquire_felid_foundation_assemblies(
                 'reason="checksum mismatch; hash=%s expected=%s" destination=%s',
                 entry.species_slug,
                 entry.identifier,
-                actual_md5,
+                actual_checksum,
                 asset.checksum,
                 asset.destination,
             )

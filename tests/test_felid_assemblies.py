@@ -31,6 +31,7 @@ _EXPECTED_SPECIES = {
     "Panthera pardus",
 }
 _MD5_HEX = re.compile(r"^[0-9a-f]{32}$")
+_SHA256_HEX = re.compile(r"^[0-9a-f]{64}$")
 
 
 def test_approved_registry_shape() -> None:
@@ -39,18 +40,44 @@ def test_approved_registry_shape() -> None:
     assert {a.species for a in APPROVED_FELID_ASSEMBLIES} == _EXPECTED_SPECIES
 
 
-def test_every_pinned_md5_is_lowercase_hex() -> None:
+def test_every_pinned_checksum_is_lowercase_hex() -> None:
     """Guards against typos or uppercase drift that would break hashlib comparison."""
     for assembly in APPROVED_FELID_ASSEMBLIES:
-        assert _MD5_HEX.match(assembly.expected_checksum), (
-            f"{assembly.identifier} MD5 {assembly.expected_checksum!r} is not lowercase 32-char hex"
-        )
+        if assembly.checksum_name == "md5":
+            assert _MD5_HEX.match(assembly.expected_checksum), (
+                f"{assembly.identifier} MD5 {assembly.expected_checksum!r} "
+                "is not lowercase 32-char hex"
+            )
+        elif assembly.checksum_name == "sha256":
+            assert _SHA256_HEX.match(assembly.expected_checksum), (
+                f"{assembly.identifier} SHA256 {assembly.expected_checksum!r} "
+                "is not lowercase 64-char hex"
+            )
+        else:
+            pytest.fail(f"Unknown checksum_name {assembly.checksum_name}")
+
+
+def test_jaguar_dna_zoo_registry_shape() -> None:
+    """The jaguar row resolves to the DNA Zoo URL via url_override and uses sha256."""
+    jaguar = next(a for a in APPROVED_FELID_ASSEMBLIES if a.species == "Panthera onca")
+    assert jaguar.identifier == "DNAZOO_Panthera_onca_HiC"
+    assert (
+        jaguar.url_override
+        == "https://dnazoo.s3.wasabisys.com/Panthera_onca/Panthera_onca_HiC.fasta.gz"
+    )
+    assert jaguar.checksum_name == "sha256"
+    assert jaguar.expected_size == 745_951_926
+    assert "huggingface.co" in (jaguar.mirror_url or "")
 
 
 @pytest.mark.parametrize("assembly", APPROVED_FELID_ASSEMBLIES, ids=lambda a: a.identifier)
 def test_build_refseq_fasta_url_round_trip(assembly: FelidAssembly) -> None:
-    """Each pinned identifier produces the canonical NCBI FTP URL shape."""
-    url = build_refseq_fasta_url(assembly.identifier, assembly.assembly_name)
+    """Each pinned identifier produces the canonical NCBI FTP URL shape, or returns url_override."""
+    url = build_refseq_fasta_url(assembly.identifier, assembly.assembly_name, assembly.url_override)
+    if assembly.url_override:
+        assert url == assembly.url_override
+        return
+
     stem = f"{assembly.identifier}_{assembly.assembly_name}"
     numeric = assembly.identifier.split("_", 1)[1].split(".", 1)[0]
     expected = (
@@ -88,11 +115,11 @@ def test_manifest_returns_six_sorted_reference_assets(tmp_path: Path) -> None:
     """Default manifest is deterministic: six assets, sorted by identifier, kind=reference."""
     manifest = build_felid_reference_manifest(tmp_path)
     assert len(manifest) == 6
-    identifiers = [asset.url.rsplit("/", 1)[1].split("_genomic")[0] for asset in manifest]
+    identifiers = [asset.destination.name.split(".fna")[0] for asset in manifest]
     assert identifiers == sorted(identifiers)
     for asset in manifest:
         assert asset.kind == "reference"
-        assert asset.checksum_name == "md5"
+        assert asset.checksum_name in ("md5", "sha256")
         assert asset.destination.parent == tmp_path / "reference"
         assert asset.destination.suffix == ".gz"
 

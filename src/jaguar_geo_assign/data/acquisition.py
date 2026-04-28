@@ -18,12 +18,15 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlparse
 from urllib.request import OpenerDirector, Request, build_opener
+
+_LOGGER = logging.getLogger(__name__)
 
 DEFAULT_BIOPROJECT_ACCESSION = "PRJNA308208"
 DEFAULT_REFERENCE_URL = (
@@ -94,7 +97,6 @@ class DownloadAsset:
     checksum_name: str = "sha256"
     sample_id: str | None = None
     kind: str = "generic"
-    # TODO (Wave A2): Implement mirror_url and expected_size logic.
     mirror_url: str | None = None
     expected_size: int | None = None
 
@@ -308,6 +310,28 @@ def download_with_retry(
             after all retry attempts are exhausted.
     """
     opener = opener or build_opener()
+
+    if asset.expected_size is not None:
+        try:
+            head_req = Request(asset.url, method="HEAD")
+            with opener.open(head_req, timeout=timeout_seconds) as head_resp:
+                size_header = head_resp.headers.get("Content-Length") or head_resp.headers.get(
+                    "x-linked-size"
+                )
+                if size_header is not None:
+                    observed_size = int(size_header)
+                    if observed_size != asset.expected_size:
+                        raise AcquisitionError(
+                            f"Size mismatch during HEAD pre-flight for {asset.url}: "
+                            f"expected {asset.expected_size}, got {observed_size}"
+                        )
+        except AcquisitionError:
+            raise
+        except Exception as exc:
+            _LOGGER.warning(
+                "HEAD pre-flight failed for %s, falling through to download: %s", asset.url, exc
+            )
+
     destination = asset.destination
     destination.parent.mkdir(parents=True, exist_ok=True)
     partial_path = destination.with_name(f"{destination.name}.part")
@@ -333,11 +357,40 @@ def download_with_retry(
             if asset.checksum and not _checksum_matches(
                 partial_path, asset.checksum, asset.checksum_name
             ):
+                observed_checksum = _get_digest(partial_path, asset.checksum_name)
                 partial_path.unlink(missing_ok=True)
-                raise AcquisitionError(
-                    f"Checksum mismatch for {asset.url}; "
-                    f"expected {asset.checksum_name}={asset.checksum}"
-                )
+
+                if asset.mirror_url:
+                    _LOGGER.warning(
+                        "Checksum mismatch for primary %s "
+                        "(expected %s, got %s); "
+                        "falling back to mirror %s",
+                        asset.url,
+                        asset.checksum,
+                        observed_checksum,
+                        asset.mirror_url,
+                    )
+                    bytes_written = _download_once(
+                        opener=opener,
+                        url=asset.mirror_url,
+                        partial_path=partial_path,
+                        timeout_seconds=timeout_seconds,
+                        chunk_size=chunk_size,
+                    )
+                    if not _checksum_matches(partial_path, asset.checksum, asset.checksum_name):
+                        mirror_observed = _get_digest(partial_path, asset.checksum_name)
+                        partial_path.unlink(missing_ok=True)
+                        raise AcquisitionError(
+                            f"Checksum mismatch for both primary and mirror; "
+                            f"primary: {asset.url} (got {observed_checksum}), "
+                            f"mirror: {asset.mirror_url} (got {mirror_observed}); "
+                            f"expected {asset.checksum_name}={asset.checksum}"
+                        )
+                else:
+                    raise AcquisitionError(
+                        f"Checksum mismatch for {asset.url}; "
+                        f"expected {asset.checksum_name}={asset.checksum} (got {observed_checksum})"
+                    )
             partial_path.replace(destination)
             return DownloadResult(
                 path=destination,
@@ -404,6 +457,15 @@ def _download_once(
     return partial_path.stat().st_size
 
 
+def _get_digest(path: Path, checksum_name: str) -> str:
+    """Compute the streaming hex digest of path using hashlib.new(checksum_name)."""
+    digest = hashlib.new(checksum_name)
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 def _checksum_matches(path: Path, checksum: str | None, checksum_name: str) -> bool:
     """Check whether a file's digest matches an expected checksum.
 
@@ -421,11 +483,7 @@ def _checksum_matches(path: Path, checksum: str | None, checksum_name: str) -> b
     """
     if checksum is None:
         return path.exists()
-    digest = hashlib.new(checksum_name)
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest() == checksum
+    return _get_digest(path, checksum_name) == checksum
 
 
 def _load_json(opener: OpenerDirector, url: str) -> dict[str, object]:

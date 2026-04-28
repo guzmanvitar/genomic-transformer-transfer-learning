@@ -33,7 +33,7 @@ identifier = "GCF_018350215.1"
 
 [[species]]
 species = "Panthera onca"
-identifier = "GCF_028533385.1"
+identifier = "DNAZOO_Panthera_onca_HiC"
 
 [windowing]
 context_window = 512

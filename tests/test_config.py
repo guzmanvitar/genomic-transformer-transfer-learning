@@ -329,7 +329,7 @@ def test_validate_felid_species_entries_rejects_legacy_accession_key() -> None:
         {"species": "Panthera tigris", "identifier": "GCF_000464555.1"},
         {"species": "Puma concolor", "identifier": "GCF_003327715.1"},
         {"species": "Panthera pardus", "identifier": "GCF_001857705.1"},
-        {"species": "Panthera onca", "accession": "GCF_028533385.1"},
+        {"species": "Panthera onca", "accession": "DNAZOO_Panthera_onca_HiC"},
     ]
     with pytest.raises(ValueError, match="renamed to 'identifier'"):
         _validate_felid_species_entries(raw_species)
