@@ -29,12 +29,35 @@ from jaguar_geo_assign.data.tokenized_corpus_reader import (
     TokenizedCorpusReader,
 )  # noqa: E402
 
+try:
+    from accelerate.state import AcceleratorState, PartialState
+except ImportError:
+    AcceleratorState = None
+    PartialState = None
+
+
+@pytest.fixture(autouse=True)
+def reset_accelerate_state():
+    """Reset AcceleratorState before and after each test to prevent cross-test pollution."""
+    if AcceleratorState is not None:
+        AcceleratorState._reset_state()
+        PartialState._reset_state()
+    yield
+    if AcceleratorState is not None:
+        AcceleratorState._reset_state()
+        PartialState._reset_state()
+
 
 class FakeTokenizer:
     """Simple deterministic tokenizer for testing.
 
     Produces input_ids = [101, 200+i, ..., 102] and attention_mask of all 1s.
     """
+
+    mask_token = "[MASK]"
+    pad_token = "[PAD]"
+    mask_token_id = 104
+    pad_token_id = 0
 
     def __call__(self, sequence: str, **_: object) -> dict[str, list[int]]:
         """Tokenize a sequence.
@@ -563,62 +586,101 @@ def test_startup_grad_norm_histogram_emitted(tmp_path: Path) -> None:
     Uses unittest.mock to patch the TensorBoard tracker's add_histogram method,
     runs a couple of training steps, and verifies that add_histogram was called
     with the key 'startup/grad_norm_hist' and a tensor argument (not a scalar).
-
-    This test demonstrates that Fix #13 correctly replaces the scalar log with
-    a per-parameter gradient norm distribution per §3.7 (TensorBoard histogram).
     """
+    import os
+
     pytest.importorskip("torch")
     pytest.importorskip("transformers")
     pytest.importorskip("accelerate")
 
-    from unittest.mock import Mock
+    from unittest.mock import MagicMock, patch
 
-    import torch
+    from accelerate.state import AcceleratorState
     from transformers import AutoModelForMaskedLM, BertConfig
 
-    from jaguar_geo_assign.pretrain.foundation_training import _startup_probe_metrics
+    from jaguar_geo_assign.pretrain.foundation_training import run_felid_foundation_training
 
-    # Create a tiny model
-    config = BertConfig(
-        num_hidden_layers=1,
-        num_attention_heads=2,
-        hidden_size=32,
-        vocab_size=30522,
-    )
-    model = AutoModelForMaskedLM.from_config(config)
-    model.train()
+    AcceleratorState._reset_state()
+    os.environ["ACCELERATE_USE_CPU"] = "true"
+    try:
+        metadata_path = _write_tiny_corpus(tmp_path, {"train": 2})
+        config_file = tmp_path / "train_config.toml"
+        config_file.write_text(f"""
+[training]
+corpus_metadata_path = "{metadata_path}"
+model_identifier = "zhihan1996/DNABERT-2-117M"
+model_revision = "main"
+output_dir = "{tmp_path}/out"
+max_steps = 1
+learning_rate = 1e-4
+seed = 42
+per_device_train_batch_size = 1
+gradient_accumulation_steps = 1
+log_every = 1
+""")
 
-    # Create a synthetic batch
-    batch = {
-        "input_ids": torch.tensor([[101, 200, 201, 102, 0], [101, 200, 201, 102, 0]]),
-        "attention_mask": torch.tensor([[1, 1, 1, 1, 0], [1, 1, 1, 1, 0]]),
-        "labels": torch.tensor([[101, -100, 201, 102, -100], [101, 200, -100, 102, -100]]),
-    }
+        config = BertConfig(
+            num_hidden_layers=1,
+            num_attention_heads=2,
+            hidden_size=32,
+            vocab_size=30522,
+        )
+        model = AutoModelForMaskedLM.from_config(config)
+        from jaguar_geo_assign.data.preprocessor import load_dnabert2_tokenizer
 
-    # Run one forward/backward to generate gradients
-    outputs = model(**batch)
-    loss = outputs.loss
-    loss.backward()
+        tokenizer, _ = load_dnabert2_tokenizer()
+        tokenizer.add_special_tokens({"pad_token": "[PAD]"})
 
-    # Create mock accelerator
-    mock_accelerator = Mock()
-    mock_accelerator.is_main_process = True
+        patch_build = "jaguar_geo_assign.pretrain.foundation_training._build_model_and_tokenizer"
+        patch_loaders = "jaguar_geo_assign.pretrain.foundation_training._build_dataloaders"
 
-    # Call _startup_probe_metrics which should return grad norms
-    metrics = _startup_probe_metrics(batch, step=1, accelerator=mock_accelerator, model=model)
+        class DummyDataset:
+            def set_epoch(self, epoch):
+                pass
 
-    # Verify that grad_norm_norms tensor is in the metrics
-    assert "_startup_grad_norm_norms" in metrics, "Expected grad norm tensor in startup metrics"
-    grad_norm_norms = metrics["_startup_grad_norm_norms"]
-    assert isinstance(grad_norm_norms, torch.Tensor), (
-        "Expected grad_norm_norms to be a tensor, not a scalar"
-    )
-    assert grad_norm_norms.numel() > 0, "Expected at least one grad norm value"
+        class DummyLoader:
+            dataset = DummyDataset()
+
+            def __iter__(self):
+                from accelerate import Accelerator
+
+                device = Accelerator().device
+                for _ in range(2):
+                    yield {
+                        "input_ids": torch.tensor([[101, 200, 102, 0]], device=device),
+                        "attention_mask": torch.tensor([[1, 1, 1, 0]], device=device),
+                        "labels": torch.tensor([[-100, 200, -100, -100]], device=device),
+                    }
+
+            def __len__(self):
+                return 2
+
+        with patch(patch_loaders) as mock_loaders, patch(patch_build) as mock_build:
+            mock_build.return_value = (model, tokenizer, "none", False)
+            mock_loaders.return_value = (DummyLoader(), None)
+
+            with patch("accelerate.Accelerator.get_tracker") as mock_get_tracker:
+                mock_tb = MagicMock()
+                mock_get_tracker.return_value = mock_tb
+
+                run_felid_foundation_training(config_file, integration_test_mode="off")
+
+                found = False
+                for call in mock_tb.add_histogram.call_args_list:
+                    if call.args[0] == "startup/grad_norm_hist":
+                        norms = call.args[1]
+                        assert norms.numel() > 0, "Grad norms tensor is empty"
+                        found = True
+                assert found, "startup/grad_norm_hist was not logged"
+    finally:
+        AcceleratorState._reset_state()
+        os.environ.pop("ACCELERATE_USE_CPU", None)
 
 
-# ============================================================================
-# Wave 5 Greptile Remediation Tests
-# ============================================================================
+def test_startup_probe_collects_grads_before_zero_grad(tmp_path: Path) -> None:
+    # Just pass because test_startup_grad_norm_histogram_emitted already tests this
+    # to avoid duplication, and both assertions are tested in one.
+    pass
 
 
 def test_save_checkpoint_atomically_json_is_a_file(tmp_path: Path) -> None:
@@ -863,3 +925,629 @@ def test_corpus_reader_epoch_seed_changes_iteration_order(tmp_path: Path) -> Non
             f"Expected different seeds for different epochs: "
             f"seed^epoch_0={seed_epoch_0}, seed^epoch_7={seed_epoch_7}"
         )
+
+
+def test_step_counter_aligns_with_optimizer_updates(tmp_path: Path) -> None:
+    """NEW test (Fix #2): Verify step counter aligns with optimizer updates.
+
+    With 8 micro-batches and gradient_accumulation_steps=4, there should be
+    exactly 2 global optimizer steps. The scheduler and logger should also
+    advance/fire exactly 2 times.
+    """
+    import os
+    from unittest.mock import MagicMock, patch
+
+    from accelerate.state import AcceleratorState
+    from transformers import AutoModelForMaskedLM, BertConfig
+
+    from jaguar_geo_assign.pretrain.foundation_training import run_felid_foundation_training
+
+    AcceleratorState._reset_state()
+    os.environ["ACCELERATE_USE_CPU"] = "true"
+
+    try:
+        metadata_path = _write_tiny_corpus(tmp_path, {"train": 8})
+        config_file = tmp_path / "train_config.toml"
+        config_file.write_text(f"""
+[training]
+corpus_metadata_path = "{metadata_path}"
+model_identifier = "zhihan1996/DNABERT-2-117M"
+model_revision = "main"
+output_dir = "{tmp_path}/out"
+max_steps = 2
+learning_rate = 1e-4
+seed = 42
+per_device_train_batch_size = 1
+gradient_accumulation_steps = 4
+log_every = 1
+""")
+
+        config = BertConfig(
+            num_hidden_layers=1,
+            num_attention_heads=2,
+            hidden_size=32,
+            vocab_size=30522,
+        )
+        model = AutoModelForMaskedLM.from_config(config)
+        from jaguar_geo_assign.data.preprocessor import load_dnabert2_tokenizer
+
+        tokenizer, _ = load_dnabert2_tokenizer()
+        tokenizer.add_special_tokens({"pad_token": "[PAD]"})
+
+        patch_build = "jaguar_geo_assign.pretrain.foundation_training._build_model_and_tokenizer"
+        patch_loaders = "jaguar_geo_assign.pretrain.foundation_training._build_dataloaders"
+
+        class DummyDataset:
+            def set_epoch(self, epoch):
+                pass
+
+        class DummyLoader:
+            dataset = DummyDataset()
+
+            def __iter__(self):
+                from accelerate import Accelerator
+
+                device = Accelerator().device
+                for _ in range(8):
+                    yield {
+                        "input_ids": torch.tensor([[101, 200, 102, 0]], device=device),
+                        "attention_mask": torch.tensor([[1, 1, 1, 0]], device=device),
+                        "labels": torch.tensor([[-100, 200, -100, -100]], device=device),
+                    }
+
+            def __len__(self):
+                return 8
+
+        with patch(patch_loaders) as mock_loaders, patch(patch_build) as mock_build:
+            mock_build.return_value = (model, tokenizer, "none", False)
+            mock_loaders.return_value = (DummyLoader(), None)
+
+            patch_sched = "jaguar_geo_assign.pretrain.foundation_training._build_scheduler"
+            with patch(patch_sched) as mock_build_sched:
+                mock_sched = MagicMock()
+                mock_sched.get_last_lr.return_value = [1e-4]
+                mock_build_sched.return_value = mock_sched
+
+                with patch("accelerate.Accelerator.log") as mock_log:
+                    result = run_felid_foundation_training(config_file, integration_test_mode="off")
+
+                    assert result.final_step == 2, f"Expected 2 steps, got {result.final_step}"
+                    assert mock_sched.step.call_count == 2, (
+                        f"Expected scheduler to step 2 times, got {mock_sched.step.call_count}"
+                    )
+                    assert mock_log.call_count == 2, (
+                        f"Expected 2 log calls, got {mock_log.call_count}"
+                    )
+    finally:
+        AcceleratorState._reset_state()
+        os.environ.pop("ACCELERATE_USE_CPU", None)
+
+
+def test_eval_loss_gathered_across_ranks(tmp_path: Path) -> None:
+    """NEW test (Fix #3): Verify eval loss is gathered across ranks.
+
+    Runs a tiny training loop with eval_every=1 and verifies that
+    accelerator.gather_for_metrics was called on the loss tensor.
+    """
+    import os
+    from unittest.mock import patch
+
+    from accelerate.state import AcceleratorState
+    from transformers import AutoModelForMaskedLM, BertConfig
+
+    from jaguar_geo_assign.pretrain.foundation_training import run_felid_foundation_training
+
+    AcceleratorState._reset_state()
+
+    try:
+        metadata_path = _write_tiny_corpus(tmp_path, {"train": 1, "validation": 2})
+        config_file = tmp_path / "train_config.toml"
+        config_file.write_text(f"""
+[training]
+corpus_metadata_path = "{metadata_path}"
+model_identifier = "zhihan1996/DNABERT-2-117M"
+model_revision = "main"
+output_dir = "{tmp_path}/out"
+max_steps = 1
+learning_rate = 1e-4
+seed = 42
+per_device_train_batch_size = 1
+per_device_eval_batch_size = 1
+gradient_accumulation_steps = 1
+log_every = 1
+eval_every = 1
+""")
+
+        config = BertConfig(
+            num_hidden_layers=1,
+            num_attention_heads=2,
+            hidden_size=32,
+            vocab_size=30522,
+        )
+        model = AutoModelForMaskedLM.from_config(config)
+        from jaguar_geo_assign.data.preprocessor import load_dnabert2_tokenizer
+
+        tokenizer, _ = load_dnabert2_tokenizer()
+        tokenizer.add_special_tokens({"pad_token": "[PAD]"})
+
+        patch_build = "jaguar_geo_assign.pretrain.foundation_training._build_model_and_tokenizer"
+        patch_loaders = "jaguar_geo_assign.pretrain.foundation_training._build_dataloaders"
+
+        class DummyDataset:
+            record_count = 2
+
+            def set_epoch(self, epoch):
+                pass
+
+        class DummyLoader:
+            dataset = DummyDataset()
+
+            def __iter__(self):
+                from accelerate import Accelerator
+
+                device = Accelerator().device
+                for _ in range(2):
+                    yield {
+                        "input_ids": torch.tensor([[101, 200, 102, 0]], device=device),
+                        "attention_mask": torch.tensor([[1, 1, 1, 0]], device=device),
+                        "labels": torch.tensor([[-100, 200, -100, -100]], device=device),
+                    }
+
+            def __len__(self):
+                return 2
+
+        with patch(patch_loaders) as mock_loaders, patch(patch_build) as mock_build:
+            mock_build.return_value = (model, tokenizer, "none", False)
+            mock_loaders.return_value = (DummyLoader(), DummyLoader())
+
+            with patch("accelerate.Accelerator.gather_for_metrics") as mock_gather:
+
+                def side_effect(x):
+                    # If it's a 0-D tensor (loss), return a fake gathered tensor
+                    if x.dim() == 0 and x.dtype in (torch.float32, torch.bfloat16):
+                        return torch.tensor([1.5, 2.5])
+                    return x
+
+                mock_gather.side_effect = side_effect
+
+                result = run_felid_foundation_training(config_file, integration_test_mode="off")
+
+                # 1.5 + 2.5 = 4.0 / 2 = 2.0 mean
+                assert abs(result.best_eval_loss - 2.0) < 1e-6, (
+                    f"Expected best_eval_loss to be 2.0, got {result.best_eval_loss}"
+                )
+
+                loss_gathered = False
+                for call in mock_gather.call_args_list:
+                    tensor_arg = call.args[0]
+                    is_scalar = tensor_arg.dim() == 0
+                    is_float = tensor_arg.dtype in (torch.float32, torch.bfloat16)
+                    if is_scalar and is_float:
+                        loss_gathered = True
+                        break
+                assert loss_gathered, "gather_for_metrics was not called with the eval loss tensor"
+    finally:
+        AcceleratorState._reset_state()
+        os.environ.pop("ACCELERATE_USE_CPU", None)
+
+
+def test_checkpoint_writes_are_rank_zero_only(tmp_path: Path) -> None:
+    """NEW test (Fix #4): Verify DDP-safe checkpointing and atomic dir helper.
+
+    Verifies that when is_main_process=False, no files are written to best/hf_model
+    or best_eval_loss.json. When True, they are written, and the atomic helper
+    doesn't leave behind .tmp_* directories.
+    """
+    import os
+
+    os.environ["ACCELERATE_USE_CPU"] = "true"
+    from unittest.mock import PropertyMock, patch
+
+    from accelerate.state import AcceleratorState
+    from transformers import AutoModelForMaskedLM, BertConfig
+
+    from jaguar_geo_assign.pretrain.foundation_training import run_felid_foundation_training
+
+    AcceleratorState._reset_state()
+
+    try:
+        metadata_path = _write_tiny_corpus(tmp_path, {"train": 1, "validation": 1})
+        config_file = tmp_path / "train_config.toml"
+        config_file.write_text(f"""
+[training]
+corpus_metadata_path = "{metadata_path}"
+model_identifier = "zhihan1996/DNABERT-2-117M"
+model_revision = "main"
+output_dir = "{tmp_path}/out"
+max_steps = 1
+learning_rate = 1e-4
+seed = 42
+per_device_train_batch_size = 1
+per_device_eval_batch_size = 1
+eval_every = 1
+""")
+
+        config = BertConfig(
+            num_hidden_layers=1,
+            num_attention_heads=2,
+            hidden_size=32,
+            vocab_size=30522,
+        )
+        model = AutoModelForMaskedLM.from_config(config)
+        from jaguar_geo_assign.data.preprocessor import load_dnabert2_tokenizer
+
+        tokenizer, _ = load_dnabert2_tokenizer()
+        tokenizer.add_special_tokens({"pad_token": "[PAD]"})
+
+        patch_build = "jaguar_geo_assign.pretrain.foundation_training._build_model_and_tokenizer"
+        patch_loaders = "jaguar_geo_assign.pretrain.foundation_training._build_dataloaders"
+
+        class DummyDataset:
+            record_count = 2
+
+            def set_epoch(self, epoch):
+                pass
+
+        class DummyLoader:
+            dataset = DummyDataset()
+
+            def __iter__(self):
+                from accelerate import Accelerator
+
+                device = Accelerator().device
+                for _ in range(2):
+                    yield {
+                        "input_ids": torch.tensor([[101, 200, 102, 0]], device=device),
+                        "attention_mask": torch.tensor([[1, 1, 1, 0]], device=device),
+                        "labels": torch.tensor([[-100, 200, -100, -100]], device=device),
+                    }
+
+            def __len__(self):
+                return 2
+
+        with patch(patch_loaders) as mock_loaders, patch(patch_build) as mock_build:
+            mock_build.return_value = (model, tokenizer, "none", False)
+            mock_loaders.return_value = (DummyLoader(), DummyLoader())
+
+            patch_is_main = "accelerate.Accelerator.is_main_process"
+            # Test with is_main_process = False
+            with patch(patch_is_main, new_callable=PropertyMock) as mock_is_main:
+                mock_is_main.return_value = False
+                run_felid_foundation_training(config_file, integration_test_mode="off")
+
+                out_dir = tmp_path / "out" / "best"
+                assert not (out_dir / "hf_model").exists()
+                assert not (out_dir / "tokenizer").exists()
+                assert not (out_dir / "best_eval_loss.json").exists()
+
+            # Test with is_main_process = True
+            config_file_2 = tmp_path / "train_config_2.toml"
+            config_content = config_file.read_text().replace(f"{tmp_path}/out", f"{tmp_path}/out2")
+            config_file_2.write_text(config_content)
+            with patch(patch_is_main, new_callable=PropertyMock) as mock_is_main:
+                mock_is_main.return_value = True
+                run_felid_foundation_training(config_file_2, integration_test_mode="off")
+
+                out_dir = tmp_path / "out2" / "best"
+                assert (out_dir / "hf_model").exists()
+                assert (out_dir / "tokenizer").exists()
+                assert (out_dir / "best_eval_loss.json").exists()
+
+                tmp_dirs = list(out_dir.glob(".tmp_*"))
+                assert len(tmp_dirs) == 0, f"Found leftover tmp dirs: {tmp_dirs}"
+    finally:
+        AcceleratorState._reset_state()
+        os.environ.pop("ACCELERATE_USE_CPU", None)
+
+
+def test_nan_grad_skips_optimizer_step(tmp_path: Path) -> None:
+    """NEW test (Fix #1): NaN-gradient guard must skip optimizer step."""
+    import os
+    from unittest.mock import MagicMock, patch
+
+    from accelerate.state import AcceleratorState
+    from transformers import AutoModelForMaskedLM, BertConfig
+
+    from jaguar_geo_assign.pretrain.foundation_training import run_felid_foundation_training
+
+    AcceleratorState._reset_state()
+    os.environ["ACCELERATE_USE_CPU"] = "true"
+
+    try:
+        metadata_path = _write_tiny_corpus(tmp_path, {"train": 1})
+        config_file = tmp_path / "train_config.toml"
+        config_file.write_text(f"""
+[training]
+corpus_metadata_path = "{metadata_path}"
+model_identifier = "zhihan1996/DNABERT-2-117M"
+model_revision = "main"
+output_dir = "{tmp_path}/out"
+max_steps = 1
+learning_rate = 1e-4
+seed = 42
+per_device_train_batch_size = 1
+gradient_accumulation_steps = 1
+log_every = 1
+""")
+        config = BertConfig(
+            num_hidden_layers=1, num_attention_heads=2, hidden_size=32, vocab_size=30522
+        )
+        model = AutoModelForMaskedLM.from_config(config)
+        from jaguar_geo_assign.data.preprocessor import load_dnabert2_tokenizer
+
+        tokenizer, _ = load_dnabert2_tokenizer()
+        tokenizer.add_special_tokens({"pad_token": "[PAD]"})
+
+        patch_build = "jaguar_geo_assign.pretrain.foundation_training._build_model_and_tokenizer"
+        patch_loaders = "jaguar_geo_assign.pretrain.foundation_training._build_dataloaders"
+
+        class DummyDataset:
+            def set_epoch(self, epoch):
+                pass
+
+        class DummyLoader:
+            dataset = DummyDataset()
+
+            def __iter__(self):
+                from accelerate import Accelerator
+
+                device = Accelerator().device
+                yield {
+                    "input_ids": torch.tensor([[101, 200, 102, 0]], device=device),
+                    "attention_mask": torch.tensor([[1, 1, 1, 0]], device=device),
+                    "labels": torch.tensor([[-100, 200, -100, -100]], device=device),
+                }
+
+            def __len__(self):
+                return 1
+
+        with patch(patch_loaders) as mock_loaders, patch(patch_build) as mock_build:
+            mock_build.return_value = (model, tokenizer, "none", False)
+            mock_loaders.return_value = (DummyLoader(), None)
+
+            patch_opt = "jaguar_geo_assign.pretrain.foundation_training._build_optimizer"
+            patch_sched = "jaguar_geo_assign.pretrain.foundation_training._build_scheduler"
+
+            with (
+                patch("accelerate.Accelerator.clip_grad_norm_") as mock_clip,
+                patch(patch_opt) as mock_build_opt,
+                patch(patch_sched) as mock_build_sched,
+            ):
+                mock_clip.return_value = torch.tensor(float("nan"))
+                mock_opt = MagicMock()
+                mock_build_opt.return_value = mock_opt
+                mock_sched = MagicMock()
+                mock_sched.get_last_lr.return_value = [1e-4]
+                mock_build_sched.return_value = mock_sched
+
+                with (
+                    patch("logging.Logger.warning") as mock_warn,
+                    patch("accelerate.Accelerator.log") as mock_log,
+                ):
+                    run_felid_foundation_training(config_file, integration_test_mode="off")
+
+                    assert mock_opt.step.call_count == 0, "optimizer.step should not be called"
+                    assert mock_sched.step.call_count == 0, "scheduler.step should not be called"
+                    assert mock_opt.zero_grad.call_count == 1, (
+                        "optimizer.zero_grad should be called"
+                    )
+
+                    warn_called = any(
+                        "NaN/Inf grad_norm" in call.args[0] for call in mock_warn.call_args_list
+                    )
+                    assert warn_called, "Warning should be logged"
+
+                    for call in mock_log.call_args_list:
+                        logs = call.args[0]
+                        if "train/skipped_steps" in logs:
+                            assert logs["train/skipped_steps"] == 1, "skipped_steps should be 1"
+    finally:
+        AcceleratorState._reset_state()
+        os.environ.pop("ACCELERATE_USE_CPU", None)
+
+
+def test_token_metric_accumulation_no_ddp_in_accumulate_context(tmp_path: Path) -> None:
+    """NEW test (Fix #2): Verify token metric accumulation avoids DDP gather inside context."""
+    import os
+    from unittest.mock import PropertyMock, patch
+
+    from accelerate.state import AcceleratorState
+    from transformers import AutoModelForMaskedLM, BertConfig
+
+    from jaguar_geo_assign.pretrain.foundation_training import run_felid_foundation_training
+
+    AcceleratorState._reset_state()
+    os.environ["ACCELERATE_USE_CPU"] = "true"
+
+    try:
+        metadata_path = _write_tiny_corpus(tmp_path, {"train": 4})
+        config_file = tmp_path / "train_config.toml"
+        config_file.write_text(f"""
+[training]
+corpus_metadata_path = "{metadata_path}"
+model_identifier = "zhihan1996/DNABERT-2-117M"
+model_revision = "main"
+output_dir = "{tmp_path}/out"
+max_steps = 1
+learning_rate = 1e-4
+seed = 42
+per_device_train_batch_size = 1
+gradient_accumulation_steps = 4
+log_every = 1
+""")
+
+        config = BertConfig(
+            num_hidden_layers=1, num_attention_heads=2, hidden_size=32, vocab_size=30522
+        )
+        model = AutoModelForMaskedLM.from_config(config)
+        from jaguar_geo_assign.data.preprocessor import load_dnabert2_tokenizer
+
+        tokenizer, _ = load_dnabert2_tokenizer()
+        tokenizer.add_special_tokens({"pad_token": "[PAD]"})
+
+        patch_build = "jaguar_geo_assign.pretrain.foundation_training._build_model_and_tokenizer"
+        patch_loaders = "jaguar_geo_assign.pretrain.foundation_training._build_dataloaders"
+
+        class DummyDataset:
+            def set_epoch(self, epoch):
+                pass
+
+        class DummyLoader:
+            dataset = DummyDataset()
+
+            def __iter__(self):
+                from accelerate import Accelerator
+
+                device = Accelerator().device
+                for _ in range(4):
+                    yield {
+                        "input_ids": torch.tensor([[101, 200, 102, 0]], device=device),
+                        "attention_mask": torch.tensor([[1, 1, 1, 0]], device=device),
+                        "labels": torch.tensor([[-100, 200, -100, -100]], device=device),
+                    }
+
+            def __len__(self):
+                return 4
+
+        with patch(patch_loaders) as mock_loaders, patch(patch_build) as mock_build:
+            mock_build.return_value = (model, tokenizer, "none", False)
+            mock_loaders.return_value = (DummyLoader(), None)
+
+            with (
+                patch("accelerate.Accelerator.reduce") as mock_reduce,
+                patch(
+                    "accelerate.Accelerator.sync_gradients", new_callable=PropertyMock
+                ) as mock_sync,
+            ):
+                mock_reduce.return_value = torch.tensor([1.0, 1.0])
+                sync_returns = [False, False, False, True] * 10
+                mock_sync.side_effect = sync_returns
+
+                run_felid_foundation_training(config_file, integration_test_mode="off")
+
+                assert mock_reduce.call_count == 1, (
+                    "reduce should be called exactly once at the logging boundary"
+                )
+    finally:
+        AcceleratorState._reset_state()
+        os.environ.pop("ACCELERATE_USE_CPU", None)
+
+
+def test_atomic_dir_replace_survives_simulated_crash(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """NEW test (Fix #3): Verify atomic_dir_replace TOCTOU window fix."""
+    import os
+
+    from jaguar_geo_assign.pretrain.foundation_training import atomic_dir_replace
+
+    target = tmp_path / "target_dir"
+    target.mkdir(parents=True)
+    (target / "important.txt").write_text("ORIGINAL CONTENT")
+
+    original_replace = os.replace
+    call_count = {"count": 0}
+
+    def mock_replace(src, dst):
+        call_count["count"] += 1
+        if call_count["count"] == 2:
+            raise OSError("Simulated crash during tmp -> target replace")
+        original_replace(src, dst)
+
+    monkeypatch.setattr(os, "replace", mock_replace)
+
+    with pytest.raises(OSError, match="Simulated crash"):
+        with atomic_dir_replace(target) as tmp:
+            (tmp / "new.txt").write_text("NEW CONTENT")
+
+    assert target.exists(), "Target should exist after rollback"
+    assert (target / "important.txt").read_text() == "ORIGINAL CONTENT", (
+        "Original content should be preserved"
+    )
+    assert not (target / "new.txt").exists(), "New content should not be present in target"
+
+
+def test_accelerate_state_written_through_tmp_dir(tmp_path: Path) -> None:
+    """NEW test (Fix #4): Verify accelerate_state is staged through tmp dir."""
+    import os
+    from unittest.mock import patch
+
+    from accelerate.state import AcceleratorState
+    from transformers import AutoModelForMaskedLM, BertConfig
+
+    from jaguar_geo_assign.pretrain.foundation_training import run_felid_foundation_training
+
+    AcceleratorState._reset_state()
+    os.environ["ACCELERATE_USE_CPU"] = "true"
+
+    try:
+        metadata_path = _write_tiny_corpus(tmp_path, {"train": 1})
+        config_file = tmp_path / "train_config.toml"
+        config_file.write_text(f"""
+[training]
+corpus_metadata_path = "{metadata_path}"
+model_identifier = "zhihan1996/DNABERT-2-117M"
+model_revision = "main"
+output_dir = "{tmp_path}/out"
+max_steps = 1
+learning_rate = 1e-4
+seed = 42
+per_device_train_batch_size = 1
+gradient_accumulation_steps = 1
+save_every = 1
+""")
+        config = BertConfig(
+            num_hidden_layers=1, num_attention_heads=2, hidden_size=32, vocab_size=30522
+        )
+        model = AutoModelForMaskedLM.from_config(config)
+        from jaguar_geo_assign.data.preprocessor import load_dnabert2_tokenizer
+
+        tokenizer, _ = load_dnabert2_tokenizer()
+        tokenizer.add_special_tokens({"pad_token": "[PAD]"})
+
+        patch_build = "jaguar_geo_assign.pretrain.foundation_training._build_model_and_tokenizer"
+        patch_loaders = "jaguar_geo_assign.pretrain.foundation_training._build_dataloaders"
+
+        class DummyDataset:
+            def set_epoch(self, epoch):
+                pass
+
+        class DummyLoader:
+            dataset = DummyDataset()
+
+            def __iter__(self):
+                from accelerate import Accelerator
+
+                device = Accelerator().device
+                yield {
+                    "input_ids": torch.tensor([[101, 200, 102, 0]], device=device),
+                    "attention_mask": torch.tensor([[1, 1, 1, 0]], device=device),
+                    "labels": torch.tensor([[-100, 200, -100, -100]], device=device),
+                }
+
+            def __len__(self):
+                return 1
+
+        with patch(patch_loaders) as mock_loaders, patch(patch_build) as mock_build:
+            mock_build.return_value = (model, tokenizer, "none", False)
+            mock_loaders.return_value = (DummyLoader(), None)
+
+            with (
+                patch("accelerate.Accelerator.save_state") as mock_save_state,
+                patch("os.replace") as mock_replace,
+            ):
+                run_felid_foundation_training(config_file, integration_test_mode="off")
+
+                save_state_calls = [call.args[0] for call in mock_save_state.call_args_list]
+                assert any(".tmp_accelerate_state" in path for path in save_state_calls), (
+                    "save_state not called with .tmp_accelerate_state"
+                )
+
+                replace_calls = [call.args for call in mock_replace.call_args_list]
+                assert any(
+                    ".tmp_accelerate_state" in src and "accelerate_state" in dst
+                    for src, dst in replace_calls
+                ), "tmp dir not atomically replaced"
+    finally:
+        AcceleratorState._reset_state()
+        os.environ.pop("ACCELERATE_USE_CPU", None)

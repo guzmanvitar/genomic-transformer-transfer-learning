@@ -18,12 +18,14 @@ CLI (--integration-test flag) and pytest, with configurable model source
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import math
 import os
 import shutil
 import tempfile
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
@@ -59,6 +61,7 @@ class MetricAccumulator:
     token_masked: int = 0
     step_count: int = 0
     nan_count: int = 0
+    skipped_steps: int = 0
 
     def reset(self) -> None:
         """Reset accumulator to zero state.
@@ -71,6 +74,7 @@ class MetricAccumulator:
         self.token_masked = 0
         self.step_count = 0
         self.nan_count = 0
+        self.skipped_steps = 0
 
 
 @dataclass(frozen=True)
@@ -359,6 +363,34 @@ def _compute_eval_max_steps(
     return eval_max_steps
 
 
+@contextlib.contextmanager
+def atomic_dir_replace(target: Path) -> Iterator[Path]:
+    """Yield a tmp dir path; atomically rename to target on successful exit."""
+    target.parent.mkdir(parents=True, exist_ok=True)
+    tmp = target.parent / f".tmp_{target.name}_{os.getpid()}"
+    if tmp.exists():
+        shutil.rmtree(tmp)
+    tmp.mkdir(parents=True)
+    try:
+        yield tmp
+        # TRADE-OFF: rename-old-aside prevents target disappearance during replacement
+        if target.exists():
+            old_target = target.parent / f".old_{target.name}_{os.getpid()}"
+            os.replace(str(target), str(old_target))
+            try:
+                os.replace(str(tmp), str(target))
+            except Exception:
+                # Roll back: restore old to target
+                os.replace(str(old_target), str(target))
+                raise
+            shutil.rmtree(old_target, ignore_errors=True)
+        else:
+            os.replace(str(tmp), str(target))
+    except Exception:
+        shutil.rmtree(tmp, ignore_errors=True)
+        raise
+
+
 def _save_checkpoint_atomically(
     path: Path,
     content: dict[str, Any],
@@ -394,16 +426,8 @@ def _save_checkpoint_atomically(
     else:
         # Directory-based atomic write for accelerate state.
         # Write to temp dir, then atomically replace the target directory.
-        tmp_dir = path.parent / f".tmp_{path.name}_{os.getpid()}"
-        try:
-            tmp_dir.mkdir(parents=True, exist_ok=True)
-            # Caller (accelerator.save_state) populates tmp_dir with content
-            os.replace(str(tmp_dir), str(path))
-        except Exception:
-            # Cleanup on failure
-            if tmp_dir.exists():
-                shutil.rmtree(tmp_dir, ignore_errors=True)
-            raise
+        with atomic_dir_replace(path):
+            pass  # Caller populates the path independently if they don't use the yield
 
 
 def _startup_probe_metrics(
@@ -436,17 +460,6 @@ def _startup_probe_metrics(
             mask = labels != -100
             observed_mask_rate = mask.sum().item() / max(mask.numel(), 1)
             metrics["startup/observed_mask_rate"] = observed_mask_rate
-
-        # §3.7 (Fix #13): Emit per-parameter grad-norm distribution as TensorBoard histogram.
-        # TRADE-OFF: This runs on rank-0 only because TB histograms are not reduce-able
-        # across DDP ranks. Collecting per-parameter norms avoids double-counting via gather.
-        # Fix #15: Guard against empty grad list (after optimizer.zero_grad(), all p.grad are None).
-        # torch.stack([]) raises RuntimeError, so we only stack if grad_list is non-empty.
-        grad_list = [p.grad.detach().norm() for p in model.parameters() if p.grad is not None]
-        if grad_list:
-            norms = torch.stack(grad_list)
-            # Store norms tensor for later histogram logging; will be logged via accelerator
-            metrics["_startup_grad_norm_norms"] = norms
 
         return metrics
     return {}
@@ -561,6 +574,7 @@ def run_felid_foundation_training(
     eval_metric = MetricAccumulator()
 
     accelerator.init_trackers("felid_foundation_training")
+    startup_grad_norms = []
 
     try:
         for _epoch in range(1, 1000):  # Iterate until max_steps reached
@@ -570,7 +584,6 @@ def run_felid_foundation_training(
                 if step >= config.max_steps:
                     break
 
-                step += 1
                 with accelerator.accumulate(model):
                     outputs = model(**batch)
                     loss = outputs.loss
@@ -592,14 +605,12 @@ def run_felid_foundation_training(
                         preds = outputs.logits.argmax(dim=-1)
                         labels = batch.get("labels")
                         if labels is not None:
-                            # Gather across DDP ranks before materializing scalars
-                            preds_gathered = accelerator.gather_for_metrics(preds)
-                            labels_gathered = accelerator.gather_for_metrics(labels)
-                            mask_gathered = labels_gathered != -100
-                            train_metric.token_correct += int(
-                                ((preds_gathered == labels_gathered) & mask_gathered).sum().item()
-                            )
-                            train_metric.token_masked += int(mask_gathered.sum().item())
+                            mask = labels != -100
+                            # TRADE-OFF: Computing correct predictions locally avoids DDP gather
+                            # inside the accumulation loop. We accumulate locally and defer gather
+                            # to the log step.
+                            train_metric.token_correct += ((preds == labels) & mask).sum().item()
+                            train_metric.token_masked += mask.sum().item()
 
                     # Backward pass
                     accelerator.backward(loss)
@@ -609,151 +620,222 @@ def run_felid_foundation_training(
                         model.parameters(), config.gradient_clip
                     )
 
-                    optimizer.step()
-                    # Fix #17: Guard scheduler.step() by sync_gradients.
-                    # accumulate() no-ops optimizer.step() and optimizer.zero_grad(),
-                    # but NOT scheduler.step(). Without this guard, the scheduler advances
-                    # once per accumulation micro-step instead of once per optimizer update,
-                    # exhausting the learning rate schedule prematurely.
+                    # Fix 1: Collect grad norms on sync steps before step/zero_grad
+                    skip_step = False
                     if accelerator.sync_gradients:
-                        scheduler.step()
+                        if torch.isnan(grad_norm).any() or torch.isinf(grad_norm).any():
+                            logger.warning(
+                                f"NaN/Inf grad_norm ({grad_norm}) detected at step {step}. "
+                                "Skipping optimizer step."
+                            )
+                            train_metric.skipped_steps += 1
+                            skip_step = True
+                        elif accelerator.is_main_process and step < 20:
+                            grad_list = [
+                                p.grad.detach().norm()
+                                for p in model.parameters()
+                                if p.grad is not None
+                            ]
+                            if grad_list:
+                                # Save with the upcoming step number
+                                startup_grad_norms.append((step + 1, torch.stack(grad_list)))
+
+                    if not skip_step:
+                        optimizer.step()
+                        # Fix #17: Guard scheduler.step() by sync_gradients.
+                        # accumulate() no-ops optimizer.step() and optimizer.zero_grad(),
+                        # but NOT scheduler.step(). Without this guard, the scheduler advances
+                        # once per accumulation micro-step instead of once per optimizer update,
+                        # exhausting the learning rate schedule prematurely.
+                        if accelerator.sync_gradients:
+                            scheduler.step()
                     optimizer.zero_grad()
 
-                # Log metrics at log_every (§3.6: windowed averages)
-                if step % config.log_every == 0:
-                    mean_loss = train_metric.loss_sum / max(train_metric.step_count, 1)
-                    # §3.6 (Fix #12): NaN convention: token_accuracy is NaN when token_masked==0
-                    # rather than 0.0, to distinguish "no masked tokens" from "zero accuracy".
-                    # TRADE-OFF: This convention helps downstream analysis identify data issues.
-                    token_acc = (
-                        float("nan")
-                        if train_metric.token_masked == 0
-                        else train_metric.token_correct / train_metric.token_masked
-                    )
-                    # TRADE-OFF: perplexity clamped at 20 to prevent bf16 overflow
-                    ppl = (
-                        float("nan")
-                        if train_metric.step_count == 0
-                        else math.exp(min(mean_loss, 20.0))
-                    )
+                if accelerator.sync_gradients:
+                    # step counts optimizer updates, not micro-batches;
+                    # cadence aligns with scheduler
+                    step += 1
 
-                    logs = {
-                        "train/mlm_loss": mean_loss,
-                        "train/token_accuracy": token_acc,
-                        "train/perplexity": ppl,
-                        "train/nan_steps": train_metric.nan_count,
-                        "train/grad_norm": grad_norm,
-                        "train/lr": scheduler.get_last_lr()[0],
-                    }
+                    # Log metrics at log_every (§3.6: windowed averages)
+                    if step % config.log_every == 0:
+                        mean_loss = train_metric.loss_sum / max(train_metric.step_count, 1)
 
-                    # §3.7: Startup probe for first 20 steps (rank-0 only)
-                    startup_logs = _startup_probe_metrics(batch, step, accelerator, model)
-                    # Extract histogram tensor before adding to logs dict
-                    grad_norm_norms = startup_logs.pop("_startup_grad_norm_norms", None)
-                    logs.update(startup_logs)
+                        # DDP-safe global token accuracy reduce
+                        local_counts = torch.tensor(
+                            [train_metric.token_correct, train_metric.token_masked],
+                            dtype=torch.float32,
+                            device=accelerator.device,
+                        )
+                        global_counts = accelerator.reduce(local_counts, reduction="sum")
+                        global_correct = global_counts[0].item()
+                        global_masked = global_counts[1].item()
 
-                    accelerator.log(logs, step=step)
-
-                    # §3.7 (Fix #13): Log grad_norm_hist as TensorBoard histogram (rank-0 only).
-                    # Must be done separately from accelerator.log because histograms need
-                    # direct access to the TensorBoard writer, not the generic log interface.
-                    if accelerator.is_main_process and step <= 20 and grad_norm_norms is not None:
-                        tb_tracker = accelerator.get_tracker("tensorboard", unwrap=True)
-                        tb_tracker.add_histogram(
-                            "startup/grad_norm_hist",
-                            grad_norm_norms,
-                            global_step=step,
+                        # §3.6 (Fix #12): NaN convention: token_accuracy is NaN when token_masked==0
+                        # rather than 0.0, to distinguish "no masked tokens" from "zero accuracy".
+                        # TRADE-OFF: This convention helps downstream analysis identify data issues.
+                        token_acc = (
+                            float("nan") if global_masked == 0 else global_correct / global_masked
+                        )
+                        # TRADE-OFF: perplexity clamped at 20 to prevent bf16 overflow
+                        ppl = (
+                            float("nan")
+                            if train_metric.step_count == 0
+                            else math.exp(min(mean_loss, 20.0))
                         )
 
-                    train_metric.reset()
+                        logs = {
+                            "train/mlm_loss": mean_loss,
+                            "train/token_accuracy": token_acc,
+                            "train/perplexity": ppl,
+                            "train/nan_steps": train_metric.nan_count,
+                            "train/skipped_steps": train_metric.skipped_steps,
+                            "train/grad_norm": grad_norm,
+                            "train/lr": scheduler.get_last_lr()[0],
+                        }
 
-                # Evaluation at eval_every (§1.2: fixed eval_max_steps)
-                if eval_loader is not None and step % config.eval_every == 0:
-                    eval_max_steps = _compute_eval_max_steps(
-                        eval_loader.dataset,
-                        config.per_device_eval_batch_size,
-                        accelerator.num_processes,
-                    )
+                        # §3.7: Startup probe for first 20 steps (rank-0 only)
+                        startup_logs = _startup_probe_metrics(batch, step, accelerator, model)
+                        logs.update(startup_logs)
 
-                    model.eval()
-                    with torch.no_grad():
-                        for eval_step, eval_batch in enumerate(eval_loader):
-                            if eval_step >= eval_max_steps:
-                                break
+                        accelerator.log(logs, step=step)
 
-                            outputs = model(**eval_batch)
-                            loss = outputs.loss
-
-                            loss_f = loss.detach().float()
-                            if not (torch.isnan(loss_f).any() or torch.isinf(loss_f).any()):
-                                eval_metric.loss_sum += loss_f.mean().item()
-                                eval_metric.step_count += 1
-
-                            # §3.6 (Fix #11): Token accuracy accumulation for eval loop.
-                            # Mirror train-loop accumulation: gather across ranks before
-                            # materializing scalars so metric is correctly aggregated.
-                            preds = outputs.logits.argmax(dim=-1)
-                            labels = eval_batch.get("labels")
-                            if labels is not None:
-                                preds_gathered = accelerator.gather_for_metrics(preds)
-                                labels_gathered = accelerator.gather_for_metrics(labels)
-                                mask_gathered = labels_gathered != -100
-                                eval_metric.token_correct += int(
-                                    ((preds_gathered == labels_gathered) & mask_gathered)
-                                    .sum()
-                                    .item()
+                        # §3.7 (Fix #13): Log grad_norm_hist as TensorBoard histogram (rank-0 only).
+                        # Must be done separately from accelerator.log because histograms need
+                        # direct access to the TensorBoard writer, not the generic log interface.
+                        if accelerator.is_main_process and startup_grad_norms:
+                            tb_tracker = accelerator.get_tracker("tensorboard", unwrap=True)
+                            for s, norms in startup_grad_norms:
+                                tb_tracker.add_histogram(
+                                    "startup/grad_norm_hist",
+                                    norms,
+                                    global_step=s,
                                 )
-                                eval_metric.token_masked += int(mask_gathered.sum().item())
+                            startup_grad_norms.clear()
 
-                    model.train()
-                    mean_eval_loss = eval_metric.loss_sum / max(eval_metric.step_count, 1)
-                    # §3.6 (Fix #12): NaN convention for eval token_accuracy
-                    eval_token_acc = (
-                        float("nan")
-                        if eval_metric.token_masked == 0
-                        else eval_metric.token_correct / eval_metric.token_masked
-                    )
-                    eval_ppl = (
-                        float("nan")
-                        if eval_metric.step_count == 0
-                        else math.exp(min(mean_eval_loss, 20.0))
-                    )
+                        train_metric.reset()
 
-                    accelerator.log(
-                        {
-                            "eval/mlm_loss": mean_eval_loss,
-                            "eval/token_accuracy": eval_token_acc,
-                            "eval/perplexity": eval_ppl,
-                        },
-                        step=step,
-                    )
+                    # Evaluation at eval_every (§1.2: fixed eval_max_steps)
+                    if eval_loader is not None and step % config.eval_every == 0:
+                        eval_max_steps = _compute_eval_max_steps(
+                            eval_loader.dataset,
+                            config.per_device_eval_batch_size,
+                            accelerator.num_processes,
+                        )
 
-                    if mean_eval_loss < best_eval_loss:
-                        best_eval_loss = mean_eval_loss
-                        # Save best checkpoint
-                        best_dir = output_dir / "best"
-                        _save_checkpoint_atomically(
-                            best_dir / "best_eval_loss.json",
+                        model.eval()
+                        with torch.no_grad():
+                            for eval_step, eval_batch in enumerate(eval_loader):
+                                if eval_step >= eval_max_steps:
+                                    break
+
+                                outputs = model(**eval_batch)
+                                loss = outputs.loss
+
+                                loss_f = loss.detach().float()
+                                # Fix 3: Gather eval loss across ranks before accumulation
+                                gathered_loss = accelerator.gather_for_metrics(loss_f)
+                                if not (
+                                    torch.isnan(gathered_loss).any()
+                                    or torch.isinf(gathered_loss).any()
+                                ):
+                                    eval_metric.loss_sum += gathered_loss.mean().item()
+                                    eval_metric.step_count += 1
+
+                                # §3.6 (Fix #11): Token accuracy accumulation for eval loop.
+                                # Compute predictions and accumulate against masked labels locally.
+                                preds = outputs.logits.argmax(dim=-1)
+                                labels = eval_batch.get("labels")
+                                if labels is not None:
+                                    mask = labels != -100
+                                    eval_metric.token_correct += (
+                                        ((preds == labels) & mask).sum().item()
+                                    )
+                                    eval_metric.token_masked += mask.sum().item()
+
+                        model.train()
+                        mean_eval_loss = eval_metric.loss_sum / max(eval_metric.step_count, 1)
+
+                        local_eval_counts = torch.tensor(
+                            [eval_metric.token_correct, eval_metric.token_masked],
+                            dtype=torch.float32,
+                            device=accelerator.device,
+                        )
+                        global_eval_counts = accelerator.reduce(local_eval_counts, reduction="sum")
+                        global_eval_correct = global_eval_counts[0].item()
+                        global_eval_masked = global_eval_counts[1].item()
+
+                        # §3.6 (Fix #12): NaN convention for eval token_accuracy
+                        eval_token_acc = (
+                            float("nan")
+                            if global_eval_masked == 0
+                            else global_eval_correct / global_eval_masked
+                        )
+                        eval_ppl = (
+                            float("nan")
+                            if eval_metric.step_count == 0
+                            else math.exp(min(mean_eval_loss, 20.0))
+                        )
+
+                        accelerator.log(
                             {
-                                "step": step,
-                                "eval_loss": best_eval_loss,
+                                "eval/mlm_loss": mean_eval_loss,
+                                "eval/token_accuracy": eval_token_acc,
+                                "eval/perplexity": eval_ppl,
                             },
-                            as_json=True,
+                            step=step,
                         )
-                        accelerator.save_state(str(best_dir / "accelerate_state"))
-                        unwrapped_model = accelerator.unwrap_model(model)
-                        unwrapped_model.save_pretrained(
-                            str(best_dir / "hf_model"),
-                            safe_serialization=True,
-                        )
-                        tokenizer.save_pretrained(str(best_dir / "tokenizer"))
 
-                    eval_metric.reset()
+                        if mean_eval_loss < best_eval_loss:
+                            best_eval_loss = mean_eval_loss
+                            # Save best checkpoint
+                            best_dir = output_dir / "best"
 
-                # Save latest checkpoint at save_every
-                if step % config.save_every == 0:
-                    latest_dir = output_dir / "latest"
-                    accelerator.save_state(str(latest_dir / "accelerate_state"))
+                            # Fix 4: DDP-safe checkpointing staged through tmp
+                            tmp_best_accel_state = best_dir / ".tmp_accelerate_state"
+                            accelerator.save_state(str(tmp_best_accel_state))
+
+                            accelerator.wait_for_everyone()
+                            if accelerator.is_main_process:
+                                with atomic_dir_replace(
+                                    best_dir / "accelerate_state"
+                                ) as swap_target:
+                                    swap_target.rmdir()
+                                    os.replace(str(tmp_best_accel_state), str(swap_target))
+
+                                _save_checkpoint_atomically(
+                                    best_dir / "best_eval_loss.json",
+                                    {
+                                        "step": step,
+                                        "eval_loss": best_eval_loss,
+                                    },
+                                    as_json=True,
+                                )
+                                unwrapped_model = accelerator.unwrap_model(model)
+                                with atomic_dir_replace(best_dir / "hf_model") as tmp_model_dir:
+                                    unwrapped_model.save_pretrained(
+                                        str(tmp_model_dir),
+                                        safe_serialization=True,
+                                    )
+                                with atomic_dir_replace(best_dir / "tokenizer") as tmp_tok_dir:
+                                    tokenizer.save_pretrained(str(tmp_tok_dir))
+                            accelerator.wait_for_everyone()
+
+                        eval_metric.reset()
+
+                    # Save latest checkpoint at save_every
+                    if step % config.save_every == 0:
+                        latest_dir = output_dir / "latest"
+
+                        # Stage accelerate save_state through tmp to prevent corruption
+                        tmp_accel_state = latest_dir / ".tmp_accelerate_state"
+                        accelerator.save_state(str(tmp_accel_state))
+
+                        accelerator.wait_for_everyone()
+                        if accelerator.is_main_process:
+                            with atomic_dir_replace(latest_dir / "accelerate_state") as swap_target:
+                                swap_target.rmdir()
+                                os.replace(str(tmp_accel_state), str(swap_target))
+                        accelerator.wait_for_everyone()
 
             if step >= config.max_steps:
                 break
