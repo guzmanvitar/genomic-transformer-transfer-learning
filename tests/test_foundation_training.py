@@ -2101,3 +2101,65 @@ eval_every = 1
         assert p.exists(), f"Recovered directory {p} does not exist"
         assert (p / "marker.txt").exists(), f"Marker file missing in {p}"
         assert not list(p.parent.glob(f".old_{p.name}_*")), f".old_ dir not cleaned up for {p}"
+
+
+def test_build_dataloaders_propagates_non_split_corpus_errors(tmp_path: Path) -> None:
+    """NEW test (Fix #41): _build_dataloaders propagates non-split-missing errors."""
+    from unittest.mock import MagicMock
+
+    from jaguar_geo_assign.config import FoundationTrainingConfig
+    from jaguar_geo_assign.pretrain.foundation_training import _build_dataloaders
+
+    config = FoundationTrainingConfig(
+        corpus_metadata_path=tmp_path / "metadata.json",
+        model_identifier="zhihan1996/DNABERT-2-117M",
+        model_revision="main",
+        max_steps=100,
+        per_device_train_batch_size=1,
+        per_device_eval_batch_size=1,
+    )
+    tokenizer = FakeTokenizer()
+
+    patch_reader = "jaguar_geo_assign.pretrain.foundation_training.TokenizedCorpusReader"
+    with patch(patch_reader) as mock_reader:
+        # Mock the train reader to succeed
+        def side_effect(path, split, **kwargs):
+            if split == "validation":
+                raise CorpusReaderError("Found 2 files in /tmp/x but DDP needs at least 4")
+            return MagicMock()
+
+        mock_reader.side_effect = side_effect
+
+        with pytest.raises(CorpusReaderError, match="DDP needs at least 4"):
+            _build_dataloaders(config, tokenizer)
+
+
+def test_build_dataloaders_handles_missing_validation_split(tmp_path: Path) -> None:
+    """NEW test (Fix #41): _build_dataloaders must catch specific split missing error."""
+    from unittest.mock import MagicMock
+
+    from jaguar_geo_assign.config import FoundationTrainingConfig
+    from jaguar_geo_assign.pretrain.foundation_training import _build_dataloaders
+
+    config = FoundationTrainingConfig(
+        corpus_metadata_path=tmp_path / "metadata.json",
+        model_identifier="zhihan1996/DNABERT-2-117M",
+        model_revision="main",
+        max_steps=100,
+        per_device_train_batch_size=1,
+        per_device_eval_batch_size=1,
+    )
+    tokenizer = FakeTokenizer()
+
+    patch_reader = "jaguar_geo_assign.pretrain.foundation_training.TokenizedCorpusReader"
+    with patch(patch_reader) as mock_reader:
+        # Mock the train reader to succeed
+        def side_effect(path, split, **kwargs):
+            if split == "validation":
+                raise CorpusReaderError("Split 'validation' not found in metadata.json")
+            return MagicMock()
+
+        mock_reader.side_effect = side_effect
+
+        train_loader, eval_loader = _build_dataloaders(config, tokenizer)
+        assert eval_loader is None

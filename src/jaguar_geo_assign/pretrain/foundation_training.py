@@ -9,7 +9,7 @@ Key design decisions (tagged with # TRADE-OFF:):
 - IterableDataset is used (streaming reader); resume restarts at epoch boundary.
 - Perplexity is clamped at exp(20) to protect against bf16 noise.
 - Pad-token guard implements all three fallback strategies (eos/unk/add_pad).
-- Evaluation uses a deterministic eval_max_steps to prevent DDP deadlock.
+- Evaluation is DDP-safe via gather_for_metrics + padding handling + empty-shard guard.
 
 The integration_test() function is designed to be callable from both the
 CLI (--integration-test flag) and pytest, with configurable model source
@@ -43,6 +43,7 @@ from transformers import (
 from jaguar_geo_assign.config import FoundationTrainingConfig
 from jaguar_geo_assign.data.preprocessor import load_dnabert2_tokenizer
 from jaguar_geo_assign.data.tokenized_corpus_reader import (
+    CorpusReaderError,
     TokenizedCorpusReader,
     _get_distributed_state,
 )
@@ -334,42 +335,16 @@ def _build_dataloaders(
             collate_fn=collator,
             num_workers=config.num_workers,
         )
-    except RuntimeError:
+    except CorpusReaderError as exc:
+        # TRADE-OFF: Substring match is used here to identify "validation split missing"
+        # as a non-fatal condition, while letting other CorpusReaderError variants
+        # (empty shard, schema errors) propagate loudly during startup.
+        if "validation" not in str(exc) or "not found" not in str(exc).lower():
+            raise
         # Validation split not available
         logger.info("Validation split not found; skipping eval.")
 
     return train_loader, eval_loader
-
-
-def _compute_eval_max_steps(
-    eval_reader: TokenizedCorpusReader,
-    per_device_eval_batch_size: int,
-    world_size: int,
-) -> int:
-    """Compute fixed eval step count to prevent DDP deadlock per §1.2.
-
-    All ranks must iterate exactly this many batches. Any leftover rows
-    are dropped and logged.
-
-    Args:
-        eval_reader: Validation IterableDataset with record_count property.
-        per_device_eval_batch_size: Batch size per device.
-        world_size: Total number of processes (global_batch_size = per_device * world_size).
-
-    Returns:
-        Fixed maximum evaluation steps.
-    """
-    # TRADE-OFF: eval-step cap is derived from record_count to prevent DDP deadlock
-    # when ranks yield different batch counts. Leftover rows are dropped.
-    record_count = eval_reader.record_count
-    global_batch_size = per_device_eval_batch_size * world_size
-    eval_max_steps = max(1, record_count // global_batch_size)
-    leftover = record_count % global_batch_size
-    if leftover > 0:
-        logger.info(
-            f"Eval will drop {leftover} rows (not evenly divisible into {world_size} ranks)"
-        )
-    return eval_max_steps
 
 
 @contextlib.contextmanager
@@ -755,20 +730,11 @@ def run_felid_foundation_training(
 
                         train_metric.reset()
 
-                    # Evaluation at eval_every (§1.2: fixed eval_max_steps)
+                    # Evaluation at eval_every
                     if eval_loader is not None and step % config.eval_every == 0:
-                        eval_max_steps = _compute_eval_max_steps(
-                            eval_loader.dataset,
-                            config.per_device_eval_batch_size,
-                            accelerator.num_processes,
-                        )
-
                         model.eval()
                         with torch.no_grad():
-                            for eval_step, eval_batch in enumerate(eval_loader):
-                                if eval_step >= eval_max_steps:
-                                    break
-
+                            for eval_batch in eval_loader:
                                 outputs = model(**eval_batch)
                                 loss = outputs.loss
 

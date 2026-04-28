@@ -75,12 +75,6 @@ warmup_steps = 1000
 # Set to 0 to skip validation; recommended range is 500–2000.
 eval_every = 500
 
-# Maximum validation steps per epoch (OPTIONAL: auto-derived from record_count if omitted).
-# Auto-derivation prevents DDP deadlock by capping eval at a fixed step count.
-# If set explicitly, must be <= record_count / (per_device_eval_batch_size * world_size).
-# Uncomment and set to enable explicit cap:
-# eval_max_steps = 5000
-
 # Checkpoint save frequency (every N training steps).
 # "latest" checkpoint is overwritten; "best" is kept only if eval loss improves.
 save_every = 1000
