@@ -83,6 +83,8 @@ class TrainingRunResult:
         mlm_head_random_init: Whether MLM head was randomly initialized.
         pad_token_fallback_used: The fallback strategy used (eos/unk/add_pad).
         resumed: Whether training resumed from a prior checkpoint.
+        trainable_param_count: Number of trainable parameters (verified after prepare).
+        total_param_count: Total number of parameters.
         resolved_versions: Pinned versions of torch, accelerate, transformers, tensorboard.
     """
 
@@ -91,6 +93,8 @@ class TrainingRunResult:
     mlm_head_random_init: bool = False
     pad_token_fallback_used: str = "none"
     resumed: bool = False
+    trainable_param_count: int = 0
+    total_param_count: int = 0
     resolved_versions: dict[str, str] = field(default_factory=dict)
 
 
@@ -386,20 +390,20 @@ def _save_checkpoint_atomically(
 
 def _startup_probe_metrics(
     batch: dict[str, torch.Tensor],
-    grad_norm: float,
     step: int,
     accelerator: Accelerator,
+    model: Any,
 ) -> dict[str, float]:
     """Compute startup probe metrics for the first 20 steps per §3.7.
 
     Args:
         batch: Data batch with attention_mask and labels.
-        grad_norm: Gradient norm from clip_grad_norm_.
         step: Current training step (1-indexed).
         accelerator: Accelerate trainer for rank detection.
+        model: Model for computing per-parameter gradient norms (rank-0 only).
 
     Returns:
-        Dict of metric name -> value for rank-0-only logging.
+        Dict of metric name -> value for rank-0-only logging (excludes grad_norm_hist).
     """
     if accelerator.is_main_process and step <= 20:
         attention_mask = batch.get("attention_mask")
@@ -415,7 +419,15 @@ def _startup_probe_metrics(
             observed_mask_rate = mask.sum().item() / max(mask.numel(), 1)
             metrics["startup/observed_mask_rate"] = observed_mask_rate
 
-        metrics["startup/grad_norm_hist"] = grad_norm
+        # §3.7 (Fix #13): Emit per-parameter grad-norm distribution as TensorBoard histogram.
+        # TRADE-OFF: This runs on rank-0 only because TB histograms are not reduce-able
+        # across DDP ranks. Collecting per-parameter norms avoids double-counting via gather.
+        norms = torch.stack(
+            [p.grad.detach().norm() for p in model.parameters() if p.grad is not None]
+        )
+        if norms.numel() > 0:
+            # Store norms tensor for later histogram logging; will be logged via accelerator
+            metrics["_startup_grad_norm_norms"] = norms
 
         return metrics
     return {}
@@ -455,6 +467,8 @@ def run_felid_foundation_training(
             mlm_head_random_init=False,
             pad_token_fallback_used="none",
             resumed=False,
+            trainable_param_count=0,
+            total_param_count=0,
             resolved_versions=_get_resolved_versions(),
         )
 
@@ -495,6 +509,23 @@ def run_felid_foundation_training(
     )
     eval_loader = accelerator.prepare(eval_loader) if eval_loader is not None else None
 
+    # §3.10 (Fix #10): Model trainability verification (AC#5)
+    # Count trainable vs. total parameters after construction and verify all are trainable.
+    trainable = sum(1 for p in model.parameters() if p.requires_grad)
+    total = sum(1 for _ in model.parameters())
+    if trainable != total:
+        raise RuntimeError(
+            f"Model trainability check failed: Expected all {total} params trainable; "
+            f"only {trainable} are. Verify model construction and accelerator.prepare()."
+        )
+    logger.info(
+        "model_trainability_verified",
+        extra={
+            "trainable_params": trainable,
+            "total_params": total,
+        },
+    )
+
     # Resume if needed (§3.9)
     # TRADE-OFF: IterableDataset does not restore the cursor position on resume;
     # the dataloader restarts at the epoch boundary. This may cause the first batch
@@ -531,6 +562,23 @@ def run_felid_foundation_training(
                         train_metric.loss_sum += loss_f.mean().item()
                         train_metric.step_count += 1
 
+                    # §3.6 (Fix #9): Token accuracy accumulation for train loop.
+                    # Compute predictions and accumulate against masked labels.
+                    # TRADE-OFF: argmax over full vocab is the dominant new cost;
+                    # computed inside torch.no_grad() and only for masked positions when feasible.
+                    with torch.no_grad():
+                        preds = outputs.logits.argmax(dim=-1)
+                        labels = batch.get("labels")
+                        if labels is not None:
+                            # Gather across DDP ranks before materializing scalars
+                            preds_gathered = accelerator.gather_for_metrics(preds)
+                            labels_gathered = accelerator.gather_for_metrics(labels)
+                            mask_gathered = labels_gathered != -100
+                            train_metric.token_correct += int(
+                                ((preds_gathered == labels_gathered) & mask_gathered).sum().item()
+                            )
+                            train_metric.token_masked += int(mask_gathered.sum().item())
+
                     # Backward pass
                     accelerator.backward(loss)
 
@@ -546,7 +594,14 @@ def run_felid_foundation_training(
                 # Log metrics at log_every (§3.6: windowed averages)
                 if step % config.log_every == 0:
                     mean_loss = train_metric.loss_sum / max(train_metric.step_count, 1)
-                    token_acc = train_metric.token_correct / max(train_metric.token_masked, 1)
+                    # §3.6 (Fix #12): NaN convention: token_accuracy is NaN when token_masked==0
+                    # rather than 0.0, to distinguish "no masked tokens" from "zero accuracy".
+                    # TRADE-OFF: This convention helps downstream analysis identify data issues.
+                    token_acc = (
+                        float("nan")
+                        if train_metric.token_masked == 0
+                        else train_metric.token_correct / train_metric.token_masked
+                    )
                     # TRADE-OFF: perplexity clamped at 20 to prevent bf16 overflow
                     ppl = (
                         float("nan")
@@ -564,10 +619,24 @@ def run_felid_foundation_training(
                     }
 
                     # §3.7: Startup probe for first 20 steps (rank-0 only)
-                    startup_logs = _startup_probe_metrics(batch, grad_norm, step, accelerator)
+                    startup_logs = _startup_probe_metrics(batch, step, accelerator, model)
+                    # Extract histogram tensor before adding to logs dict
+                    grad_norm_norms = startup_logs.pop("_startup_grad_norm_norms", None)
                     logs.update(startup_logs)
 
                     accelerator.log(logs, step=step)
+
+                    # §3.7 (Fix #13): Log grad_norm_hist as TensorBoard histogram (rank-0 only).
+                    # Must be done separately from accelerator.log because histograms need
+                    # direct access to the TensorBoard writer, not the generic log interface.
+                    if accelerator.is_main_process and step <= 20 and grad_norm_norms is not None:
+                        tb_tracker = accelerator.get_tracker("tensorboard", unwrap=True)
+                        tb_tracker.add_histogram(
+                            "startup/grad_norm_hist",
+                            grad_norm_norms,
+                            global_step=step,
+                        )
+
                     train_metric.reset()
 
                 # Evaluation at eval_every (§1.2: fixed eval_max_steps)
@@ -592,8 +661,30 @@ def run_felid_foundation_training(
                                 eval_metric.loss_sum += loss_f.mean().item()
                                 eval_metric.step_count += 1
 
+                            # §3.6 (Fix #11): Token accuracy accumulation for eval loop.
+                            # Mirror train-loop accumulation: gather across ranks before
+                            # materializing scalars so metric is correctly aggregated.
+                            preds = outputs.logits.argmax(dim=-1)
+                            labels = eval_batch.get("labels")
+                            if labels is not None:
+                                preds_gathered = accelerator.gather_for_metrics(preds)
+                                labels_gathered = accelerator.gather_for_metrics(labels)
+                                mask_gathered = labels_gathered != -100
+                                eval_metric.token_correct += int(
+                                    ((preds_gathered == labels_gathered) & mask_gathered)
+                                    .sum()
+                                    .item()
+                                )
+                                eval_metric.token_masked += int(mask_gathered.sum().item())
+
                     model.train()
                     mean_eval_loss = eval_metric.loss_sum / max(eval_metric.step_count, 1)
+                    # §3.6 (Fix #12): NaN convention for eval token_accuracy
+                    eval_token_acc = (
+                        float("nan")
+                        if eval_metric.token_masked == 0
+                        else eval_metric.token_correct / eval_metric.token_masked
+                    )
                     eval_ppl = (
                         float("nan")
                         if eval_metric.step_count == 0
@@ -603,6 +694,7 @@ def run_felid_foundation_training(
                     accelerator.log(
                         {
                             "eval/mlm_loss": mean_eval_loss,
+                            "eval/token_accuracy": eval_token_acc,
                             "eval/perplexity": eval_ppl,
                         },
                         step=step,
@@ -647,6 +739,8 @@ def run_felid_foundation_training(
         mlm_head_random_init=mlm_random_init,
         pad_token_fallback_used=pad_fallback,
         resumed=resumed,
+        trainable_param_count=trainable,
+        total_param_count=total,
         resolved_versions=_get_resolved_versions(),
     )
 
