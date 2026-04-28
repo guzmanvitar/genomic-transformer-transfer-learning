@@ -1601,3 +1601,51 @@ def test_describe_felid_foundation_config_reports_species(capsys) -> None:
     assert exit_code == 0
     assert "Felis catus" in captured.out
     assert "Panthera leo" in captured.out
+
+
+def test_train_felid_foundation_with_config_dispatches_correctly(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify ``train-felid-foundation --config`` dispatches to run_felid_foundation_training."""
+    config_path = Path("configs/examples/felid_foundation_train.toml")
+    called = []
+
+    def mock_run_training(config_path, **kwargs):
+        called.append(("run_felid_foundation_training", config_path, kwargs))
+
+    # Mock at the module level inside the lazy import branch
+    monkeypatch.setattr(
+        "jaguar_geo_assign.pretrain.foundation_training.run_felid_foundation_training",
+        mock_run_training,
+    )
+
+    exit_code = main(["train-felid-foundation", "--config", str(config_path)])
+
+    assert exit_code == 0
+    assert len(called) == 1
+    assert called[0][0] == "run_felid_foundation_training"
+    assert called[0][1] == config_path
+
+
+def test_train_felid_foundation_with_integration_test_flag_calls_integration_test(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify ``train-felid-foundation --integration-test`` calls integration_test."""
+    config_path = Path("configs/examples/felid_foundation_train.toml")
+    called = []
+
+    def mock_integration_test(*, use_real_model=False):
+        called.append(("integration_test", use_real_model))
+
+    # Mock at the module level inside the lazy import branch
+    monkeypatch.setattr(
+        "jaguar_geo_assign.pretrain.foundation_training.integration_test",
+        mock_integration_test,
+    )
+
+    exit_code = main(["train-felid-foundation", "--config", str(config_path), "--integration-test"])
+
+    assert exit_code == 0
+    assert len(called) == 1
+    assert called[0][0] == "integration_test"
+    assert called[0][1] is True  # use_real_model=True
