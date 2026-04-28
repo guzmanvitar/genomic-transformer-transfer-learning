@@ -142,6 +142,7 @@ class TokenizedCorpusReader(IterableDataset):
         self.shuffle_buffer_size = shuffle_buffer_size
         self.seed = seed
         self.corpus_root = self.metadata_path.parent
+        self._epoch = 0  # Fix #18: Track epoch for deterministic multi-epoch shuffling
 
         # Validation split disables shuffling
         self.file_shuffle = file_shuffle and (split != "validation")
@@ -235,6 +236,21 @@ class TokenizedCorpusReader(IterableDataset):
         """
         return self._record_count
 
+    def set_epoch(self, epoch: int) -> None:
+        """Set the epoch number for reproducible multi-epoch training.
+
+        Fix #18: Mirrors torch.utils.data.distributed.DistributedSampler.set_epoch.
+        The epoch is XORed with the random seed inside __iter__ so that the file
+        permutation (and row-level RNG) differs across epochs, ensuring data diversity
+        in multi-epoch runs. Without this, the same shuffle permutation is reused,
+        reducing effective training diversity.
+
+        Args:
+            epoch: Epoch number (0-indexed). Should be called by the trainer at the
+                start of each epoch before iterating the dataloader.
+        """
+        self._epoch = epoch
+
     def __iter__(self) -> Generator[dict[str, Any], None, None]:
         """Iterate over rows with file-level and row-level shuffling.
 
@@ -271,12 +287,12 @@ class TokenizedCorpusReader(IterableDataset):
                 f"global_id={global_worker_id}/{global_world_size}"
             )
 
-        # File-level shuffle: epoch=0 for single epoch (can be extended later)
-        epoch = 0
+        # File-level shuffle: use epoch-dependent seed for multi-epoch diversity
+        # Fix #18: Use self._epoch (set by trainer via set_epoch) instead of hardcoded 0
         files = list(self._files)
         if self.file_shuffle:
             # Shuffle with epoch-dependent seed for reproducibility across restarts
-            rng = random.Random(self.seed ^ epoch)
+            rng = random.Random(self.seed ^ self._epoch)
             rng.shuffle(files)
 
         # Distribute files across global workers (each worker gets disjoint subset)
@@ -297,7 +313,7 @@ class TokenizedCorpusReader(IterableDataset):
 
         # Row-level shuffle buffer
         shuffle_buffer: deque[dict[str, Any]] = deque(maxlen=self.shuffle_buffer_size)
-        rng = random.Random(self.seed ^ epoch ^ global_worker_id)
+        rng = random.Random(self.seed ^ self._epoch ^ global_worker_id)
 
         # Iterate through assigned files
         for file_path in assigned_files:

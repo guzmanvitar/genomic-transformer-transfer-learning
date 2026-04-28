@@ -364,28 +364,46 @@ def _save_checkpoint_atomically(
     content: dict[str, Any],
     as_json: bool = False,
 ) -> None:
-    """Write checkpoint atomically via temp directory and os.replace per §3.8.
+    """Write checkpoint atomically via temp file or directory per §3.8.
+
+    For JSON sidecars: writes to a temporary file then atomically renames.
+    For directories (accelerate state): uses directory-based atomic write.
 
     Args:
-        path: Target checkpoint directory.
+        path: Target file or directory path.
         content: If as_json=True, dict to serialize; else ignored (use with accelerator.save_state).
-        as_json: Whether to write JSON (True) or save via accelerate context manager (False).
+        as_json: Whether to write JSON file (True) or save directory via accelerate (False).
 
     Raises:
         OSError: If atomic write fails.
     """
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_dir = path.parent / f".tmp_{path.name}_{os.getpid()}"
-    try:
-        tmp_dir.mkdir(parents=True, exist_ok=True)
-        if as_json:
-            tmp_file = tmp_dir / "data.json"
-            tmp_file.write_text(json.dumps(content))
-        os.replace(str(tmp_dir), str(path))
-    finally:
-        # Cleanup on failure
-        if tmp_dir.exists():
-            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    if as_json:
+        # Fix #14: Write JSON as a FILE with atomic rename.
+        # Use unique tmp suffix per PID to be crash-safe during concurrent writes.
+        tmp_path = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+        try:
+            tmp_path.write_text(json.dumps(content))
+            # Atomically rename temp file to target
+            os.replace(str(tmp_path), str(path))
+        except Exception:
+            # Cleanup temp file on failure
+            tmp_path.unlink(missing_ok=True)
+            raise
+    else:
+        # Directory-based atomic write for accelerate state.
+        # Write to temp dir, then atomically replace the target directory.
+        tmp_dir = path.parent / f".tmp_{path.name}_{os.getpid()}"
+        try:
+            tmp_dir.mkdir(parents=True, exist_ok=True)
+            # Caller (accelerator.save_state) populates tmp_dir with content
+            os.replace(str(tmp_dir), str(path))
+        except Exception:
+            # Cleanup on failure
+            if tmp_dir.exists():
+                shutil.rmtree(tmp_dir, ignore_errors=True)
+            raise
 
 
 def _startup_probe_metrics(
@@ -422,10 +440,11 @@ def _startup_probe_metrics(
         # §3.7 (Fix #13): Emit per-parameter grad-norm distribution as TensorBoard histogram.
         # TRADE-OFF: This runs on rank-0 only because TB histograms are not reduce-able
         # across DDP ranks. Collecting per-parameter norms avoids double-counting via gather.
-        norms = torch.stack(
-            [p.grad.detach().norm() for p in model.parameters() if p.grad is not None]
-        )
-        if norms.numel() > 0:
+        # Fix #15: Guard against empty grad list (after optimizer.zero_grad(), all p.grad are None).
+        # torch.stack([]) raises RuntimeError, so we only stack if grad_list is non-empty.
+        grad_list = [p.grad.detach().norm() for p in model.parameters() if p.grad is not None]
+        if grad_list:
+            norms = torch.stack(grad_list)
             # Store norms tensor for later histogram logging; will be logged via accelerator
             metrics["_startup_grad_norm_norms"] = norms
 
@@ -495,7 +514,8 @@ def run_felid_foundation_training(
     # Check for resumed state
     latest_state_path = output_dir / "latest" / "accelerate_state"
     resumed = latest_state_path.exists()
-    best_eval_loss_file = output_dir / "best_eval_loss.json"
+    # Fix #16: Align read path with write path (both in output_dir / "best" / "best_eval_loss.json")
+    best_eval_loss_file = output_dir / "best" / "best_eval_loss.json"
     best_eval_loss = None
     if best_eval_loss_file.exists():
         try:
@@ -544,6 +564,8 @@ def run_felid_foundation_training(
 
     try:
         for _epoch in range(1, 1000):  # Iterate until max_steps reached
+            # Fix #18: Set epoch on reader for deterministic multi-epoch shuffling
+            train_loader.dataset.set_epoch(_epoch - 1)  # 0-indexed
             for batch in train_loader:
                 if step >= config.max_steps:
                     break
@@ -588,7 +610,13 @@ def run_felid_foundation_training(
                     )
 
                     optimizer.step()
-                    scheduler.step()
+                    # Fix #17: Guard scheduler.step() by sync_gradients.
+                    # accumulate() no-ops optimizer.step() and optimizer.zero_grad(),
+                    # but NOT scheduler.step(). Without this guard, the scheduler advances
+                    # once per accumulation micro-step instead of once per optimizer update,
+                    # exhausting the learning rate schedule prematurely.
+                    if accelerator.sync_gradients:
+                        scheduler.step()
                     optimizer.zero_grad()
 
                 # Log metrics at log_every (§3.6: windowed averages)
