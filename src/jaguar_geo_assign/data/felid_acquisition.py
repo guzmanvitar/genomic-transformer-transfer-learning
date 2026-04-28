@@ -8,11 +8,11 @@ felid-specific concerns that the generic primitive does not express:
 1. **Explicit MD5-mismatch observability.** The generic retry loop skips
    when the destination checksum already matches and silently deletes +
    re-downloads on mismatch. Foundation operators need the mismatch event
-   (actual hash vs. expected hash, plus the accession) surfaced in logs;
+   (actual hash vs. expected hash, plus the identifier) surfaced in logs;
    otherwise a silently-corrected corruption bug would be undetectable.
 2. **Root-cause-preserving error contract.** :class:`FelidAcquisitionError`
    surfaces the underlying exception class name and message, plus the
-   failing accession and pinned checksum, so a ``ConnectionResetError``
+   failing identifier and pinned checksum, so a ``ConnectionResetError``
    vs. ``HTTPError`` vs. checksum mismatch is distinguishable without
    parsing tracebacks.
 
@@ -46,7 +46,7 @@ class FelidAcquisitionError(RuntimeError):
     ``HTTPError``, ``ChecksumMismatch``) surfaced directly in the error
     message so they can distinguish transient network faults from
     deterministic contract violations without digging through traceback
-    chains. The message therefore includes the failing accession, the
+    chains. The message therefore includes the failing identifier, the
     pinned expected MD5, and the class name plus string form of the
     underlying exception.
     """
@@ -62,7 +62,7 @@ class FelidAcquisitionSummary:
     download loop.
 
     Attributes:
-        per_species: Tuple of :class:`DownloadResult` in accession-sorted
+        per_species: Tuple of :class:`DownloadResult` in identifier-sorted
             registry order, one per approved species.
         total_bytes_written: Sum of bytes written across all downloads
             (zero when every file was skipped because it matched the

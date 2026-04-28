@@ -63,7 +63,7 @@ REQUIRED_SAMPLE_MANIFEST_FIELDS = ("sample_id", "individual_id", "vcf_path")
 # Felid foundation corpus contracts.
 #
 # The felid-foundation pretraining path mixes six reference assemblies
-# into a single tokenized corpus. Pinning the *set* of approved accessions at
+# into a single tokenized corpus. Pinning the *set* of approved identifiers at
 # contract level (rather than taking the list directly from
 # ``felid_assemblies.APPROVED_FELID_ASSEMBLIES``) gives the config loader an
 # O(1) membership check and makes drift visible in PR diffs: adding a species

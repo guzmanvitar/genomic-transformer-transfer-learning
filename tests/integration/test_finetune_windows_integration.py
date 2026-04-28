@@ -1,7 +1,7 @@
 """Integration test for the fine-tuning window extraction pipeline.
 
 Exercises ``extract_fasta_windows_for_sample`` against the **real** jaguar
-reference (RefSeq ``GCF_028533385.1`` / ``Panthera_onca_HiC``, ~2.5 GB
+reference (DNA Zoo ``DNAZOO_Panthera_onca_HiC`` / ``Panthera_onca_HiC``, ~2.5 GB
 compressed) and the real per-sample jaguar VCF that ships under
 ``data/raw/``. The reference download is cached in
 ``data/raw/reference/`` so re-runs do not re-pull a multi-gigabyte file.

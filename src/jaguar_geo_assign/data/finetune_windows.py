@@ -76,7 +76,7 @@ class ReferenceBaseMismatchError(AcquisitionError):
     1-based ``locus_pos`` does not match (case-insensitive) the ``REF``
     column of the VCF record. This typically indicates that the FASTA and
     VCF were derived from different assemblies even when build-token
-    validation passes (e.g. same accession, different patch level).
+    validation passes (e.g. same identifier, different patch level).
     """
 
 

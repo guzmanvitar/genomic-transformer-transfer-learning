@@ -1,8 +1,8 @@
-"""Typed registry and manifest builder for the six approved felid RefSeq assemblies.
+"""Typed registry and manifest builder for the six approved felid assemblies.
 
 This module is the single source of truth for the multi-species felid reference-FASTA
 corpus consumed by the foundation pretraining path. It pins each assembly's canonical
-NCBI RefSeq accession, assembly name, tax ID, and expected MD5 of the ``_genomic.fna.gz``
+identifier, assembly name, tax ID, and expected checksum of the compressed FASTA
 file so that ``download_with_retry`` can verify integrity and refuse silently truncated
 or stale payloads.
 
@@ -13,7 +13,7 @@ The MD5s are pinned manually from each assembly's ``md5checksums.txt``. This avo
 an online dependency at registry-construction time while still catching on-disk
 corruption when the manifest is consumed.
 
-The module intentionally does not call NCBI Entrez or execute any downloads; it only
+The module intentionally does not execute any downloads; it only
 produces typed plans. Actual transfer is handled by consumers via the existing
 ``download_with_retry`` primitive in :mod:`jaguar_geo_assign.data.acquisition`.
 """
@@ -33,22 +33,23 @@ _ACCESSION_PATTERN = re.compile(r"^GCF_(\d{3})(\d{3})(\d{3})\.\d+$")
 
 @dataclass(frozen=True)
 class FelidAssembly:
-    """Immutable registry entry for one approved felid RefSeq assembly.
+    """Immutable registry entry for one approved felid assembly.
 
-    The ``expected_md5`` field is populated from the NCBI ``md5checksums.txt`` file
-    inside each assembly's FTP directory at registry build time. It is threaded into
+    The ``expected_checksum`` field is populated from the source repository's manifest
+    at registry build time. It is threaded into
     :class:`DownloadAsset.checksum` by :func:`build_felid_reference_manifest` so that
     any post-download integrity check fails loudly on a truncated or stale file.
 
     Attributes:
         species: Latin binomial (e.g. ``"Panthera onca"``).
         common_name: Human-readable common name for logging and run summaries.
-        identifier: RefSeq assembly accession prefixed with ``GCF_`` or DNA Zoo ID.
-        assembly_name: NCBI assembly name used in the canonical FTP path.
+        identifier: Unique assembly identifier (e.g. RefSeq accession prefixed
+            with ``GCF_`` or DNA Zoo ID).
+        assembly_name: Assembly name used in the canonical FTP path.
         tax_id: NCBI taxonomy identifier for the species.
-        expected_checksum: Checksum of the ``_genomic.fna.gz`` file.
+        expected_checksum: Checksum of the compressed FASTA file.
         checksum_name: Name of the hash algorithm (default ``"md5"``).
-        url_override: Optional direct URL to bypass NCBI FTP construction.
+        url_override: Optional direct URL to bypass canonical FTP construction.
         mirror_url: Optional secondary URL to try if primary fails.
         expected_size: Optional expected file size in bytes.
     """
@@ -112,6 +113,8 @@ APPROVED_FELID_ASSEMBLIES: tuple[FelidAssembly, ...] = (
         identifier="DNAZOO_Panthera_onca_HiC",
         assembly_name="Panthera_onca_HiC",
         tax_id=9690,
+        # Provenance: Computed from commit e9fc242 and URL:
+        # https://dnazoo.s3.wasabisys.com/Panthera_onca/Panthera_onca_HiC.fasta.gz
         expected_checksum="3b3811dff68a704075cfdceb5fb3f1f4a869d6deda6dced6dd159b6498919229",
         checksum_name="sha256",
         url_override="https://dnazoo.s3.wasabisys.com/Panthera_onca/Panthera_onca_HiC.fasta.gz",
@@ -148,7 +151,7 @@ APPROVED_FELID_ASSEMBLIES: tuple[FelidAssembly, ...] = (
 def build_refseq_fasta_url(
     identifier: str, assembly_name: str, url_override: str | None = None
 ) -> str:
-    """Return the canonical RefSeq FASTA URL for a pinned ``GCF_*`` accession.
+    """Return the canonical FASTA URL for a pinned ``GCF_*`` identifier.
 
     The URL is derived deterministically by splitting the nine digits of the
     identifier into three-digit groups. We validate the shape up front so that a
