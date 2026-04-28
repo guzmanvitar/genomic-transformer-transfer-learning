@@ -2606,3 +2606,105 @@ eval_every = 1
     finally:
         AcceleratorState._reset_state()
         os.environ.pop("ACCELERATE_USE_CPU", None)
+
+
+def test_all_nan_eval_skips_best_save(tmp_path: Path) -> None:
+    """NEW test (Fix #45): Verify all-NaN eval batches do not save best checkpoint."""
+    import os
+    from unittest.mock import patch
+
+    import torch
+    from accelerate.state import AcceleratorState
+    from transformers import AutoModelForMaskedLM, BertConfig
+
+    from jaguar_geo_assign.pretrain.foundation_training import run_felid_foundation_training
+
+    AcceleratorState._reset_state()
+    os.environ["ACCELERATE_USE_CPU"] = "true"
+
+    try:
+        metadata_path = _write_tiny_corpus(tmp_path, {"train": 1, "validation": 2})
+        config_file = tmp_path / "train_config_nan_eval.toml"
+        config_file.write_text(f"""
+[training]
+corpus_metadata_path = "{metadata_path}"
+model_identifier = "zhihan1996/DNABERT-2-117M"
+model_revision = "main"
+output_dir = "{tmp_path}/out"
+max_steps = 1
+learning_rate = 1e-4
+seed = 42
+per_device_train_batch_size = 1
+per_device_eval_batch_size = 1
+gradient_accumulation_steps = 1
+log_every = 1
+eval_every = 1
+""")
+
+        config = BertConfig(
+            num_hidden_layers=1, num_attention_heads=2, hidden_size=32, vocab_size=30522
+        )
+        model = AutoModelForMaskedLM.from_config(config)
+        tokenizer = FakeTokenizer()
+
+        class DummyDataset:
+            record_count = 2
+
+            def set_epoch(self, epoch):
+                pass
+
+        class DummyLoader:
+            dataset = DummyDataset()
+
+            def __iter__(self):
+                # 2 batches
+                yield {
+                    "input_ids": torch.tensor([[101, 200, 102, 0]]),
+                    "attention_mask": torch.tensor([[1, 1, 1, 0]]),
+                    "labels": torch.tensor([[1, 2, 3, 4]]),
+                }
+                yield {
+                    "input_ids": torch.tensor([[101, 201, 102, 0]]),
+                    "attention_mask": torch.tensor([[1, 1, 1, 0]]),
+                    "labels": torch.tensor([[1, 2, 3, 4]]),
+                }
+
+            def __len__(self):
+                return 2
+
+        with (
+            patch(
+                "jaguar_geo_assign.pretrain.foundation_training._build_dataloaders"
+            ) as mock_loaders,
+            patch(
+                "jaguar_geo_assign.pretrain.foundation_training._build_model_and_tokenizer"
+            ) as mock_build,
+            patch("logging.Logger.warning") as mock_warning,
+        ):
+            mock_build.return_value = (model, tokenizer, "none", False)
+            mock_loaders.return_value = (DummyLoader(), DummyLoader())
+
+            original_forward = model.forward
+
+            def mock_forward(*args, **kwargs):
+                out = original_forward(*args, **kwargs)
+                if not model.training:
+                    out.loss = torch.tensor(float("nan"))
+                return out
+
+            with patch.object(model, "forward", side_effect=mock_forward):
+                run_felid_foundation_training(config_file, integration_test_mode="off")
+
+            assert any(
+                "produced no finite loss values" in str(call)
+                for call in mock_warning.call_args_list
+            )
+
+            best_json_path = tmp_path / "out" / "best" / "best_eval_loss.json"
+            assert not best_json_path.exists(), (
+                "best_eval_loss.json should not be written when all eval batches are NaN"
+            )
+
+    finally:
+        AcceleratorState._reset_state()
+        os.environ.pop("ACCELERATE_USE_CPU", None)

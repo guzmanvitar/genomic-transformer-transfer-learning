@@ -842,7 +842,11 @@ def run_felid_foundation_training(
                                         eval_metric.token_masked += gathered_mask.sum().item()
 
                         model.train()
-                        mean_eval_loss = eval_metric.loss_sum / max(eval_metric.step_count, 1)
+                        mean_eval_loss = (
+                            eval_metric.loss_sum / eval_metric.step_count
+                            if eval_metric.step_count > 0
+                            else float("nan")
+                        )
 
                         # §3.6 (Fix #12): NaN convention for eval token_accuracy
                         eval_token_acc = (
@@ -865,7 +869,19 @@ def run_felid_foundation_training(
                             step=step,
                         )
 
-                        if mean_eval_loss < best_eval_loss:
+                        # TRADE-OFF: When all eval batches are non-finite,
+                        # the running mean is undefined. We skip the best-comparison
+                        # entirely (rather than treating it as 0.0 or +inf) to avoid
+                        # spurious-best poisoning and silently treating 'no data'
+                        # as 'worst'. Logged as a warning so operators can investigate.
+                        if eval_metric.step_count == 0:
+                            logger.warning(
+                                "Eval at step %d produced no finite loss values "
+                                "(all batches were NaN/Inf or dataset was empty); "
+                                "skipping best-checkpoint comparison to avoid poisoning.",
+                                step,
+                            )
+                        elif mean_eval_loss < best_eval_loss:
                             best_eval_loss = mean_eval_loss
                             # Save best checkpoint
                             best_dir = output_dir / "best"
