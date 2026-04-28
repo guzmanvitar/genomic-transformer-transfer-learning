@@ -89,12 +89,20 @@ def write_placeholder_fastas(reference_dir: Path, padded_identifiers: list[str])
         path = reference_dir / placeholder_fasta_filename(identifier)
         if path.exists():
             continue
-        path.write_bytes(build_fixture_fasta({identifier: "A" * 128}))
+        if "Panthera_onca" in identifier:
+            contigs = {identifier: "A" * 128, "HiC_scaffold_1": "A" * 128}
+        else:
+            contigs = {identifier: "A" * 128}
+        path.write_bytes(build_fixture_fasta(contigs))
 
 
 def placeholder_fasta_checksum(identifier: str) -> str:
     """Return the MD5 of the placeholder FASTA written by :func:`write_placeholder_fastas`."""
-    return hashlib.md5(build_fixture_fasta({identifier: "A" * 128})).hexdigest()
+    if "Panthera_onca" in identifier:
+        contigs = {identifier: "A" * 128, "HiC_scaffold_1": "A" * 128}
+    else:
+        contigs = {identifier: "A" * 128}
+    return hashlib.md5(build_fixture_fasta(contigs)).hexdigest()
 
 
 def pad_species_to_full_roster(

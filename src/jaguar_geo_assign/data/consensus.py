@@ -890,3 +890,6 @@ def _open_maybe_gzip(path: Path):
         if path.suffix == ".gz"
         else path.open("r", encoding="utf-8")
     )
+
+
+canonicalize_reference_evidence = _canonicalize_reference_evidence
