@@ -2373,3 +2373,236 @@ eval_max_steps = 2
     finally:
         AcceleratorState._reset_state()
         os.environ.pop("ACCELERATE_USE_CPU", None)
+
+
+def test_resume_restores_step_counter(tmp_path: Path) -> None:
+    """NEW test (Fix #44): Verify resume restores step counter from train_state.json."""
+    import json
+    import os
+    from unittest.mock import patch
+
+    from accelerate.state import AcceleratorState
+    from transformers import AutoModelForMaskedLM, BertConfig
+
+    from jaguar_geo_assign.pretrain.foundation_training import run_felid_foundation_training
+
+    AcceleratorState._reset_state()
+    os.environ["ACCELERATE_USE_CPU"] = "true"
+
+    try:
+        out_dir = tmp_path / "out"
+        latest_state = out_dir / "latest" / "accelerate_state"
+        latest_state.mkdir(parents=True)
+
+        (out_dir / "latest" / "train_state.json").write_text(
+            json.dumps({"step": 5000, "best_eval_loss": 1.23})
+        )
+
+        metadata_path = _write_tiny_corpus(tmp_path, {"train": 1})
+        config_file = tmp_path / "train_config_resume.toml"
+        config_file.write_text(f"""
+[training]
+corpus_metadata_path = "{metadata_path}"
+model_identifier = "zhihan1996/DNABERT-2-117M"
+model_revision = "main"
+output_dir = "{out_dir}"
+max_steps = 5000
+learning_rate = 1e-4
+seed = 42
+per_device_train_batch_size = 1
+gradient_accumulation_steps = 1
+log_every = 1
+eval_every = 1
+""")
+
+        config = BertConfig(
+            num_hidden_layers=1, num_attention_heads=2, hidden_size=32, vocab_size=30522
+        )
+        model = AutoModelForMaskedLM.from_config(config)
+        tokenizer = FakeTokenizer()
+
+        class DummyDataset:
+            def set_epoch(self, epoch):
+                pass
+
+        class DummyLoader:
+            dataset = DummyDataset()
+
+            def __iter__(self):
+                return iter([])
+
+            def __len__(self):
+                return 0
+
+        with (
+            patch(
+                "jaguar_geo_assign.pretrain.foundation_training._build_dataloaders"
+            ) as mock_loaders,
+            patch(
+                "jaguar_geo_assign.pretrain.foundation_training._build_model_and_tokenizer"
+            ) as mock_build,
+            patch("accelerate.Accelerator.load_state"),
+        ):
+            mock_build.return_value = (model, tokenizer, "none", False)
+            mock_loaders.return_value = (DummyLoader(), None)
+
+            result = run_felid_foundation_training(config_file, integration_test_mode="off")
+            assert result.final_step == 5000
+
+    finally:
+        AcceleratorState._reset_state()
+        os.environ.pop("ACCELERATE_USE_CPU", None)
+
+
+def test_resume_handles_missing_train_state(tmp_path: Path) -> None:
+    """NEW test (Fix #44): Verify resume gracefully handles missing train_state.json."""
+    import os
+    from unittest.mock import patch
+
+    from accelerate.state import AcceleratorState
+    from transformers import AutoModelForMaskedLM, BertConfig
+
+    from jaguar_geo_assign.pretrain.foundation_training import run_felid_foundation_training
+
+    AcceleratorState._reset_state()
+    os.environ["ACCELERATE_USE_CPU"] = "true"
+
+    try:
+        out_dir = tmp_path / "out"
+        latest_state = out_dir / "latest" / "accelerate_state"
+        latest_state.mkdir(parents=True)
+
+        metadata_path = _write_tiny_corpus(tmp_path, {"train": 1})
+        config_file = tmp_path / "train_config_missing.toml"
+        config_file.write_text(f"""
+[training]
+corpus_metadata_path = "{metadata_path}"
+model_identifier = "zhihan1996/DNABERT-2-117M"
+model_revision = "main"
+output_dir = "{out_dir}"
+max_steps = 1
+learning_rate = 1e-4
+seed = 42
+per_device_train_batch_size = 1
+gradient_accumulation_steps = 1
+log_every = 1
+eval_every = 1
+""")
+        config = BertConfig(
+            num_hidden_layers=1, num_attention_heads=2, hidden_size=32, vocab_size=30522
+        )
+        model = AutoModelForMaskedLM.from_config(config)
+        tokenizer = FakeTokenizer()
+
+        class DummyDataset:
+            def set_epoch(self, epoch):
+                pass
+
+        class DummyLoader:
+            dataset = DummyDataset()
+
+            def __iter__(self):
+                return iter([])
+
+            def __len__(self):
+                return 0
+
+        with (
+            patch(
+                "jaguar_geo_assign.pretrain.foundation_training._build_dataloaders"
+            ) as mock_loaders,
+            patch(
+                "jaguar_geo_assign.pretrain.foundation_training._build_model_and_tokenizer"
+            ) as mock_build,
+            patch("accelerate.Accelerator.load_state"),
+            patch("logging.Logger.info") as mock_info,
+        ):
+            mock_build.return_value = (model, tokenizer, "none", False)
+            mock_loaders.return_value = (DummyLoader(), None)
+
+            result = run_felid_foundation_training(config_file, integration_test_mode="off")
+            assert result.final_step == 0
+            # Ensure info was logged about missing train_state.json
+            assert any(
+                "train_state.json not found" in str(call) for call in mock_info.call_args_list
+            )
+
+    finally:
+        AcceleratorState._reset_state()
+        os.environ.pop("ACCELERATE_USE_CPU", None)
+
+
+def test_resume_handles_corrupt_train_state(tmp_path: Path) -> None:
+    """NEW test (Fix #44): Verify resume gracefully handles corrupt train_state.json."""
+    import os
+    from unittest.mock import patch
+
+    from accelerate.state import AcceleratorState
+    from transformers import AutoModelForMaskedLM, BertConfig
+
+    from jaguar_geo_assign.pretrain.foundation_training import run_felid_foundation_training
+
+    AcceleratorState._reset_state()
+    os.environ["ACCELERATE_USE_CPU"] = "true"
+
+    try:
+        out_dir = tmp_path / "out"
+        latest_state = out_dir / "latest" / "accelerate_state"
+        latest_state.mkdir(parents=True)
+        (out_dir / "latest" / "train_state.json").write_text('{"step": "not-an-int"}')
+
+        metadata_path = _write_tiny_corpus(tmp_path, {"train": 1})
+        config_file = tmp_path / "train_config_corrupt.toml"
+        config_file.write_text(f"""
+[training]
+corpus_metadata_path = "{metadata_path}"
+model_identifier = "zhihan1996/DNABERT-2-117M"
+model_revision = "main"
+output_dir = "{out_dir}"
+max_steps = 1
+learning_rate = 1e-4
+seed = 42
+per_device_train_batch_size = 1
+gradient_accumulation_steps = 1
+log_every = 1
+eval_every = 1
+""")
+        config = BertConfig(
+            num_hidden_layers=1, num_attention_heads=2, hidden_size=32, vocab_size=30522
+        )
+        model = AutoModelForMaskedLM.from_config(config)
+        tokenizer = FakeTokenizer()
+
+        class DummyDataset:
+            def set_epoch(self, epoch):
+                pass
+
+        class DummyLoader:
+            dataset = DummyDataset()
+
+            def __iter__(self):
+                return iter([])
+
+            def __len__(self):
+                return 0
+
+        with (
+            patch(
+                "jaguar_geo_assign.pretrain.foundation_training._build_dataloaders"
+            ) as mock_loaders,
+            patch(
+                "jaguar_geo_assign.pretrain.foundation_training._build_model_and_tokenizer"
+            ) as mock_build,
+            patch("accelerate.Accelerator.load_state"),
+            patch("logging.Logger.warning") as mock_warning,
+        ):
+            mock_build.return_value = (model, tokenizer, "none", False)
+            mock_loaders.return_value = (DummyLoader(), None)
+
+            result = run_felid_foundation_training(config_file, integration_test_mode="off")
+            assert result.final_step == 0
+            assert any("Failed to parse" in str(call) for call in mock_warning.call_args_list)
+
+    finally:
+        AcceleratorState._reset_state()
+        os.environ.pop("ACCELERATE_USE_CPU", None)

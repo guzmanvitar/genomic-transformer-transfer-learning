@@ -610,12 +610,37 @@ def run_felid_foundation_training(
     # TRADE-OFF: IterableDataset does not restore the cursor position on resume;
     # the dataloader restarts at the epoch boundary. This may cause the first batch
     # after resume to contain duplicate rows from earlier in the epoch.
-    if resumed:
-        accelerator.load_state(str(latest_state_path))
-        logger.info("Resumed training from latest checkpoint")
-
     # Training loop
     step = 0
+    if resumed:
+        accelerator.load_state(str(latest_state_path))
+
+        # TRADE-OFF: step is restored from sidecar (not accelerate_state) because
+        # Python ints are not part of save_state. Sidecar is best-effort; old
+        # checkpoints without it resume at step=0 with a warning.
+        train_state_path = latest_state_path.parent / "train_state.json"
+        if train_state_path.exists():
+            try:
+                train_state = json.loads(train_state_path.read_text(encoding="utf-8"))
+                step = int(train_state.get("step", 0))
+            except (OSError, json.JSONDecodeError, ValueError) as exc:
+                logger.warning(
+                    "Failed to parse %s on resume; restarting step counter at 0: %s",
+                    train_state_path,
+                    exc,
+                )
+                step = 0
+        else:
+            logger.info(
+                "train_state.json not found in latest checkpoint (older format); "
+                "step counter restarting at 0."
+            )
+            step = 0
+
+        logger.info("Resumed training from latest checkpoint")
+
+    # Note: tokens-trained-so-far implications: no metrics currently use step as a
+    # denominator in a way that breaks on resume. step counts all previous steps.
     best_eval_loss = float("inf") if best_eval_loss is None else float(best_eval_loss)
     train_metric = MetricAccumulator()
     eval_metric = MetricAccumulator()
@@ -915,6 +940,11 @@ def run_felid_foundation_training(
                                 ) as swap_target:
                                     swap_target.rmdir()
                                     os.replace(str(tmp_accel_state), str(swap_target))
+
+                                _save_json_atomically(
+                                    latest_dir / "train_state.json",
+                                    {"step": step, "best_eval_loss": best_eval_loss},
+                                )
                             except Exception as e:
                                 # TRADE-OFF: Rank-0 checkpoint exception is caught and broadcasted
                                 logger.error("Rank-0 checkpoint save failed: %s", e, exc_info=True)
