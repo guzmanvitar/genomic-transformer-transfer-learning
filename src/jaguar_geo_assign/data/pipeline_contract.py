@@ -71,10 +71,10 @@ REQUIRED_SAMPLE_MANIFEST_FIELDS = ("sample_id", "individual_id", "vcf_path")
 # feline BioProject pinning above.
 from .felid_assemblies import APPROVED_FELID_ASSEMBLIES as _APPROVED_FELID_ASSEMBLIES  # noqa: E402
 
-APPROVED_FELID_ACCESSIONS: frozenset[str] = frozenset(
-    assembly.accession for assembly in _APPROVED_FELID_ASSEMBLIES
+APPROVED_FELID_IDENTIFIERS: frozenset[str] = frozenset(
+    assembly.identifier for assembly in _APPROVED_FELID_ASSEMBLIES
 )
-"""Frozen set of the six pinned RefSeq accessions approved for the felid foundation corpus."""
+"""Frozen set of the six pinned identifiers approved for the felid foundation corpus."""
 
 REQUIRED_FELID_FOUNDATION_SPECIES_COUNT = len(_APPROVED_FELID_ASSEMBLIES)
 """The felid foundation contract requires exactly this many approved species."""

@@ -101,21 +101,21 @@ def _zip_entries_with_assets(
 ) -> tuple[tuple[FelidSpeciesEntry, DownloadAsset], ...]:
     """Pair each configured species with its matching :class:`DownloadAsset`.
 
-    :class:`DownloadAsset` is intentionally accession-agnostic so
+    :class:`DownloadAsset` is intentionally identifier-agnostic so
     the acquisition layer stays generic. For felid-specific logging we
     need the species slug and Latin binomial alongside the asset. The
-    manifest is sorted by accession; we index assets by their
-    ``destination`` stem (``<ACC>_<ASM>``) so the pairing works even when
+    manifest is sorted by identifier; we index assets by their
+    ``destination`` stem (``<identifier>``) so the pairing works even when
     the config's species list is in a different order.
     """
     by_stem = {asset.destination.name.split(".fna.gz")[0]: asset for asset in assets}
     pairs: list[tuple[FelidSpeciesEntry, DownloadAsset]] = []
     for entry in species:
-        stem = f"{entry.accession}_{entry.assembly_name}"
+        stem = f"{entry.identifier}"
         asset = by_stem.get(stem)
         if asset is None:
             raise FelidAcquisitionError(
-                f"Config species {entry.species} ({entry.accession}) has no "
+                f"Config species {entry.species} ({entry.identifier}) has no "
                 "matching asset in the felid reference manifest; the species "
                 "list must be a subset of APPROVED_FELID_ASSEMBLIES"
             )
@@ -194,9 +194,9 @@ def acquire_felid_foundation_assemblies(
 
     for entry, asset in pairs:
         _LOGGER.info(
-            "start species=%s accession=%s destination=%s",
+            "start species=%s identifier=%s destination=%s",
             entry.species_slug,
-            entry.accession,
+            entry.identifier,
             asset.destination,
         )
 
@@ -205,9 +205,9 @@ def acquire_felid_foundation_assemblies(
             actual_md5 = _compute_md5(asset.destination)
             if actual_md5 == asset.checksum:
                 _LOGGER.info(
-                    'skip species=%s accession=%s reason="checksum match" destination=%s',
+                    'skip species=%s identifier=%s reason="checksum match" destination=%s',
                     entry.species_slug,
-                    entry.accession,
+                    entry.identifier,
                     asset.destination,
                 )
                 results.append(
@@ -222,10 +222,10 @@ def acquire_felid_foundation_assemblies(
                 skipped_count += 1
                 continue
             _LOGGER.info(
-                "verify_mismatch_redownload species=%s accession=%s "
+                "verify_mismatch_redownload species=%s identifier=%s "
                 'reason="checksum mismatch; hash=%s expected=%s" destination=%s',
                 entry.species_slug,
-                entry.accession,
+                entry.identifier,
                 actual_md5,
                 asset.checksum,
                 asset.destination,
@@ -244,37 +244,37 @@ def acquire_felid_foundation_assemblies(
         except AcquisitionError as exc:
             root_cause = exc.__cause__ or exc
             _LOGGER.error(
-                "failure species=%s accession=%s checksum=%s root_cause=%s: %s",
+                "failure species=%s identifier=%s checksum=%s root_cause=%s: %s",
                 entry.species_slug,
-                entry.accession,
+                entry.identifier,
                 asset.checksum,
                 type(root_cause).__name__,
                 root_cause,
             )
             raise FelidAcquisitionError(
                 f"Failed to acquire felid reference for {entry.species} "
-                f"(accession={entry.accession}, expected md5={asset.checksum}): "
+                f"(identifier={entry.identifier}, expected checksum={asset.checksum}): "
                 f"{type(root_cause).__name__}: {root_cause}"
             ) from exc
 
         if result.resumed:
             _LOGGER.info(
-                "resume species=%s accession=%s attempts=%d",
+                "resume species=%s identifier=%s attempts=%d",
                 entry.species_slug,
-                entry.accession,
+                entry.identifier,
                 result.attempts,
             )
         _LOGGER.info(
-            "download_finish species=%s accession=%s attempts=%d bytes=%d",
+            "download_finish species=%s identifier=%s attempts=%d bytes=%d",
             entry.species_slug,
-            entry.accession,
+            entry.identifier,
             result.attempts,
             result.bytes_written,
         )
         _LOGGER.info(
-            "verify_ok species=%s accession=%s checksum=%s",
+            "verify_ok species=%s identifier=%s checksum=%s",
             entry.species_slug,
-            entry.accession,
+            entry.identifier,
             asset.checksum,
         )
         results.append(result)

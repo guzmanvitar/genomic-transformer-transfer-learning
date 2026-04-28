@@ -43,18 +43,26 @@ class FelidAssembly:
     Attributes:
         species: Latin binomial (e.g. ``"Panthera onca"``).
         common_name: Human-readable common name for logging and run summaries.
-        accession: RefSeq assembly accession prefixed with ``GCF_``.
+        identifier: RefSeq assembly accession prefixed with ``GCF_`` or DNA Zoo ID.
         assembly_name: NCBI assembly name used in the canonical FTP path.
         tax_id: NCBI taxonomy identifier for the species.
-        expected_md5: Lowercase 32-char hex MD5 of the ``_genomic.fna.gz`` file.
+        expected_checksum: Checksum of the ``_genomic.fna.gz`` file.
+        checksum_name: Name of the hash algorithm (default ``"md5"``).
+        url_override: Optional direct URL to bypass NCBI FTP construction.
+        mirror_url: Optional secondary URL to try if primary fails.
+        expected_size: Optional expected file size in bytes.
     """
 
     species: str
     common_name: str
-    accession: str
+    identifier: str
     assembly_name: str
     tax_id: int
-    expected_md5: str
+    expected_checksum: str
+    checksum_name: str = "md5"
+    url_override: str | None = None
+    mirror_url: str | None = None
+    expected_size: int | None = None
 
 
 # Provenance: MD5s pinned manually from
@@ -65,69 +73,98 @@ APPROVED_FELID_ASSEMBLIES: tuple[FelidAssembly, ...] = (
     FelidAssembly(
         species="Felis catus",
         common_name="Domestic cat",
-        accession="GCF_000181335.3",
+        identifier="GCF_000181335.3",
         assembly_name="Felis_catus_9.0",
         tax_id=9685,
-        expected_md5="55c8869801266af1b1fb13ffa7464209",
+        expected_checksum="55c8869801266af1b1fb13ffa7464209",
+        checksum_name="md5",
+        url_override=None,
+        mirror_url=None,
+        expected_size=None,
     ),
     FelidAssembly(
         species="Panthera leo",
         common_name="Lion",
-        accession="GCF_018350215.1",
+        identifier="GCF_018350215.1",
         assembly_name="P.leo_Ple1_pat1.1",
         tax_id=9689,
-        expected_md5="33cb54c850de6090ff6364f3823606ac",
+        expected_checksum="33cb54c850de6090ff6364f3823606ac",
+        checksum_name="md5",
+        url_override=None,
+        mirror_url=None,
+        expected_size=None,
     ),
     FelidAssembly(
         species="Panthera tigris",
         common_name="Amur tiger",
-        accession="GCF_000464555.1",
+        identifier="GCF_000464555.1",
         assembly_name="PanTig1.0",
         tax_id=74533,
-        expected_md5="7d373b516c4ae82a1dc9c18bcc1ca389",
+        expected_checksum="7d373b516c4ae82a1dc9c18bcc1ca389",
+        checksum_name="md5",
+        url_override=None,
+        mirror_url=None,
+        expected_size=None,
     ),
     FelidAssembly(
         species="Panthera onca",
         common_name="Jaguar",
-        accession="GCF_028533385.1",
+        identifier="GCF_028533385.1",
         assembly_name="Panthera_onca_HiC",
         tax_id=9690,
-        expected_md5="42ec44de315ab9e0b2a07520987776eb",
+        expected_checksum="42ec44de315ab9e0b2a07520987776eb",
+        checksum_name="md5",
+        url_override=None,
+        mirror_url=None,
+        expected_size=None,
     ),
     FelidAssembly(
         species="Puma concolor",
         common_name="Puma",
-        accession="GCF_003327715.1",
+        identifier="GCF_003327715.1",
         assembly_name="PumCon1.0",
         tax_id=9696,
-        expected_md5="0bbbfb230e807f8601d1017449f71ea5",
+        expected_checksum="0bbbfb230e807f8601d1017449f71ea5",
+        checksum_name="md5",
+        url_override=None,
+        mirror_url=None,
+        expected_size=None,
     ),
     FelidAssembly(
         species="Panthera pardus",
         common_name="Leopard",
-        accession="GCF_001857705.1",
+        identifier="GCF_001857705.1",
         assembly_name="PanPar1.0",
         tax_id=9691,
-        expected_md5="e3e5fa056f33374224d43aeddb673b2d",
+        expected_checksum="e3e5fa056f33374224d43aeddb673b2d",
+        checksum_name="md5",
+        url_override=None,
+        mirror_url=None,
+        expected_size=None,
     ),
 )
 
 
-def build_refseq_fasta_url(accession: str, assembly_name: str) -> str:
+def build_refseq_fasta_url(
+    identifier: str, assembly_name: str, url_override: str | None = None
+) -> str:
     """Return the canonical RefSeq FASTA URL for a pinned ``GCF_*`` accession.
 
     The URL is derived deterministically by splitting the nine digits of the
-    accession into three-digit groups. We validate the shape up front so that a
-    typo in a pinned accession fails loudly at URL-construction time rather than
+    identifier into three-digit groups. We validate the shape up front so that a
+    typo in a pinned identifier fails loudly at URL-construction time rather than
     producing a 404 during download.
     """
-    match = _ACCESSION_PATTERN.match(accession)
+    if url_override is not None:
+        return url_override
+
+    match = _ACCESSION_PATTERN.match(identifier)
     if not match:
         raise ValueError(
-            f"accession {accession!r} must match GCF_<9 digits grouped 3/3/3>.<version>"
+            f"identifier {identifier!r} must match GCF_<9 digits grouped 3/3/3>.<version>"
         )
     aaa, bbb, ccc = match.group(1), match.group(2), match.group(3)
-    stem = f"{accession}_{assembly_name}"
+    stem = f"{identifier}_{assembly_name}"
     return f"{_REFSEQ_FTP_ROOT}/{aaa}/{bbb}/{ccc}/{stem}/{stem}_genomic.fna.gz"
 
 
@@ -139,30 +176,33 @@ def build_felid_reference_manifest(
 ) -> tuple[DownloadAsset, ...]:
     """Build a deterministic per-species download plan for the felid corpus.
 
-    Assets are sorted by accession so manifest order is reproducible across runs
-    regardless of the input sequence order. The ``expected_md5`` on each assembly
+    Assets are sorted by identifier so manifest order is reproducible across runs
+    regardless of the input sequence order. The ``expected_checksum`` on each assembly
     is threaded into :attr:`DownloadAsset.checksum` with ``checksum_name="md5"``;
     an in-code assertion refuses to return any asset with an empty checksum so a
     future edit cannot silently drop the integrity guard.
     """
     reference_dir = Path(output_dir) / "reference"
     override = dict(checksum_override or {})
-    ordered = sorted(assemblies, key=lambda a: a.accession)
+    ordered = sorted(assemblies, key=lambda a: a.identifier)
     assets: list[DownloadAsset] = []
     for assembly in ordered:
-        checksum = override.get(assembly.accession, assembly.expected_md5)
-        stem = f"{assembly.accession}_{assembly.assembly_name}"
+        checksum = override.get(assembly.identifier, assembly.expected_checksum)
         assets.append(
             DownloadAsset(
-                url=build_refseq_fasta_url(assembly.accession, assembly.assembly_name),
-                destination=reference_dir / f"{stem}.fna.gz",
+                url=build_refseq_fasta_url(
+                    assembly.identifier, assembly.assembly_name, assembly.url_override
+                ),
+                destination=reference_dir / f"{assembly.identifier}.fna.gz",
                 checksum=checksum,
-                checksum_name="md5",
+                checksum_name=assembly.checksum_name,
+                mirror_url=assembly.mirror_url,
+                expected_size=assembly.expected_size,
                 kind="reference",
             )
         )
     assert all(asset.checksum for asset in assets), (
         "build_felid_reference_manifest produced an asset with empty checksum; "
-        "every felid reference download must be MD5-verified"
+        "every felid reference download must be verified"
     )
     return tuple(assets)

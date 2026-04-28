@@ -383,7 +383,7 @@ def test_header_contig_absent_from_reference_raises(tmp_path: Path):
 def test_reference_base_mismatch_against_fasta_raises(tmp_path: Path):
     """If the FASTA base at the locus disagrees with the VCF ``REF``, raise.
 
-    Same accession + different patch level is the typical real-world
+    Same identifier + different patch level is the typical real-world
     cause; the per-locus guard catches it even when build-token
     validation passes.
     """

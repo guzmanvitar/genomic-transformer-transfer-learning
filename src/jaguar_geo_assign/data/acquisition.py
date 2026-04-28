@@ -57,14 +57,14 @@ class BioProjectSummary:
     """Immutable snapshot of an NCBI BioProject retrieved via E-utilities.
 
     Attributes:
-        accession: NCBI BioProject accession (e.g. ``"PRJNA308208"``).
+        identifier: NCBI BioProject accession (e.g. ``"PRJNA308208"``).
         project_id: Numeric NCBI internal project identifier.
         title: Human-readable project title returned by the API.
         description: Extended project description (may be empty).
         submitter: Submitting organisation name (may be empty).
     """
 
-    accession: str
+    identifier: str
     project_id: str
     title: str
     description: str
@@ -94,6 +94,9 @@ class DownloadAsset:
     checksum_name: str = "sha256"
     sample_id: str | None = None
     kind: str = "generic"
+    # TODO (Wave A2): Implement mirror_url and expected_size logic.
+    mirror_url: str | None = None
+    expected_size: int | None = None
 
 
 @dataclass(frozen=True)
@@ -171,7 +174,7 @@ def fetch_bioproject_summary(
     summary_payload = _load_json(opener, BIOPROJECT_SUMMARY_URL.format(project_id=project_id))
     record = summary_payload["result"][project_id]
     return BioProjectSummary(
-        accession=record["project_acc"],
+        identifier=record["project_acc"],
         project_id=project_id,
         title=record["project_title"],
         description=record.get("project_description", ""),
@@ -223,7 +226,7 @@ def build_feline_acquisition_manifest(
     project = fetch_bioproject_summary(project_accession, opener=opener)
     if "99 Lives" not in project.title:
         raise AcquisitionError(
-            f"BioProject {project.accession} does not look like the approved 99 Lives target: "
+            f"BioProject {project.identifier} does not look like the approved 99 Lives target: "
             f"{project.title}"
         )
 

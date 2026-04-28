@@ -48,7 +48,7 @@ def test_felid_foundation_integration_panthera_tigris():
     honouring the six-species loader contract via placeholder FASTAs for the
     non-tigris roster.
     """
-    pinned_accession = "GCF_000464555.1"
+    pinned_identifier = "GCF_000464555.1"
     pinned_assembly = "PanTig1.0"
     pinned_species_slug = "panthera_tigris"
     # TRADE-OFF: ``max_decompressed_bytes`` is a
@@ -67,7 +67,7 @@ def test_felid_foundation_integration_panthera_tigris():
         # for the other five species to keep their ``retained_sequence_count``
         # at zero without tripping ``MissingFelidReferenceError``.
         species_roster = [
-            (assembly.species, assembly.accession) for assembly in APPROVED_FELID_ASSEMBLIES
+            (assembly.species, assembly.identifier) for assembly in APPROVED_FELID_ASSEMBLIES
         ]
 
         config_path = render_example_config(
@@ -83,15 +83,15 @@ def test_felid_foundation_integration_panthera_tigris():
         reference_dir = tmp_dir / "reference"
         reference_dir.mkdir(parents=True)
 
-        padded_accessions = [
-            assembly.accession
+        padded_identifiers = [
+            assembly.identifier
             for assembly in APPROVED_FELID_ASSEMBLIES
-            if assembly.accession != pinned_accession
+            if assembly.identifier != pinned_identifier
         ]
-        write_placeholder_fastas(reference_dir, padded_accessions)
+        write_placeholder_fastas(reference_dir, padded_identifiers)
 
-        fasta_url = build_refseq_fasta_url(pinned_accession, pinned_assembly)
-        fasta_path = reference_dir / f"{pinned_accession}_{pinned_assembly}.fna.gz"
+        fasta_url = build_refseq_fasta_url(pinned_identifier, pinned_assembly)
+        fasta_path = reference_dir / f"{pinned_identifier}.fna.gz"
 
         opener = build_opener()
         request = Request(fasta_url)
@@ -108,7 +108,7 @@ def test_felid_foundation_integration_panthera_tigris():
         tigris_stats = next(
             stats for stats in result.per_species_stats if stats.species_slug == pinned_species_slug
         )
-        assert tigris_stats.accession == pinned_accession
+        assert tigris_stats.identifier == pinned_identifier
         assert tigris_stats.assembly_name == pinned_assembly
         assert tigris_stats.peak_window_count_in_memory >= 1
         assert tigris_stats.retained_sequence_count >= 1

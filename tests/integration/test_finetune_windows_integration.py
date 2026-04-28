@@ -59,7 +59,7 @@ _VCF_PATH = (
 )
 _REFERENCE_CACHE_DIR = _REPO_ROOT / "data" / "raw" / "reference"
 
-_JAGUAR_ACCESSION = "GCF_028533385.1"
+_JAGUAR_IDENTIFIER = "GCF_028533385.1"
 _JAGUAR_ASSEMBLY = "Panthera_onca_HiC"
 _TARGET_CONTIG = "HiC_scaffold_1"
 _SAMPLES_UNDER_TEST = ("LegadoSP", "bPon001")
@@ -72,14 +72,14 @@ def _jaguar_assembly_name() -> str:
     Drift between this test's pinned ``_JAGUAR_ASSEMBLY`` and
     ``APPROVED_FELID_ASSEMBLIES`` would silently produce a 404 at download
     time; this lookup surfaces that drift up front via ``pytest.fail`` with
-    the missing accession instead of letting an opaque ``StopIteration``
+    the missing identifier instead of letting an opaque ``StopIteration``
     escape the helper.
     """
     try:
-        assembly = next(a for a in APPROVED_FELID_ASSEMBLIES if a.accession == _JAGUAR_ACCESSION)
+        assembly = next(a for a in APPROVED_FELID_ASSEMBLIES if a.identifier == _JAGUAR_IDENTIFIER)
     except StopIteration:
         pytest.fail(
-            f"Accession {_JAGUAR_ACCESSION!r} not found in APPROVED_FELID_ASSEMBLIES; "
+            f"Identifier {_JAGUAR_IDENTIFIER!r} not found in APPROVED_FELID_ASSEMBLIES; "
             "the registry has drifted from this test's pinned jaguar build."
         )
     return assembly.assembly_name
@@ -97,10 +97,10 @@ def _download_jaguar_reference_if_needed() -> Path:
         f"registry assembly name {assembly_name!r} drifted from test pin {_JAGUAR_ASSEMBLY!r}"
     )
     _REFERENCE_CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    target = _REFERENCE_CACHE_DIR / f"{_JAGUAR_ACCESSION}_{_JAGUAR_ASSEMBLY}.fna.gz"
+    target = _REFERENCE_CACHE_DIR / f"{_JAGUAR_IDENTIFIER}.fna.gz"
     if target.exists() and target.stat().st_size > 0:
         return target
-    url = build_refseq_fasta_url(_JAGUAR_ACCESSION, _JAGUAR_ASSEMBLY)
+    url = build_refseq_fasta_url(_JAGUAR_IDENTIFIER, _JAGUAR_ASSEMBLY)
     partial = target.with_suffix(target.suffix + ".partial")
     opener = build_opener()
     with opener.open(Request(url), timeout=600) as response, partial.open("wb") as out:

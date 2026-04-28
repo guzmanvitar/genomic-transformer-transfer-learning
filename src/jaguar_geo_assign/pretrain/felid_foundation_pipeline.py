@@ -110,7 +110,7 @@ class FelidSpeciesPretrainStats:
     Attributes:
         species_slug: Canonical slug (e.g. ``"panthera_leo"``). Used as
             ``individual_id`` on every emitted window.
-        accession: RefSeq accession for this species' assembly.
+        identifier: RefSeq identifier for this species' assembly.
         assembly_name: RefSeq assembly name (e.g. ``"Felis_catus_9.0"``).
         contig_count: Number of FASTA contigs parsed for this species.
         retained_sequence_count: Number of ``PreparedSequence`` that
@@ -132,7 +132,7 @@ class FelidSpeciesPretrainStats:
     """
 
     species_slug: str
-    accession: str
+    identifier: str
     assembly_name: str
     contig_count: int
     retained_sequence_count: int
@@ -159,8 +159,8 @@ class FelidFoundationPretrainRunResult:
         tokenizer_identifier: HuggingFace identifier of the tokenizer
             that validated successfully against the config contract.
         tokenizer_revision: Immutable revision SHA of the loaded tokenizer.
-        species: Tuple of ``(species_slug, accession, assembly_name)`` in
-            accession-sorted order, matching the ``species`` JSON list.
+        species: Tuple of ``(species_slug, identifier, assembly_name)`` in
+            registry order, matching the ``species`` JSON list.
         per_species_stats: Per-species stats keyed by species slug (as
             an ordered mapping; emitted as the JSON ``per_species`` map).
         totals: Corpus-wide split totals with exactly ``{"train",
@@ -178,7 +178,7 @@ class FelidFoundationPretrainRunResult:
 
 
 def _resolve_fasta_path(reference_dir: Path, entry: FelidSpeciesEntry) -> Path:
-    """Derive the canonical ``<ACC>_<ASM>.fna.gz`` path for a species.
+    """Derive the canonical ``<identifier>.fna.gz`` path for a species.
 
     The per-species filename is deterministic from the registry
     so :func:`acquire_felid_foundation_assemblies` and
@@ -186,7 +186,7 @@ def _resolve_fasta_path(reference_dir: Path, entry: FelidSpeciesEntry) -> Path:
     sharing state. Keeping the derivation in a single helper means any
     future change to the filename convention is a one-line edit.
     """
-    return reference_dir / f"{entry.accession}_{entry.assembly_name}.fna.gz"
+    return reference_dir / f"{entry.identifier}.fna.gz"
 
 
 def _iter_species_sequence_records(
@@ -266,7 +266,7 @@ def _run_single_species(
     logs alone; per-filter-reason counts fire at ``DEBUG``.
 
     Args:
-        entry: Validated species entry (accession, assembly, slug).
+        entry: Validated species entry (identifier, assembly, slug).
         fasta_path: Per-species FASTA path resolved from the config.
         preprocessing_config: Shared preprocessing thresholds.
         tokenizer: Loaded tokenizer object (opaque).
@@ -286,9 +286,9 @@ def _run_single_species(
             declared by a different species earlier in the run.
     """
     _LOGGER.info(
-        "species_start species=%s accession=%s fasta=%s",
+        "species_start species=%s identifier=%s fasta=%s",
         entry.species_slug,
-        entry.accession,
+        entry.identifier,
         fasta_path,
     )
 
@@ -307,9 +307,9 @@ def _run_single_species(
         species_records.append(record)
         contig_count += 1
     _LOGGER.info(
-        "fasta_parsed species=%s accession=%s contigs=%d",
+        "fasta_parsed species=%s identifier=%s contigs=%d",
         entry.species_slug,
-        entry.accession,
+        entry.identifier,
         contig_count,
     )
 
@@ -325,9 +325,9 @@ def _run_single_species(
             count,
         )
     _LOGGER.info(
-        "sequences_prepared species=%s accession=%s retained=%d filtered=%d",
+        "sequences_prepared species=%s identifier=%s retained=%d filtered=%d",
         entry.species_slug,
-        entry.accession,
+        entry.identifier,
         len(report.retained),
         len(report.filtered),
     )
@@ -338,18 +338,18 @@ def _run_single_species(
         window_sequences(list(report.retained), preprocessing_config) if report.retained else ()
     )
     _LOGGER.info(
-        "windows_generated species=%s accession=%s windows=%d",
+        "windows_generated species=%s identifier=%s windows=%d",
         entry.species_slug,
-        entry.accession,
+        entry.identifier,
         len(windows),
     )
 
     species_windows = tokenize_windows(windows, tokenizer, provenance=provenance) if windows else ()
     species_windows = tuple(species_windows)
     _LOGGER.info(
-        "windows_tokenized species=%s accession=%s tokens=%d",
+        "windows_tokenized species=%s identifier=%s tokens=%d",
         entry.species_slug,
-        entry.accession,
+        entry.identifier,
         len(species_windows),
     )
 
@@ -362,16 +362,16 @@ def _run_single_species(
 
     peak_rss_bytes = _read_peak_rss_bytes()
     _LOGGER.info(
-        "species_end species=%s accession=%s windows=%d peak_rss_bytes=%d",
+        "species_end species=%s identifier=%s windows=%d peak_rss_bytes=%d",
         entry.species_slug,
-        entry.accession,
+        entry.identifier,
         len(species_windows),
         peak_rss_bytes,
     )
 
     return FelidSpeciesPretrainStats(
         species_slug=entry.species_slug,
-        accession=entry.accession,
+        identifier=entry.identifier,
         assembly_name=entry.assembly_name,
         contig_count=contig_count,
         retained_sequence_count=len(report.retained),
@@ -451,7 +451,7 @@ def run_felid_foundation_pretrain(
         if not fasta_path.exists() or not fasta_path.is_file():
             raise MissingFelidReferenceError(
                 f"Missing reference FASTA for {entry.species} "
-                f"({entry.accession}) at {fasta_path}. Run: "
+                f"({entry.identifier}) at {fasta_path}. Run: "
                 "uv run python -m jaguar_geo_assign.cli "
                 f"acquire-felid-foundation-assemblies {config_path}"
             )
@@ -505,14 +505,14 @@ def run_felid_foundation_pretrain(
         "species": [
             {
                 "species_slug": stats.species_slug,
-                "accession": stats.accession,
+                "identifier": stats.identifier,
                 "assembly_name": stats.assembly_name,
             }
             for stats in per_species_stats
         ],
         "per_species": {
             stats.species_slug: {
-                "accession": stats.accession,
+                "identifier": stats.identifier,
                 "assembly_name": stats.assembly_name,
                 "contig_count": stats.contig_count,
                 "retained_sequence_count": stats.retained_sequence_count,
@@ -534,7 +534,7 @@ def run_felid_foundation_pretrain(
     )
 
     species_tuple = tuple(
-        (stats.species_slug, stats.accession, stats.assembly_name) for stats in per_species_stats
+        (stats.species_slug, stats.identifier, stats.assembly_name) for stats in per_species_stats
     )
     return FelidFoundationPretrainRunResult(
         config_name=config.name,
@@ -578,7 +578,7 @@ def format_felid_foundation_pretrain_result(
     ]
     for stats in result.per_species_stats:
         lines.append(
-            f"  - {stats.species_slug} ({stats.accession} / {stats.assembly_name}): "
+            f"  - {stats.species_slug} ({stats.identifier} / {stats.assembly_name}): "
             f"contigs={stats.contig_count} retained={stats.retained_sequence_count} "
             f"windows={stats.peak_window_count_in_memory} "
             f"splits={dict(stats.window_counts_by_split)} "

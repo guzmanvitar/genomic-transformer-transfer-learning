@@ -14,6 +14,7 @@ from pathlib import Path
 import pytest
 
 from jaguar_geo_assign.config import (
+    _validate_felid_species_entries,
     load_experiment_config,
     load_felid_foundation_pipeline_config,
     load_feline_pipeline_config,
@@ -318,3 +319,17 @@ def test_load_felid_foundation_pipeline_config_accepts_real_booleans(
 
     config = load_felid_foundation_pipeline_config(rebuilt)
     assert config.windowing.drop_short_sequences is (bool_literal == "true")
+
+
+def test_validate_felid_species_entries_rejects_legacy_accession_key() -> None:
+    """The loader provides a clear migration path when encountering the old accession key."""
+    raw_species = [
+        {"species": "Felis catus", "identifier": "GCF_000181335.3"},
+        {"species": "Panthera leo", "identifier": "GCF_018350215.1"},
+        {"species": "Panthera tigris", "identifier": "GCF_000464555.1"},
+        {"species": "Puma concolor", "identifier": "GCF_003327715.1"},
+        {"species": "Panthera pardus", "identifier": "GCF_001857705.1"},
+        {"species": "Panthera onca", "accession": "GCF_028533385.1"},
+    ]
+    with pytest.raises(ValueError, match="renamed to 'identifier'"):
+        _validate_felid_species_entries(raw_species)

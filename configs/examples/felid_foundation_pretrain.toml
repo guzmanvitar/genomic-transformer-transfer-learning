@@ -13,27 +13,27 @@ report_dir = "reports/generated/felid_foundation_pretrain"
 # derives the assembly_name and species slug from the pinned registry.
 [[species]]
 species = "Felis catus"
-accession = "GCF_000181335.3"
+identifier = "GCF_000181335.3"
 
 [[species]]
 species = "Panthera tigris"
-accession = "GCF_000464555.1"
+identifier = "GCF_000464555.1"
 
 [[species]]
 species = "Panthera pardus"
-accession = "GCF_001857705.1"
+identifier = "GCF_001857705.1"
 
 [[species]]
 species = "Puma concolor"
-accession = "GCF_003327715.1"
+identifier = "GCF_003327715.1"
 
 [[species]]
 species = "Panthera leo"
-accession = "GCF_018350215.1"
+identifier = "GCF_018350215.1"
 
 [[species]]
 species = "Panthera onca"
-accession = "GCF_028533385.1"
+identifier = "GCF_028533385.1"
 
 [windowing]
 context_window = 512
