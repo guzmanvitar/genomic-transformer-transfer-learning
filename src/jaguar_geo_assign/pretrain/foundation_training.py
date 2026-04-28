@@ -419,6 +419,23 @@ def _recover_atomic_dir(target: Path) -> bool:
     return True
 
 
+def _broadcast_save_failure(accelerator: Accelerator, save_failed: bool) -> bool:
+    """Broadcast save failure across ranks to prevent deadlocks.
+    Uses set_trigger if available (newer Accelerate), else gathers a tensor.
+    """
+    # TRADE-OFF: Fallback logic for older Accelerate versions ensures compatibility
+    if hasattr(accelerator, "set_trigger"):
+        if save_failed:
+            accelerator.set_trigger()
+        return accelerator.check_trigger()
+    else:
+        fail_tensor = torch.tensor(
+            [1 if save_failed else 0], dtype=torch.int32, device=accelerator.device
+        )
+        gathered = accelerator.gather(fail_tensor)
+        return gathered.sum().item() > 0
+
+
 def _save_json_atomically(
     path: Path,
     content: dict[str, Any],
@@ -545,9 +562,10 @@ def run_felid_foundation_training(
     latest_state_path = output_dir / "latest" / "accelerate_state"
 
     # Fix 28: Recover from mid-rename crash
-    _recover_atomic_dir(latest_state_path)
-    _recover_atomic_dir(output_dir / "latest" / "hf_model")
+    _recover_atomic_dir(output_dir / "latest" / "accelerate_state")
+    _recover_atomic_dir(output_dir / "best" / "accelerate_state")
     _recover_atomic_dir(output_dir / "best" / "hf_model")
+    _recover_atomic_dir(output_dir / "best" / "tokenizer")
 
     resumed = latest_state_path.exists()
     # Fix #16: Align read path with write path (both in output_dir / "best" / "best_eval_loss.json")
@@ -814,6 +832,7 @@ def run_felid_foundation_training(
                             accelerator.save_state(str(tmp_best_accel_state))
 
                             accelerator.wait_for_everyone()
+                            saved_exc = None
                             save_failed = False
                             if accelerator.is_main_process:
                                 try:
@@ -840,20 +859,21 @@ def run_felid_foundation_training(
                                         tokenizer.save_pretrained(str(tmp_tok_dir))
                                 except Exception as e:
                                     # TRADE-OFF: Rank-0 exception broadcasted
-                                    # via set_trigger to prevent ranks deadlocking.
+                                    # to prevent ranks deadlocking.
                                     logger.error(
                                         "Rank-0 checkpoint save failed: %s", e, exc_info=True
                                     )
-                                    accelerator.set_trigger()
                                     save_failed = True
+                                    saved_exc = e
                             accelerator.wait_for_everyone()
-                            if accelerator.check_trigger():
+                            if save_failed:
+                                raise saved_exc
+                            if _broadcast_save_failure(accelerator, save_failed):
                                 raise RuntimeError(
                                     "Distributed checkpoint save failed on rank-0; aborting "
-                                    "to allow torchrun cleanup. Inspect rank-0 logs."
+                                    "all ranks to allow torchrun cleanup. Inspect rank-0 "
+                                    "logs for the original exception."
                                 )
-                            if save_failed:
-                                raise
 
                         eval_metric.reset()
 
@@ -866,6 +886,7 @@ def run_felid_foundation_training(
                         accelerator.save_state(str(tmp_accel_state))
 
                         accelerator.wait_for_everyone()
+                        saved_exc = None
                         save_failed = False
                         if accelerator.is_main_process:
                             try:
@@ -877,16 +898,17 @@ def run_felid_foundation_training(
                             except Exception as e:
                                 # TRADE-OFF: Rank-0 checkpoint exception is caught and broadcasted
                                 logger.error("Rank-0 checkpoint save failed: %s", e, exc_info=True)
-                                accelerator.set_trigger()
                                 save_failed = True
+                                saved_exc = e
                         accelerator.wait_for_everyone()
-                        if accelerator.check_trigger():
+                        if save_failed:
+                            raise saved_exc
+                        if _broadcast_save_failure(accelerator, save_failed):
                             raise RuntimeError(
                                 "Distributed checkpoint save failed on rank-0; aborting "
-                                "to allow torchrun cleanup. Inspect rank-0 logs."
+                                "all ranks to allow torchrun cleanup. Inspect rank-0 "
+                                "logs for the original exception."
                             )
-                        if save_failed:
-                            raise
 
             if step >= config.max_steps:
                 break

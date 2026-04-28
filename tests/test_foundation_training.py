@@ -1860,17 +1860,15 @@ eval_every = 1
             ) as mock_build,
             patch("accelerate.Accelerator.is_main_process", True),
             patch("accelerate.Accelerator.wait_for_everyone") as mock_wait,
-            patch("accelerate.Accelerator.set_trigger") as mock_set_trigger,
             patch("accelerate.Accelerator.check_trigger", return_value=True),
             patch("transformers.PreTrainedModel.save_pretrained", side_effect=OSError("disk full")),
         ):
             mock_build.return_value = (model, tokenizer, "none", False)
             mock_loaders.return_value = (DummyLoader(), DummyLoader())
 
-            with pytest.raises(RuntimeError, match="Distributed checkpoint save failed"):
+            with pytest.raises(OSError, match="disk full"):
                 run_felid_foundation_training(config_file, integration_test_mode="off")
 
-            mock_set_trigger.assert_called_once()
             assert mock_wait.call_count >= 2
     finally:
         AcceleratorState._reset_state()
@@ -1926,57 +1924,180 @@ def test_accelerator_honors_world_size_env_vars() -> None:
 
 
 def test_reader_full_ddp_sharding_coverage(tmp_path: Path) -> None:
-    """NEW test (Fix #33): Verify DDP sharding distributes all files evenly without duplicates."""
+    """NEW test (Fix #33, #39): Verify DDP sharding distributes files evenly without duplicates."""
+    import os
+    from dataclasses import dataclass
     from unittest.mock import patch
 
+    from accelerate.state import AcceleratorState, PartialState
+
     from jaguar_geo_assign.data.tokenized_corpus_reader import TokenizedCorpusReader
+
+    class FakeBatch:
+        def __init__(self, locus_id):
+            self.locus_id = locus_id
+
+        def to_pydict(self):
+            return {"locus_id": [[self.locus_id]]}
+
+        def __len__(self):
+            return 1
+
+    class FakeParquetFile:
+        def __init__(self, path):
+            self.locus_id = int(Path(path).stem.split("_")[1])
+
+        def iter_batches(self, batch_size):
+            yield FakeBatch(self.locus_id)
+
+    @dataclass
+    class FakeWorkerInfo:
+        id: int
+        num_workers: int
 
     configs = [(1, 1), (2, 1), (2, 2), (4, 1), (4, 2), (8, 1)]
 
     for world_size, num_workers in configs:
-        collected_files = []
-        for process_index in range(world_size):
+        collected_markers = []
+        all_worker_markers = []
+
+        for rank in range(world_size):
             for worker_id in range(num_workers):
+                env_vars = {
+                    "WORLD_SIZE": str(world_size),
+                    "RANK": str(rank),
+                    "LOCAL_RANK": str(rank),
+                    "MASTER_ADDR": "localhost",
+                    "MASTER_PORT": "29500",
+                }
 
-                def mock_get_distributed_state(
-                    pi=process_index, ws=world_size, wi=worker_id, nw=num_workers
+                with (
+                    patch.dict(os.environ, env_vars),
+                    patch(
+                        "torch.utils.data.get_worker_info",
+                        return_value=FakeWorkerInfo(id=worker_id, num_workers=num_workers),
+                    ),
+                    patch("pyarrow.parquet.ParquetFile", FakeParquetFile),
+                    patch.object(TokenizedCorpusReader, "_validate_metadata_and_schema"),
                 ):
-                    return pi, ws, wi, nw
+                    AcceleratorState._reset_state()
+                    PartialState._reset_state()
 
-                with patch(
-                    "jaguar_geo_assign.data.tokenized_corpus_reader._get_distributed_state",
-                    mock_get_distributed_state,
-                ):
-                    # Mock _validate_metadata_and_schema to populate 16 dummy files
-                    with patch.object(TokenizedCorpusReader, "_validate_metadata_and_schema"):
-                        reader = TokenizedCorpusReader(
-                            "dummy.json",
-                            "train",
-                            file_shuffle=False,
-                            world_size=world_size,
-                            num_workers=num_workers,
-                        )
-                        reader._files = [Path(f"file_{i}.parquet") for i in range(16)]
-                        reader._record_count = 16
+                    reader = TokenizedCorpusReader(
+                        "dummy.json",
+                        "train",
+                        file_shuffle=False,
+                        world_size=world_size,
+                        num_workers=num_workers,
+                    )
+                    reader._files = [Path(f"file_{i}.parquet") for i in range(16)]
+                    reader._record_count = 16
 
-                        # Just get the assigned files list
-                        global_worker_id = process_index * num_workers + worker_id
-                        global_world_size = world_size * num_workers
+                    # Extract the unique marker from each yielded record
+                    records = list(reader)
+                    markers = [rec["locus_id"][0] for rec in records]
+                    collected_markers.extend(markers)
+                    all_worker_markers.append(set(markers))
 
-                        files = list(reader._files)
-                        assigned_files = [
-                            f
-                            for i, f in enumerate(files)
-                            if i % global_world_size == global_worker_id
-                        ]
-
-                        collected_files.append(len(assigned_files))
-
-        # Total files should be exactly 16
-        assert sum(collected_files) == 16, (
-            f"Expected 16 files, got {sum(collected_files)} for {world_size}x{num_workers}"
+        # Union across all (rank, worker_id) pairs == full set of 16 markers
+        assert set(collected_markers) == set(range(16)), (
+            f"Missing files for {world_size}x{num_workers}"
         )
-        # Diff between max and min should be <= 1
-        assert max(collected_files) - min(collected_files) <= 1, (
+
+        # Pairwise intersections empty (total collected == sum of unique per worker)
+        assert len(collected_markers) == sum(len(s) for s in all_worker_markers), (
+            "Duplicate files found"
+        )
+
+        # Balance: max(len) - min(len) <= 1
+        lengths = [len(s) for s in all_worker_markers]
+        assert max(lengths) - min(lengths) <= 1, (
             f"Unbalanced distribution for {world_size}x{num_workers}"
         )
+
+
+def test_mid_rename_crash_recovery_all_dirs(tmp_path: Path) -> None:
+    """NEW test (Fix #37): Verify that all 4 critical directories are recovered on startup."""
+    from unittest.mock import patch
+
+    from accelerate.state import AcceleratorState
+    from transformers import AutoModelForMaskedLM, BertConfig
+
+    from jaguar_geo_assign.pretrain.foundation_training import run_felid_foundation_training
+
+    AcceleratorState._reset_state()
+
+    metadata_path = _write_tiny_corpus(tmp_path, {"train": 1})
+    out_dir = tmp_path / "out"
+
+    # Create the old directories mimicking a mid-rename crash
+    latest_state = out_dir / "latest" / "accelerate_state"
+    best_state = out_dir / "best" / "accelerate_state"
+    best_model = out_dir / "best" / "hf_model"
+    best_tok = out_dir / "best" / "tokenizer"
+
+    for p in [latest_state, best_state, best_model, best_tok]:
+        p.parent.mkdir(parents=True, exist_ok=True)
+        # Create a mock .old_ directory
+        old_dir = p.parent / f".old_{p.name}_123"
+        old_dir.mkdir()
+        (old_dir / "marker.txt").touch()
+
+    config_file = tmp_path / "train_config.toml"
+    config_file.write_text(f"""
+[training]
+corpus_metadata_path = "{metadata_path}"
+model_identifier = "zhihan1996/DNABERT-2-117M"
+model_revision = "main"
+output_dir = "{out_dir}"
+max_steps = 1
+learning_rate = 1e-4
+seed = 42
+per_device_train_batch_size = 1
+per_device_eval_batch_size = 1
+gradient_accumulation_steps = 1
+log_every = 1
+eval_every = 1
+""")
+
+    with (
+        patch("jaguar_geo_assign.pretrain.foundation_training._build_dataloaders") as mock_loaders,
+        patch(
+            "jaguar_geo_assign.pretrain.foundation_training._build_model_and_tokenizer"
+        ) as mock_build,
+    ):
+        config = BertConfig(
+            num_hidden_layers=1, num_attention_heads=2, hidden_size=32, vocab_size=30522
+        )
+        model = AutoModelForMaskedLM.from_config(config)
+        tokenizer = FakeTokenizer()
+        mock_build.return_value = (model, tokenizer, "none", False)
+
+        class DummyDataset:
+            record_count = 1
+
+            def set_epoch(self, epoch):
+                pass
+
+        class DummyLoader:
+            dataset = DummyDataset()
+
+            def __iter__(self):
+                return iter([])
+
+            def __len__(self):
+                return 1
+
+        mock_loaders.return_value = (DummyLoader(), DummyLoader())
+
+        try:
+            # We wrap it in a try-except or just let it run. It will recover the dirs first thing
+            run_felid_foundation_training(config_file, integration_test_mode="off")
+        except Exception:
+            pass
+
+    # Assert that the recovery moved .old_ to the target
+    for p in [latest_state, best_state, best_model, best_tok]:
+        assert p.exists(), f"Recovered directory {p} does not exist"
+        assert (p / "marker.txt").exists(), f"Marker file missing in {p}"
+        assert not list(p.parent.glob(f".old_{p.name}_*")), f".old_ dir not cleaned up for {p}"
