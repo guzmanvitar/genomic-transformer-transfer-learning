@@ -31,7 +31,7 @@ EXAMPLE_FELID_FOUNDATION_CONFIG_PATH = (
 )
 
 
-# All six approved felid species in (species, accession) form, kept here so
+# All six approved felid species in (species, identifier) form, kept here so
 # both the unit-test suite and the integration test derive their fixture
 # roster from a single source of truth. Mirrors the order published by
 # :data:`jaguar_geo_assign.data.felid_assemblies.APPROVED_FELID_ASSEMBLIES`.
@@ -39,7 +39,7 @@ ALL_APPROVED_FELIDS: tuple[tuple[str, str], ...] = (
     ("Felis catus", "GCF_000181335.3"),
     ("Panthera leo", "GCF_018350215.1"),
     ("Panthera tigris", "GCF_000464555.1"),
-    ("Panthera onca", "GCF_028533385.1"),
+    ("Panthera onca", "DNAZOO_Panthera_onca_HiC"),
     ("Puma concolor", "GCF_003327715.1"),
     ("Panthera pardus", "GCF_001857705.1"),
 )
@@ -60,10 +60,10 @@ def build_fixture_fasta(contigs: dict[str, str]) -> bytes:
     return gzip.compress(fasta_text.encode("ascii"))
 
 
-def placeholder_fasta_filename(accession: str) -> str:
-    """Return the fixture FASTA filename for *accession*.
+def placeholder_fasta_filename(identifier: str) -> str:
+    """Return the fixture FASTA filename for *identifier*.
 
-    Mirrors the ``<ACC>_<ASM>.fna.gz`` filename convention enforced
+    Mirrors the ``<identifier>.fna.gz`` filename convention enforced
     by :func:`build_felid_reference_manifest`. Padded species need a real
     on-disk fixture FASTA so tests reach the logic under test instead of
     failing with :class:`MissingFelidReferenceError` on a padded entry.
@@ -71,30 +71,51 @@ def placeholder_fasta_filename(accession: str) -> str:
     from jaguar_geo_assign.data.felid_assemblies import APPROVED_FELID_ASSEMBLIES
 
     for assembly in APPROVED_FELID_ASSEMBLIES:
-        if assembly.accession == accession:
-            return f"{accession}_{assembly.assembly_name}.fna.gz"
-    raise AssertionError(f"Unknown accession in fixture: {accession}")
+        if assembly.identifier == identifier:
+            return f"{identifier}.fna.gz"
+    raise AssertionError(f"Unknown identifier in fixture: {identifier}")
 
 
-def write_placeholder_fastas(reference_dir: Path, padded_accessions: list[str]) -> None:
+def write_placeholder_fastas(reference_dir: Path, padded_identifiers: list[str]) -> None:
     """Write a minimal unique FASTA for each padded species.
 
-    Placeholder FASTAs use the accession as the contig ID so they
+    Placeholder FASTAs use the identifier as the contig ID so they
     cannot collide with user-authored fixture contigs. The 128 bp sequence
     is short enough that windowing yields zero windows, keeping padded
     species invisible to window-count assertions.
     """
     reference_dir.mkdir(parents=True, exist_ok=True)
-    for accession in padded_accessions:
-        path = reference_dir / placeholder_fasta_filename(accession)
+    for identifier in padded_identifiers:
+        path = reference_dir / placeholder_fasta_filename(identifier)
         if path.exists():
             continue
-        path.write_bytes(build_fixture_fasta({accession: "A" * 128}))
+        if "Panthera_onca" in identifier:
+            contigs = {identifier: "A" * 128, "HiC_scaffold_1": "A" * 128}
+        else:
+            contigs = {identifier: "A" * 128}
+        path.write_bytes(build_fixture_fasta(contigs))
 
 
-def placeholder_fasta_md5(accession: str) -> str:
-    """Return the MD5 of the placeholder FASTA written by :func:`write_placeholder_fastas`."""
-    return hashlib.md5(build_fixture_fasta({accession: "A" * 128})).hexdigest()
+def placeholder_fasta_checksum(identifier: str) -> str:
+    """Return the checksum of the placeholder FASTA written by :func:`write_placeholder_fastas`.
+
+    The algorithm matches the assembly's declared ``checksum_name``.
+    """
+    from jaguar_geo_assign.data.felid_assemblies import APPROVED_FELID_ASSEMBLIES
+
+    assembly = next(a for a in APPROVED_FELID_ASSEMBLIES if a.identifier == identifier)
+    if "Panthera_onca" in identifier:
+        contigs = {identifier: "A" * 128, "HiC_scaffold_1": "A" * 128}
+    else:
+        contigs = {identifier: "A" * 128}
+
+    fasta_bytes = build_fixture_fasta(contigs)
+    if assembly.checksum_name == "sha256":
+        return hashlib.sha256(fasta_bytes).hexdigest()
+    elif assembly.checksum_name == "md5":
+        return hashlib.md5(fasta_bytes).hexdigest()
+    else:
+        raise ValueError(f"Unknown checksum algorithm {assembly.checksum_name!r}")
 
 
 def pad_species_to_full_roster(
@@ -141,7 +162,7 @@ def render_example_config(
             ``None``, every entry in ``[paths]`` is rewritten to point
             under ``tmp_path``.
         species: Optional replacement for the ``[[species]]`` list as
-            a list of ``(species, accession)`` tuples. When ``None``
+            a list of ``(species, identifier)`` tuples. When ``None``
             the canonical six-entry roster is retained.
         runtime_external_tools: Optional replacement for
             ``runtime.external_tools``. Unit tests typically pass
@@ -171,7 +192,9 @@ def render_example_config(
         config["paths"][key] = str(value)
 
     if species is not None:
-        config["species"] = [{"species": sp, "accession": acc} for sp, acc in species]
+        config["species"] = [
+            {"species": sp, "identifier": identifier} for sp, identifier in species
+        ]
 
     if runtime_external_tools is not None:
         config["runtime"]["external_tools"] = list(runtime_external_tools)

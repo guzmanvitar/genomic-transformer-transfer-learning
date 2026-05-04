@@ -31,7 +31,7 @@ from jaguar_geo_assign.pretrain._shared import normalize_ru_maxrss_to_bytes
 from tests._felid_fixture import build_fixture_fasta as _build_fixture_fasta
 from tests._felid_fixture import load_example_config_dict, render_example_config
 from tests._felid_fixture import pad_species_to_full_roster as _pad_to_six_species
-from tests._felid_fixture import placeholder_fasta_md5 as _placeholder_fasta_md5
+from tests._felid_fixture import placeholder_fasta_checksum as _placeholder_fasta_checksum
 from tests._felid_fixture import write_placeholder_fastas as _write_placeholder_fastas
 
 
@@ -64,7 +64,7 @@ def test_normalize_ru_maxrss_unknown_platform():
 
 # Fixture helpers (``_build_fixture_fasta``, ``_ALL_APPROVED_FELIDS``,
 # ``_pad_to_six_species``, ``_placeholder_fasta_filename``,
-# ``_placeholder_fasta_md5``, ``_write_placeholder_fastas``) are imported
+# ``_placeholder_fasta_checksum``, ``_write_placeholder_fastas``) are imported
 # from :mod:`tests._felid_fixture` to keep the integration test and this
 # unit-test module on a single source of truth (no copy-paste).
 
@@ -78,22 +78,26 @@ def _build_full_mock_manifest(
 
     Padded-species checksums default to the placeholder FASTA MD5 so
     those entries skip naturally; pass ``overrides`` to inject a
-    test-specific checksum for a particular accession.
+    test-specific checksum for a particular identifier.
     """
     from jaguar_geo_assign.data.felid_assemblies import APPROVED_FELID_ASSEMBLIES
 
     overrides = overrides or {}
     assets: list[DownloadAsset] = []
     for assembly in APPROVED_FELID_ASSEMBLIES:
-        filename = f"{assembly.accession}_{assembly.assembly_name}.fna.gz"
-        checksum = overrides.get(assembly.accession, _placeholder_fasta_md5(assembly.accession))
+        filename = f"{assembly.identifier}.fna.gz"
+        checksum = overrides.get(
+            assembly.identifier, _placeholder_fasta_checksum(assembly.identifier)
+        )
         assets.append(
             DownloadAsset(
                 url=f"http://fake.ncbi.nlm.nih.gov/{filename}",
                 destination=reference_dir / filename,
                 checksum=checksum,
-                checksum_name="md5",
+                checksum_name=assembly.checksum_name,
                 kind="reference",
+                mirror_url=assembly.mirror_url,
+                expected_size=assembly.expected_size,
             )
         )
     return assets
@@ -120,7 +124,7 @@ def _build_fixture_config(
 
     Args:
         tmp_path: Pytest tmp_path fixture.
-        species_subset: List of (species, accession) tuples to include.
+        species_subset: List of (species, identifier) tuples to include.
         pad: When True (default), pad ``species_subset`` with remaining
             approved felids so the config has six entries (the contract).
             Pass ``False`` for tests that exercise the "too-few" validation.
@@ -139,8 +143,10 @@ def _build_fixture_config(
     """
     final_species = _pad_to_six_species(species_subset) if pad else list(species_subset)
     if write_placeholder_fastas and pad:
-        explicit_accessions = {acc for _, acc in species_subset}
-        padded_only = [acc for _, acc in final_species if acc not in explicit_accessions]
+        explicit_identifiers = {identifier for _, identifier in species_subset}
+        padded_only = [
+            identifier for _, identifier in final_species if identifier not in explicit_identifiers
+        ]
         _write_placeholder_fastas(tmp_path / "reference", padded_only)
     overrides: dict[str, object] = {
         "windowing.context_window": 510,
@@ -191,8 +197,8 @@ def test_example_config_is_loader_valid():
     assert len(config.species) == 6
 
 
-def test_config_loader_rejects_unknown_accession(tmp_path):
-    """Config loader rejects an accession not in APPROVED_FELID_ACCESSIONS."""
+def test_config_loader_rejects_unknown_identifier(tmp_path):
+    """Config loader rejects an identifier not in APPROVED_FELID_IDENTIFIERS."""
     config_path = _build_fixture_config(
         tmp_path,
         [
@@ -200,12 +206,12 @@ def test_config_loader_rejects_unknown_accession(tmp_path):
             ("Unknown species", "GCF_999999999.9"),
         ],
     )
-    with pytest.raises(ValueError, match="not an approved felid accession"):
+    with pytest.raises(ValueError, match="not an approved felid identifier"):
         load_felid_foundation_pipeline_config(config_path)
 
 
-def test_config_loader_rejects_duplicate_accession(tmp_path):
-    """Config loader rejects duplicate accessions."""
+def test_config_loader_rejects_duplicate_identifier(tmp_path):
+    """Config loader rejects duplicate identifiers."""
     config_path = _build_fixture_config(
         tmp_path,
         [
@@ -213,7 +219,7 @@ def test_config_loader_rejects_duplicate_accession(tmp_path):
             ("Felis catus", "GCF_000181335.3"),
         ],
     )
-    with pytest.raises(ValueError, match="duplicate accession"):
+    with pytest.raises(ValueError, match="duplicate identifier"):
         load_felid_foundation_pipeline_config(config_path)
 
 
@@ -256,7 +262,7 @@ def test_run_pretrain_source_is_reference(tmp_path):
     )
     reference_dir = tmp_path / "reference"
     reference_dir.mkdir(exist_ok=True)
-    fasta_path = reference_dir / "GCF_000181335.3_Felis_catus_9.0.fna.gz"
+    fasta_path = reference_dir / "GCF_000181335.3.fna.gz"
     fasta_path.write_bytes(
         _build_fixture_fasta(
             {
@@ -306,7 +312,7 @@ def test_run_pretrain_individual_id_is_species_slug(tmp_path):
     )
     reference_dir = tmp_path / "reference"
     reference_dir.mkdir(exist_ok=True)
-    fasta_path = reference_dir / "GCF_018350215.1_P.leo_Ple1_pat1.1.fna.gz"
+    fasta_path = reference_dir / "GCF_018350215.1.fna.gz"
     fasta_path.write_bytes(
         _build_fixture_fasta(
             {
@@ -360,10 +366,10 @@ def test_run_pretrain_contig_collision_raises(tmp_path):
 
     # Both FASTAs declare the same contig ID
     shared_contig = "chr1"
-    (reference_dir / "GCF_000181335.3_Felis_catus_9.0.fna.gz").write_bytes(
+    (reference_dir / "GCF_000181335.3.fna.gz").write_bytes(
         _build_fixture_fasta({shared_contig: "A" * 1000})
     )
-    (reference_dir / "GCF_018350215.1_P.leo_Ple1_pat1.1.fna.gz").write_bytes(
+    (reference_dir / "GCF_018350215.1.fna.gz").write_bytes(
         _build_fixture_fasta({shared_contig: "C" * 1000})
     )
 
@@ -409,7 +415,7 @@ def test_pipeline_zero_windows_leaves_no_artifacts(tmp_path):
     )
     reference_dir = tmp_path / "reference"
     reference_dir.mkdir(exist_ok=True)
-    (reference_dir / "GCF_000181335.3_Felis_catus_9.0.fna.gz").write_bytes(
+    (reference_dir / "GCF_000181335.3.fna.gz").write_bytes(
         _build_fixture_fasta({"NC_short": "A" * 100})
     )
 
@@ -444,10 +450,10 @@ def test_run_pretrain_streaming_memory_model(tmp_path):
     )
     reference_dir = tmp_path / "reference"
     reference_dir.mkdir(exist_ok=True)
-    (reference_dir / "GCF_000181335.3_Felis_catus_9.0.fna.gz").write_bytes(
+    (reference_dir / "GCF_000181335.3.fna.gz").write_bytes(
         _build_fixture_fasta({"NC_A": "A" * 1000})
     )
-    (reference_dir / "GCF_018350215.1_P.leo_Ple1_pat1.1.fna.gz").write_bytes(
+    (reference_dir / "GCF_018350215.1.fna.gz").write_bytes(
         _build_fixture_fasta({"NC_B": "C" * 1000})
     )
 
@@ -500,7 +506,7 @@ def test_run_summary_schema_exact_keys(tmp_path):
     )
     reference_dir = tmp_path / "reference"
     reference_dir.mkdir(exist_ok=True)
-    (reference_dir / "GCF_000181335.3_Felis_catus_9.0.fna.gz").write_bytes(
+    (reference_dir / "GCF_000181335.3.fna.gz").write_bytes(
         _build_fixture_fasta({"NC_test": "A" * 1000})
     )
 
@@ -540,7 +546,7 @@ def test_run_summary_schema_exact_keys(tmp_path):
     # per_species entry keys
     for _species_slug, species_data in summary["per_species"].items():
         assert set(species_data.keys()) == {
-            "accession",
+            "identifier",
             "assembly_name",
             "contig_count",
             "retained_sequence_count",
@@ -569,7 +575,7 @@ def test_ambiguity_threshold_boundary_retained(tmp_path):
 
     # Create a sequence with exactly 50% ambiguity (255 Ns out of 510)
     sequence = "A" * 255 + "N" * 255
-    (reference_dir / "GCF_000181335.3_Felis_catus_9.0.fna.gz").write_bytes(
+    (reference_dir / "GCF_000181335.3.fna.gz").write_bytes(
         _build_fixture_fasta({"NC_boundary": sequence})
     )
 
@@ -618,9 +624,9 @@ def test_acquisition_happy_path_skip(tmp_path):
     # species already have placeholder FASTAs written by the fixture.
     from jaguar_geo_assign.data.felid_assemblies import APPROVED_FELID_ASSEMBLIES
 
-    felis_assembly = next(a for a in APPROVED_FELID_ASSEMBLIES if a.accession == "GCF_000181335.3")
+    felis_assembly = next(a for a in APPROVED_FELID_ASSEMBLIES if a.identifier == "GCF_000181335.3")
     fasta_content = _build_fixture_fasta({"NC_test": "A" * 100})
-    fasta_path = reference_dir / f"{felis_assembly.accession}_{felis_assembly.assembly_name}.fna.gz"
+    fasta_path = reference_dir / f"{felis_assembly.identifier}.fna.gz"
     fasta_path.write_bytes(fasta_content)
     computed_md5 = hashlib.md5(fasta_content).hexdigest()
 
@@ -659,8 +665,8 @@ def test_acquisition_checksum_mismatch_redownload(tmp_path):
 
     from jaguar_geo_assign.data.felid_assemblies import APPROVED_FELID_ASSEMBLIES
 
-    felis_assembly = next(a for a in APPROVED_FELID_ASSEMBLIES if a.accession == "GCF_000181335.3")
-    fasta_path = reference_dir / f"{felis_assembly.accession}_{felis_assembly.assembly_name}.fna.gz"
+    felis_assembly = next(a for a in APPROVED_FELID_ASSEMBLIES if a.identifier == "GCF_000181335.3")
+    fasta_path = reference_dir / f"{felis_assembly.identifier}.fna.gz"
 
     # Pre-place a file with the WRONG MD5
     wrong_content = b"wrong content"
@@ -717,10 +723,8 @@ def test_acquisition_failure_preserves_root_cause(tmp_path):
 
     from jaguar_geo_assign.data.felid_assemblies import APPROVED_FELID_ASSEMBLIES
 
-    felis_assembly = next(a for a in APPROVED_FELID_ASSEMBLIES if a.accession == "GCF_000181335.3")
-    _fasta_path = (
-        reference_dir / f"{felis_assembly.accession}_{felis_assembly.assembly_name}.fna.gz"
-    )
+    felis_assembly = next(a for a in APPROVED_FELID_ASSEMBLIES if a.identifier == "GCF_000181335.3")
+    _fasta_path = reference_dir / f"{felis_assembly.identifier}.fna.gz"
 
     from unittest.mock import patch
 
@@ -757,3 +761,63 @@ def test_acquisition_failure_preserves_root_cause(tmp_path):
             assert "ConnectionResetError" in error_message
             assert "kaboom" in error_message
             assert "GCF_000181335.3" in error_message
+
+
+def test_acquisition_forwards_mirror_and_size(tmp_path: Path) -> None:
+    """rebases paths but forwards mirror_url and expected_size."""
+    config_path = _build_fixture_config(
+        tmp_path,
+        [("Panthera onca", "DNAZOO_Panthera_onca_HiC")],
+    )
+    config = load_felid_foundation_pipeline_config(config_path)
+    reference_dir = tmp_path / "reference"
+
+    def fake_opener():
+        pass
+
+    from unittest.mock import patch
+
+    with patch(
+        "jaguar_geo_assign.data.felid_acquisition.build_felid_reference_manifest"
+    ) as mock_manifest:
+        # Mock manifest sets mirror_url and expected_size for jaguar.
+        mock_manifest.return_value = _build_full_mock_manifest(
+            reference_dir,
+            overrides={"DNAZOO_Panthera_onca_HiC": "mocked_checksum"},
+        )
+
+        with patch("jaguar_geo_assign.data.felid_acquisition.download_with_retry") as mock_download:
+            # We mock download_with_retry so it succeeds
+            def fake_download(asset, *args, **kwargs):
+                asset.destination.write_bytes(b"content")
+                return DownloadResult(
+                    path=asset.destination,
+                    attempts=1,
+                    resumed=False,
+                    skipped_existing=False,
+                    bytes_written=7,
+                )
+
+            mock_download.side_effect = fake_download
+
+            acquire_felid_foundation_assemblies(config, opener=fake_opener)
+
+            # Assert that download_with_retry was called with the jaguar asset containing
+            # mirror_url and expected_size
+            jaguar_call = None
+            for call in mock_download.call_args_list:
+                asset = call.args[0]
+                if asset.destination.name.startswith("DNAZOO_Panthera_onca_HiC"):
+                    jaguar_call = asset
+                    break
+
+            assert jaguar_call is not None, "Jaguar asset was not downloaded"
+            assert "huggingface.co" in (jaguar_call.mirror_url or ""), "mirror_url was dropped"
+            assert jaguar_call.expected_size == 745951926, "expected_size was dropped"
+
+
+def test_build_full_mock_manifest_jaguar_checksum_name():
+    """Mock manifest for jaguar has checksum_name='sha256'."""
+    manifest = _build_full_mock_manifest(Path("/fake"))
+    jaguar_asset = next(a for a in manifest if "Panthera_onca" in a.destination.name)
+    assert jaguar_asset.checksum_name == "sha256"

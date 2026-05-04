@@ -34,6 +34,7 @@ from .consensus import (
     _open_maybe_gzip,
     _raise_malformed_vcf_record,
     _validated_gt_tokens,
+    canonicalize_reference_evidence,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -42,13 +43,20 @@ WINDOW_SIZE = 512
 UPSTREAM_BASES = 256
 DOWNSTREAM_BASES = 255
 
-EXPECTED_REFERENCE_TOKENS = ("GCF_028533385.1", "Panthera_onca_HiC")
-"""Default canonical build tokens for the jaguar fine-tuning reference.
+POSITIVE_REFERENCE_TOKENS = ("HiC_scaffold_1", "Panthera_onca_HiC")
+"""Canonical build tokens for the DNA Zoo jaguar fine-tuning reference.
 
-The fine-tuning VCF is called against the jaguar assembly, so the default
-differs from ``consensus.py``'s felid-foundation tokens. Callers operating on
-a different reference (e.g. unit-test fixtures or a re-call against a future
-assembly) must override via the ``expected_reference_tokens`` kwarg.
+The fine-tuning VCF was generated using the DNA Zoo submission, which retains
+the original contig names (unlike NCBI's RefSeq curation which renamed them).
+All of these tokens must be present in the loaded FASTA headers/filename.
+"""
+
+NEGATIVE_REFERENCE_TOKENS = ("NC_083295.1", "GCF_028533385.1")
+"""NCBI-specific tokens that indicate a RefSeq/GenBank reference distribution.
+
+If any of these tokens appear in the FASTA, we raise immediately; they indicate
+the user downloaded an NCBI curated repackaging which altered contig names
+and will break the VCF's positional coordinate mapping.
 """
 
 ALLOWED_NUCLEOTIDES = frozenset("ACGTN")
@@ -68,7 +76,7 @@ class ReferenceBaseMismatchError(AcquisitionError):
     1-based ``locus_pos`` does not match (case-insensitive) the ``REF``
     column of the VCF record. This typically indicates that the FASTA and
     VCF were derived from different assemblies even when build-token
-    validation passes (e.g. same accession, different patch level).
+    validation passes (e.g. same identifier, different patch level).
     """
 
 
@@ -153,11 +161,15 @@ class ReferenceIndex:
         contig_headers: Mapping of contig name → full FASTA header line
             (without the leading ``>``). Used by the build-token check
             and surfaced in error messages.
+        validated_alphabet: Whether the per-contig sequences have been scanned
+            for invalid IUPAC/non-ACGTN characters (always True if constructed
+            via :func:`load_reference_index`).
     """
 
     fasta_path: Path
     contig_sequences: Mapping[str, str]
     contig_headers: Mapping[str, str]
+    validated_alphabet: bool = True
 
 
 def extract_fasta_window(
@@ -249,10 +261,41 @@ def _read_fasta_sequences(path: Path) -> tuple[dict[str, str], dict[str, str]]:
     return {name: "".join(parts) for name, parts in sequences.items()}, headers
 
 
+def _validate_finetune_reference_evidence(
+    evidence: str,
+    *,
+    positive_tokens: Sequence[str] = POSITIVE_REFERENCE_TOKENS,
+    negative_tokens: Sequence[str] = NEGATIVE_REFERENCE_TOKENS,
+) -> None:
+    """Validate that the reference evidence satisfies fine-tuning constraints."""
+    if not _matches_expected_reference_build(evidence, positive_tokens):
+        missing = [
+            t
+            for t in positive_tokens
+            if canonicalize_reference_evidence(t) not in canonicalize_reference_evidence(evidence)
+        ]
+        canon = canonicalize_reference_evidence(evidence)
+        trunc = canon[:200] + "..." if len(canon) > 200 else canon
+        raise ReferenceMismatchError(
+            f"Reference evidence missing expected positive tokens {missing}. "
+            f"Canonicalized evidence (truncated): {trunc}"
+        )
+
+    canonical_evidence = canonicalize_reference_evidence(evidence)
+    for token in negative_tokens:
+        canon_token = canonicalize_reference_evidence(token)
+        if canon_token in canonical_evidence:
+            raise ReferenceMismatchError(
+                f"Negative reference token {token!r} found in evidence. "
+                f"This token is forbidden in the fine-tuning pipeline."
+            )
+
+
 def load_reference_index(
     reference_fasta: str | Path,
     *,
-    expected_reference_tokens: Sequence[str] = EXPECTED_REFERENCE_TOKENS,
+    positive_reference_tokens: Sequence[str] = POSITIVE_REFERENCE_TOKENS,
+    negative_reference_tokens: Sequence[str] = NEGATIVE_REFERENCE_TOKENS,
 ) -> ReferenceIndex:
     """Load and validate a reference FASTA exactly once for many-sample reuse.
 
@@ -265,30 +308,44 @@ def load_reference_index(
 
     Args:
         reference_fasta: Path to the reference FASTA (plain or gzipped).
-        expected_reference_tokens: Canonical build tokens that must
+        positive_reference_tokens: Canonical build tokens that must
             appear in either the filename or any header line.
+        negative_reference_tokens: Tokens that must NOT appear.
 
     Returns:
         A :class:`ReferenceIndex` ready for streaming window extraction.
 
     Raises:
         ReferenceMismatchError: If the FASTA filename + header evidence
-            does not jointly match every expected build token.
+            violates the positive/negative token constraints.
         AcquisitionError: Propagated from :func:`_read_fasta_sequences`
             if the FASTA contains no contig headers.
+        InvalidAlleleAlphabetError: If any contig contains characters outside
+            the allowed nucleotide alphabet.
     """
     fasta_path = Path(reference_fasta)
     contig_sequences, contig_headers = _read_fasta_sequences(fasta_path)
     reference_evidence = " ".join((fasta_path.name, *contig_headers.values()))
-    if not _matches_expected_reference_build(reference_evidence, expected_reference_tokens):
-        raise ReferenceMismatchError(
-            f"Reference FASTA {fasta_path} does not canonically match expected build evidence "
-            f"{tuple(expected_reference_tokens)}"
-        )
+
+    _validate_finetune_reference_evidence(
+        reference_evidence,
+        positive_tokens=positive_reference_tokens,
+        negative_tokens=negative_reference_tokens,
+    )
+
+    for contig_name, sequence in contig_sequences.items():
+        offending = set(sequence.upper()) - ALLOWED_NUCLEOTIDES
+        if offending:
+            raise InvalidAlleleAlphabetError(
+                f"Contig {contig_name!r} contains invalid characters {sorted(offending)} "
+                f"in FASTA {fasta_path}. Allowed alphabet is {sorted(ALLOWED_NUCLEOTIDES)}."
+            )
+
     return ReferenceIndex(
         fasta_path=fasta_path,
         contig_sequences=contig_sequences,
         contig_headers=contig_headers,
+        validated_alphabet=True,
     )
 
 
@@ -379,7 +436,8 @@ def iter_locus_windows_from_vcf(
     sample_id: str,
     sample_vcf: str | Path,
     reference: ReferenceIndex,
-    expected_reference_tokens: Sequence[str] = EXPECTED_REFERENCE_TOKENS,
+    positive_reference_tokens: Sequence[str] = POSITIVE_REFERENCE_TOKENS,
+    negative_reference_tokens: Sequence[str] = NEGATIVE_REFERENCE_TOKENS,
 ) -> Iterator[FinetuneWindow]:
     """Stream windows for one sample without materialising the full list.
 
@@ -420,9 +478,11 @@ def iter_locus_windows_from_vcf(
         sample_vcf: Path to the input VCF (plain or gzipped).
         reference: Pre-loaded :class:`ReferenceIndex` (call
             :func:`load_reference_index` once, reuse across samples).
-        expected_reference_tokens: Build tokens enforced on the VCF
+        positive_reference_tokens: Build tokens enforced on the VCF
             ``##reference`` header (must match those used to load the
             reference index).
+        negative_reference_tokens: Build tokens that must NOT appear in the
+            VCF ``##reference`` header.
 
     Yields:
         :class:`FinetuneWindow` instances in VCF record order, with
@@ -451,12 +511,17 @@ def iter_locus_windows_from_vcf(
                         f"VCF {vcf_path} is missing explicit reference/build metadata "
                         "in a ##reference header"
                     )
-                if not _matches_expected_reference_build(vcf_reference, expected_reference_tokens):
+                try:
+                    _validate_finetune_reference_evidence(
+                        vcf_reference,
+                        positive_tokens=positive_reference_tokens,
+                        negative_tokens=negative_reference_tokens,
+                    )
+                except ReferenceMismatchError as e:
                     raise ReferenceMismatchError(
                         f"VCF {vcf_path} declares reference '{vcf_reference}', "
-                        "which does not canonically match expected build evidence "
-                        f"{tuple(expected_reference_tokens)}"
-                    )
+                        f"which failed build evidence validation: {e}"
+                    ) from e
                 if header_contigs and not header_contigs.issubset(fasta_contigs):
                     missing_contigs = sorted(header_contigs.difference(fasta_contigs))
                     raise ContigMismatchError(
@@ -649,7 +714,8 @@ def extract_locus_windows_from_vcf(
     sample_vcf: str | Path,
     contig_sequences: Mapping[str, str],
     reference_path: str | Path | None = None,
-    expected_reference_tokens: Sequence[str] = EXPECTED_REFERENCE_TOKENS,
+    positive_reference_tokens: Sequence[str] = POSITIVE_REFERENCE_TOKENS,
+    negative_reference_tokens: Sequence[str] = NEGATIVE_REFERENCE_TOKENS,
 ) -> list[FinetuneWindow]:
     """Materialise all windows for one sample as a list (test-scale convenience).
 
@@ -665,8 +731,10 @@ def extract_locus_windows_from_vcf(
         contig_sequences: Pre-loaded contig name to sequence mapping.
         reference_path: Optional path used in error messages; defaults
             to ``"<in-memory>"`` when sequences are synthesised.
-        expected_reference_tokens: Build tokens enforced on the VCF
+        positive_reference_tokens: Build tokens enforced on the VCF
             ``##reference`` header.
+        negative_reference_tokens: Build tokens that must NOT appear in the
+            VCF ``##reference`` header.
 
     Returns:
         Windows in VCF record order; heterozygote pairs are consecutive.
@@ -682,7 +750,8 @@ def extract_locus_windows_from_vcf(
             sample_id=sample_id,
             sample_vcf=sample_vcf,
             reference=reference,
-            expected_reference_tokens=expected_reference_tokens,
+            positive_reference_tokens=positive_reference_tokens,
+            negative_reference_tokens=negative_reference_tokens,
         )
     )
 
@@ -693,7 +762,8 @@ def extract_fasta_windows_for_sample(
     reference_fasta: str | Path,
     sample_vcf: str | Path,
     output_jsonl: str | Path | None = None,
-    expected_reference_tokens: Sequence[str] = EXPECTED_REFERENCE_TOKENS,
+    positive_reference_tokens: Sequence[str] = POSITIVE_REFERENCE_TOKENS,
+    negative_reference_tokens: Sequence[str] = NEGATIVE_REFERENCE_TOKENS,
 ) -> list[FinetuneWindow]:
     """Single-sample convenience wrapper. **Test/small-workload use only.**
 
@@ -711,8 +781,10 @@ def extract_fasta_windows_for_sample(
         reference_fasta: Path to the reference FASTA (plain or gzipped).
         sample_vcf: Path to the input VCF (plain or gzipped).
         output_jsonl: Optional path to write one JSON record per window.
-        expected_reference_tokens: Build tokens enforced on both the
+        positive_reference_tokens: Build tokens enforced on both the
             FASTA evidence and the VCF ``##reference`` header.
+        negative_reference_tokens: Build tokens that must NOT appear in the
+            VCF ``##reference`` header.
 
     Returns:
         All windows extracted for ``sample_id``, in VCF record order.
@@ -726,14 +798,17 @@ def extract_fasta_windows_for_sample(
         stacklevel=2,
     )
     reference = load_reference_index(
-        reference_fasta, expected_reference_tokens=expected_reference_tokens
+        reference_fasta,
+        positive_reference_tokens=positive_reference_tokens,
+        negative_reference_tokens=negative_reference_tokens,
     )
     windows = list(
         iter_locus_windows_from_vcf(
             sample_id=sample_id,
             sample_vcf=Path(sample_vcf),
             reference=reference,
-            expected_reference_tokens=expected_reference_tokens,
+            positive_reference_tokens=positive_reference_tokens,
+            negative_reference_tokens=negative_reference_tokens,
         )
     )
     if output_jsonl is not None:

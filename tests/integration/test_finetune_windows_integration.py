@@ -1,7 +1,7 @@
 """Integration test for the fine-tuning window extraction pipeline.
 
 Exercises ``extract_fasta_windows_for_sample`` against the **real** jaguar
-reference (RefSeq ``GCF_028533385.1`` / ``Panthera_onca_HiC``, ~2.5 GB
+reference (DNA Zoo ``DNAZOO_Panthera_onca_HiC`` / ``Panthera_onca_HiC``, ~2.5 GB
 compressed) and the real per-sample jaguar VCF that ships under
 ``data/raw/``. The reference download is cached in
 ``data/raw/reference/`` so re-runs do not re-pull a multi-gigabyte file.
@@ -59,7 +59,7 @@ _VCF_PATH = (
 )
 _REFERENCE_CACHE_DIR = _REPO_ROOT / "data" / "raw" / "reference"
 
-_JAGUAR_ACCESSION = "GCF_028533385.1"
+_JAGUAR_IDENTIFIER = "DNAZOO_Panthera_onca_HiC"
 _JAGUAR_ASSEMBLY = "Panthera_onca_HiC"
 _TARGET_CONTIG = "HiC_scaffold_1"
 _SAMPLES_UNDER_TEST = ("LegadoSP", "bPon001")
@@ -72,14 +72,14 @@ def _jaguar_assembly_name() -> str:
     Drift between this test's pinned ``_JAGUAR_ASSEMBLY`` and
     ``APPROVED_FELID_ASSEMBLIES`` would silently produce a 404 at download
     time; this lookup surfaces that drift up front via ``pytest.fail`` with
-    the missing accession instead of letting an opaque ``StopIteration``
+    the missing identifier instead of letting an opaque ``StopIteration``
     escape the helper.
     """
     try:
-        assembly = next(a for a in APPROVED_FELID_ASSEMBLIES if a.accession == _JAGUAR_ACCESSION)
+        assembly = next(a for a in APPROVED_FELID_ASSEMBLIES if a.identifier == _JAGUAR_IDENTIFIER)
     except StopIteration:
         pytest.fail(
-            f"Accession {_JAGUAR_ACCESSION!r} not found in APPROVED_FELID_ASSEMBLIES; "
+            f"Identifier {_JAGUAR_IDENTIFIER!r} not found in APPROVED_FELID_ASSEMBLIES; "
             "the registry has drifted from this test's pinned jaguar build."
         )
     return assembly.assembly_name
@@ -96,11 +96,12 @@ def _download_jaguar_reference_if_needed() -> Path:
     assert assembly_name == _JAGUAR_ASSEMBLY, (
         f"registry assembly name {assembly_name!r} drifted from test pin {_JAGUAR_ASSEMBLY!r}"
     )
+    assembly = next(a for a in APPROVED_FELID_ASSEMBLIES if a.identifier == _JAGUAR_IDENTIFIER)
     _REFERENCE_CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    target = _REFERENCE_CACHE_DIR / f"{_JAGUAR_ACCESSION}_{_JAGUAR_ASSEMBLY}.fna.gz"
+    target = _REFERENCE_CACHE_DIR / f"{_JAGUAR_IDENTIFIER}.fna.gz"
     if target.exists() and target.stat().st_size > 0:
         return target
-    url = build_refseq_fasta_url(_JAGUAR_ACCESSION, _JAGUAR_ASSEMBLY)
+    url = build_refseq_fasta_url(_JAGUAR_IDENTIFIER, _JAGUAR_ASSEMBLY, assembly.url_override)
     partial = target.with_suffix(target.suffix + ".partial")
     opener = build_opener()
     with opener.open(Request(url), timeout=600) as response, partial.open("wb") as out:
@@ -254,8 +255,8 @@ def test_finetune_windows_pipeline_on_real_jaguar_data(
     """
     # Subset FASTA filename embeds the target contig token so it doubles
     # as the build-token evidence consumed by ``load_reference_index``.
-    expected_tokens = (_TARGET_CONTIG,)
-    subset_fasta = tmp_path / f"{_TARGET_CONTIG}.fa"
+    expected_tokens = (_JAGUAR_ASSEMBLY, _TARGET_CONTIG)
+    subset_fasta = tmp_path / f"{_JAGUAR_ASSEMBLY}_{_TARGET_CONTIG}.fa"
     _write_subset_reference_for_contig(jaguar_reference_fasta, _TARGET_CONTIG, subset_fasta)
     contig_seq_length = sum(
         len(line) for line in subset_fasta.read_text(encoding="ascii").splitlines()[1:]
@@ -272,7 +273,7 @@ def test_finetune_windows_pipeline_on_real_jaguar_data(
         target_contig=_TARGET_CONTIG,
         samples=_SAMPLES_UNDER_TEST,
         max_records=MAX_VCF_RECORDS,
-        reference_token=_TARGET_CONTIG,
+        reference_token=f"{_JAGUAR_ASSEMBLY}_{_TARGET_CONTIG}",
     )
     assert written > 0, (
         f"No PASS records on {_TARGET_CONTIG} found in {_VCF_PATH}; "
@@ -282,7 +283,7 @@ def test_finetune_windows_pipeline_on_real_jaguar_data(
     # Production-style usage: load the reference index *once*, then thread
     # it through one streaming-iterator call per sample. Validates the
     # scaling refactor (no per-sample re-read of the FASTA).
-    reference = load_reference_index(subset_fasta, expected_reference_tokens=expected_tokens)
+    reference = load_reference_index(subset_fasta, positive_reference_tokens=expected_tokens)
     output_jsonl = tmp_path / "windows.jsonl"
     windows = []
     for sample_id in _SAMPLES_UNDER_TEST:
@@ -292,7 +293,7 @@ def test_finetune_windows_pipeline_on_real_jaguar_data(
                 sample_id=sample_id,
                 sample_vcf=subset_vcf,
                 reference=reference,
-                expected_reference_tokens=expected_tokens,
+                positive_reference_tokens=expected_tokens,
             )
         )
         write_locus_windows_jsonl(per_sample_windows, per_sample_jsonl)
@@ -352,7 +353,7 @@ def test_finetune_windows_pipeline_on_real_jaguar_data(
             sample_id=_SAMPLES_UNDER_TEST[0],
             sample_vcf=subset_vcf,
             reference=reference,
-            expected_reference_tokens=expected_tokens,
+            positive_reference_tokens=expected_tokens,
         ),
         output_jsonl,
     )

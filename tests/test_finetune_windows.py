@@ -33,6 +33,7 @@ from jaguar_geo_assign.data.finetune_windows import (
     extract_fasta_window,
     extract_fasta_windows_for_sample,
     extract_locus_windows_from_vcf,
+    load_reference_index,
 )
 
 # Build-token override used throughout the unit-test suite. The strict
@@ -165,7 +166,7 @@ def _extract(fasta: Path, vcf: Path, *, sample_id: str = "cat_1", **kwargs):
         sample_id=sample_id,
         reference_fasta=fasta,
         sample_vcf=vcf,
-        expected_reference_tokens=_TEST_BUILD_TOKENS,
+        positive_reference_tokens=_TEST_BUILD_TOKENS,
         **kwargs,
     )
 
@@ -303,7 +304,7 @@ def test_extract_locus_windows_uses_provided_contig_sequences_directly(tmp_path:
         sample_id="cat_1",
         sample_vcf=vcf,
         contig_sequences=contig_sequences,
-        expected_reference_tokens=_TEST_BUILD_TOKENS,
+        positive_reference_tokens=_TEST_BUILD_TOKENS,
     )
     assert len(windows) == 1
     # Flanks pick up the C-fill we passed in memory.
@@ -338,7 +339,7 @@ def test_fasta_without_build_evidence_raises_reference_mismatch(tmp_path: Path):
     """
     vcf_text = _build_vcf(["chr1\t300\t.\tA\tT\t.\tPASS\t.\tGT\t1/1"])
     fasta, vcf = _write_fixture(tmp_path, vcf_text, fasta_filename="anonymous_reference.fa")
-    with pytest.raises(ReferenceMismatchError, match="does not canonically match"):
+    with pytest.raises(ReferenceMismatchError, match="missing expected positive tokens"):
         _extract(fasta, vcf)
 
 
@@ -364,7 +365,7 @@ def test_vcf_reference_header_with_mismatched_token_raises(tmp_path: Path):
         ["chr1\t300\t.\tA\tT\t.\tPASS\t.\tGT\t1/1"], reference_token="OTHER_BUILD_v9"
     )
     fasta, vcf = _write_fixture(tmp_path, vcf_text)
-    with pytest.raises(ReferenceMismatchError, match="does not canonically match"):
+    with pytest.raises(ReferenceMismatchError, match="failed build evidence validation"):
         _extract(fasta, vcf)
 
 
@@ -383,7 +384,7 @@ def test_header_contig_absent_from_reference_raises(tmp_path: Path):
 def test_reference_base_mismatch_against_fasta_raises(tmp_path: Path):
     """If the FASTA base at the locus disagrees with the VCF ``REF``, raise.
 
-    Same accession + different patch level is the typical real-world
+    Same identifier + different patch level is the typical real-world
     cause; the per-locus guard catches it even when build-token
     validation passes.
     """
@@ -449,3 +450,145 @@ def test_extract_fasta_window_rejects_disallowed_allele():
     sequence = _make_contig_sequence()
     with pytest.raises(InvalidAlleleAlphabetError):
         extract_fasta_window(contig_sequence=sequence, locus_pos=300, allele="*")
+
+
+def test_r2_positive_pass_succeeds(tmp_path: Path):
+    """R2 positive-pass: load a fixture FASTA containing positive tokens -> succeeds."""
+    vcf_text = _build_vcf(
+        ["HiC_scaffold_1\t300\t.\tA\tT\t.\tPASS\t.\tGT\t1/1"],
+        contigs=("HiC_scaffold_1",),
+        reference_token="Panthera_onca_HiC HiC_scaffold_1",
+    )
+    fasta, vcf = _write_fixture(
+        tmp_path, vcf_text, fasta_filename="Panthera_onca_HiC.fa", contig_name="HiC_scaffold_1"
+    )
+    windows = extract_fasta_windows_for_sample(
+        sample_id="cat_1",
+        reference_fasta=fasta,
+        sample_vcf=vcf,
+    )
+    assert len(windows) == 1
+
+
+def test_r2_negative_rejection_ncbi_shape(tmp_path: Path):
+    """R2 negative-rejection (NCBI shape): NC_083295.1 causes loud failure."""
+    vcf_text = _build_vcf(
+        ["HiC_scaffold_1\t300\t.\tA\tT\t.\tPASS\t.\tGT\t1/1"],
+        contigs=("HiC_scaffold_1",),
+        reference_token="Panthera_onca_HiC HiC_scaffold_1",
+    )
+    fasta, vcf = _write_fixture(
+        tmp_path,
+        vcf_text,
+        fasta_filename="Panthera_onca_HiC.fa",
+        contig_name="NC_083295.1 HiC_scaffold_1",
+    )
+    with pytest.raises(ReferenceMismatchError, match="[Nn]egative reference token.*NC_083295.1"):
+        extract_fasta_windows_for_sample(sample_id="cat_1", reference_fasta=fasta, sample_vcf=vcf)
+
+
+def test_r2_negative_rejection_legacy_ncbi_accession(tmp_path: Path):
+    """R2 negative-rejection (legacy NCBI accession): GCF_028533385.1 causes failure."""
+    vcf_text = _build_vcf(
+        ["HiC_scaffold_1\t300\t.\tA\tT\t.\tPASS\t.\tGT\t1/1"],
+        contigs=("HiC_scaffold_1",),
+        reference_token="Panthera_onca_HiC HiC_scaffold_1",
+    )
+    fasta, vcf = _write_fixture(
+        tmp_path,
+        vcf_text,
+        fasta_filename="GCF_028533385.1_Panthera_onca_HiC.fa",
+        contig_name="HiC_scaffold_1",
+    )
+    with pytest.raises(ReferenceMismatchError, match="[Nn]egative reference token"):
+        extract_fasta_windows_for_sample(sample_id="cat_1", reference_fasta=fasta, sample_vcf=vcf)
+
+
+def test_r2_missing_positive(tmp_path: Path):
+    """R2 missing-positive: missing both positive tokens -> fails."""
+    vcf_text = _build_vcf(
+        ["chr1\t300\t.\tA\tT\t.\tPASS\t.\tGT\t1/1"], reference_token="some_other_build"
+    )
+    fasta, vcf = _write_fixture(
+        tmp_path, vcf_text, fasta_filename="some_other_build.fa", contig_name="chr1"
+    )
+    with pytest.raises(ReferenceMismatchError, match="missing expected positive tokens"):
+        extract_fasta_windows_for_sample(sample_id="cat_1", reference_fasta=fasta, sample_vcf=vcf)
+
+
+def test_r4_iupac_rejection(tmp_path: Path):
+    """R4 IUPAC rejection: Y or R raises at load_reference_index before iter_locus."""
+    vcf_text = _build_vcf(
+        ["HiC_scaffold_1\t300\t.\tA\tT\t.\tPASS\t.\tGT\t1/1"],
+        contigs=("HiC_scaffold_1",),
+        reference_token="Panthera_onca_HiC HiC_scaffold_1",
+    )
+    fasta, vcf = _write_fixture(
+        tmp_path,
+        vcf_text,
+        fasta_filename="Panthera_onca_HiC.fa",
+        contig_name="HiC_scaffold_1",
+        sequence="ACGTNRACGT",
+    )
+    with pytest.raises(InvalidAlleleAlphabetError, match="invalid characters.*'R'"):
+        load_reference_index(fasta)
+
+
+def test_r4_valid_passes(tmp_path: Path):
+    """R4 valid passes: contig with only ACGTN loads fine and has validated_alphabet=True."""
+    vcf_text = _build_vcf(
+        ["HiC_scaffold_1\t300\t.\tA\tT\t.\tPASS\t.\tGT\t1/1"],
+        contigs=("HiC_scaffold_1",),
+        reference_token="Panthera_onca_HiC HiC_scaffold_1",
+    )
+    fasta, _ = _write_fixture(
+        tmp_path,
+        vcf_text,
+        fasta_filename="Panthera_onca_HiC.fa",
+        contig_name="HiC_scaffold_1",
+        sequence="ACGTN",
+    )
+    index = load_reference_index(fasta)
+    assert getattr(index, "validated_alphabet", False) is True
+
+
+def test_iter_locus_windows_from_vcf_signature_and_rejection(tmp_path: Path):
+    import inspect
+
+    from jaguar_geo_assign.data.finetune_windows import (
+        iter_locus_windows_from_vcf,
+        load_reference_index,
+    )
+
+    sig = inspect.signature(iter_locus_windows_from_vcf)
+    assert "positive_reference_tokens" in sig.parameters
+    assert "negative_reference_tokens" in sig.parameters
+
+    vcf_text = _build_vcf(
+        ["HiC_scaffold_1\t300\t.\tA\tT\t.\tPASS\t.\tGT\t1/1"],
+        contigs=("HiC_scaffold_1",),
+        reference_token="Panthera_onca_HiC HiC_scaffold_1 NC_083295.1",
+    )
+    fasta, vcf = _write_fixture(
+        tmp_path,
+        vcf_text,
+        fasta_filename="Panthera_onca_HiC.fa",
+        contig_name="HiC_scaffold_1",
+    )
+
+    reference = load_reference_index(
+        fasta,
+        positive_reference_tokens=["Panthera_onca_HiC"],
+        negative_reference_tokens=["NC_fake"],
+    )
+
+    with pytest.raises(ReferenceMismatchError, match="failed build evidence validation"):
+        list(
+            iter_locus_windows_from_vcf(
+                sample_id="cat_1",
+                sample_vcf=vcf,
+                reference=reference,
+                positive_reference_tokens=["Panthera_onca_HiC"],
+                negative_reference_tokens=["NC_083295.1"],
+            )
+        )

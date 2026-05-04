@@ -442,7 +442,7 @@ def generate_consensus_fasta(
     sample_vcf: str | Path,
     output_fasta: str | Path,
     bcftools_executable: str = "bcftools",
-    expected_reference_tokens: Sequence[str] = EXPECTED_REFERENCE_TOKENS,
+    positive_reference_tokens: Sequence[str] = EXPECTED_REFERENCE_TOKENS,
 ) -> ConsensusResult:
     """Generate a consensus FASTA for one sample via ``bcftools consensus``.
 
@@ -476,7 +476,7 @@ def generate_consensus_fasta(
         sample_vcf: Path to the input VCF file (plain or gzipped).
         output_fasta: Path where the consensus FASTA will be written.
         bcftools_executable: Name or path of the ``bcftools`` binary.
-        expected_reference_tokens: Canonical build tokens that must
+        positive_reference_tokens: Canonical build tokens that must
             appear in both the FASTA filename and VCF ``##reference``
             header.
 
@@ -504,7 +504,7 @@ def generate_consensus_fasta(
             reference_fasta=reference_path,
             sample_vcf=vcf_path,
             work_dir=temp_dir,
-            expected_reference_tokens=expected_reference_tokens,
+            positive_reference_tokens=positive_reference_tokens,
         )
         command = [bcftools_path, "consensus", "-s", sample_id]
         if prepared.mask_bed is not None:
@@ -568,7 +568,7 @@ def generate_consensus_fastas(
     output_dir: str | Path,
     max_workers: int = 4,
     bcftools_executable: str = "bcftools",
-    expected_reference_tokens: Sequence[str] = EXPECTED_REFERENCE_TOKENS,
+    positive_reference_tokens: Sequence[str] = EXPECTED_REFERENCE_TOKENS,
 ) -> dict[str, ConsensusResult]:
     """Generate consensus FASTAs for multiple samples in parallel.
 
@@ -591,7 +591,7 @@ def generate_consensus_fastas(
         output_dir: Directory where ``{sample_id}.fa`` files are written.
         max_workers: Maximum number of concurrent worker threads.
         bcftools_executable: Name or path of the ``bcftools`` binary.
-        expected_reference_tokens: Canonical build tokens for reference
+        positive_reference_tokens: Canonical build tokens for reference
             validation.
 
     Returns:
@@ -613,7 +613,7 @@ def generate_consensus_fastas(
             sample_vcf=vcf_path,
             output_fasta=output_root / f"{sample_id}.fa",
             bcftools_executable=bcftools_executable,
-            expected_reference_tokens=expected_reference_tokens,
+            positive_reference_tokens=positive_reference_tokens,
         )
         return sample_id, result
 
@@ -628,7 +628,7 @@ def _prepare_consensus(
     reference_fasta: Path,
     sample_vcf: Path,
     work_dir: Path,
-    expected_reference_tokens: Sequence[str],
+    positive_reference_tokens: Sequence[str],
 ) -> _PreparedConsensus:
     """Filter a VCF and build mask BED for ``bcftools consensus``.
 
@@ -647,7 +647,7 @@ def _prepare_consensus(
         reference_fasta: Path to the reference genome FASTA.
         sample_vcf: Path to the input VCF (plain or gzipped).
         work_dir: Temporary directory for intermediate files.
-        expected_reference_tokens: Canonical build tokens for
+        positive_reference_tokens: Canonical build tokens for
             reference validation.
 
     Returns:
@@ -662,11 +662,11 @@ def _prepare_consensus(
     """
     contig_headers = _read_fasta_headers(reference_fasta)
     reference_evidence = " ".join((reference_fasta.name, *contig_headers.values()))
-    if not _matches_expected_reference_build(reference_evidence, expected_reference_tokens):
+    if not _matches_expected_reference_build(reference_evidence, positive_reference_tokens):
         raise ReferenceMismatchError(
             "Reference FASTA "
             f"{reference_fasta} does not canonically match expected build evidence "
-            f"{expected_reference_tokens}"
+            f"{positive_reference_tokens}"
         )
 
     filtered_vcf = work_dir / f"{sample_id}.prepared.vcf"
@@ -696,11 +696,11 @@ def _prepare_consensus(
                         f"VCF {sample_vcf} is missing explicit reference/build metadata "
                         "in a ##reference header"
                     )
-                if not _matches_expected_reference_build(vcf_reference, expected_reference_tokens):
+                if not _matches_expected_reference_build(vcf_reference, positive_reference_tokens):
                     raise ReferenceMismatchError(
                         f"VCF {sample_vcf} declares reference '{vcf_reference}', "
                         "which does not canonically match "
-                        f"expected build evidence {expected_reference_tokens}"
+                        f"expected build evidence {positive_reference_tokens}"
                     )
                 if header_contigs and not header_contigs.issubset(contig_headers.keys()):
                     missing_contigs = sorted(header_contigs.difference(contig_headers.keys()))
@@ -837,7 +837,7 @@ def _read_fasta_headers(reference_fasta: Path) -> dict[str, str]:
 
 
 def _matches_expected_reference_build(
-    evidence: str, expected_reference_tokens: Sequence[str]
+    evidence: str, positive_reference_tokens: Sequence[str]
 ) -> bool:
     """Check whether *evidence* contains all expected reference build tokens.
 
@@ -848,7 +848,7 @@ def _matches_expected_reference_build(
     Args:
         evidence: Free-form string to search (e.g. a FASTA filename
             concatenated with contig headers).
-        expected_reference_tokens: Canonical token strings that must all
+        positive_reference_tokens: Canonical token strings that must all
             appear in *evidence*.
 
     Returns:
@@ -857,7 +857,7 @@ def _matches_expected_reference_build(
     canonical_evidence = _canonicalize_reference_evidence(evidence)
     return all(
         _canonicalize_reference_evidence(token) in canonical_evidence
-        for token in expected_reference_tokens
+        for token in positive_reference_tokens
     )
 
 
@@ -890,3 +890,6 @@ def _open_maybe_gzip(path: Path):
         if path.suffix == ".gz"
         else path.open("r", encoding="utf-8")
     )
+
+
+canonicalize_reference_evidence = _canonicalize_reference_evidence

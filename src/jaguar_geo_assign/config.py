@@ -38,7 +38,7 @@ from .data.contracts import JAGUAR_METADATA_FIELDS
 from .data.felid_assemblies import APPROVED_FELID_ASSEMBLIES, FelidAssembly
 from .data.pipeline_contract import (
     APPROVED_BIOPROJECT_ACCESSION,
-    APPROVED_FELID_ACCESSIONS,
+    APPROVED_FELID_IDENTIFIERS,
     APPROVED_REFERENCE_ASSEMBLY,
     DNABERT2_TOKENIZER_ID,
     DNABERT2_TOKENIZER_REVISION,
@@ -695,10 +695,10 @@ def load_feline_pipeline_config(path: str | Path) -> FelinePipelineConfig:
 
 @dataclass(frozen=True)
 class FelidSpeciesEntry:
-    """One approved species pinned to its RefSeq accession and assembly name.
+    """One approved species pinned to its RefSeq identifier and assembly name.
 
     The felid-foundation corpus mixes six species, and the per-species
-    FASTA filename is deterministically derived from the accession + assembly
+    FASTA filename is deterministically derived from the identifier + assembly
     name. Freezing the triple in a typed entry lets every downstream stage
     (path resolution, logging, run-summary keys) share the same species slug
     without re-deriving it from the Latin binomial each time.
@@ -706,7 +706,7 @@ class FelidSpeciesEntry:
     Attributes:
         species: Latin binomial as written in ``APPROVED_FELID_ASSEMBLIES``
             (e.g. ``"Panthera leo"``).
-        accession: RefSeq accession prefixed with ``GCF_``.
+        identifier: RefSeq identifier prefixed with ``GCF_`` or DNA Zoo ID.
         assembly_name: NCBI assembly name (e.g. ``"P.leo_Ple1_pat1.1"``).
         species_slug: Lowercase underscored identifier derived from ``species``
             (e.g. ``"panthera_leo"``). Used as ``individual_id`` on every
@@ -715,7 +715,7 @@ class FelidSpeciesEntry:
     """
 
     species: str
-    accession: str
+    identifier: str
     assembly_name: str
     species_slug: str
 
@@ -758,7 +758,7 @@ class FelidFoundationPipelineConfig:
         name: Human-readable pipeline name.
         description: Free-text description of the pipeline run.
         species: Ordered tuple of :class:`FelidSpeciesEntry`, deduplicated
-            by accession and validated against ``APPROVED_FELID_ACCESSIONS``.
+            by identifier and validated against ``APPROVED_FELID_IDENTIFIERS``.
         paths: Filesystem paths (:class:`FelidFoundationPathsConfig`).
         windowing: Sliding-window parameters (:class:`WindowingConfig`).
         split: Train/test split strategy (:class:`SplitConfig`).
@@ -897,9 +897,9 @@ def _validate_felid_species_entries(
     """Validate the ``[[species]]`` list against the approved felid registry.
 
     Prevents corpus drift. The foundation contract pins the exact
-    set of six approved accessions in :data:`APPROVED_FELID_ACCESSIONS`;
-    any config that references an unknown accession, duplicates an
-    accession, or declares a species/accession pair that does not match
+    set of six approved identifiers in :data:`APPROVED_FELID_IDENTIFIERS`;
+    any config that references an unknown identifier, duplicates an
+    identifier, or declares a species/identifier pair that does not match
     the pinned :data:`APPROVED_FELID_ASSEMBLIES` registry is rejected.
 
     Args:
@@ -907,63 +907,68 @@ def _validate_felid_species_entries(
 
     Returns:
         A tuple of validated :class:`FelidSpeciesEntry` in registry order
-        (sorted by accession for determinism).
+        (sorted by identifier for determinism).
 
     Raises:
         ValueError: If the list is not a non-empty sequence, shorter than
-            the required species count, contains duplicate accessions, or
-            references a species/accession pair that is not in the approved
+            the required species count, contains duplicate identifiers, or
+            references a species/identifier pair that is not in the approved
             registry.
     """
     if not isinstance(raw_species, list) or not raw_species:
-        raise ValueError("species must be a non-empty list of {species, accession} entries")
+        raise ValueError("species must be a non-empty list of {species, identifier} entries")
     if len(raw_species) < REQUIRED_FELID_FOUNDATION_SPECIES_COUNT:
         raise ValueError(
             "species list must include all "
-            f"{REQUIRED_FELID_FOUNDATION_SPECIES_COUNT} approved felid accessions; "
+            f"{REQUIRED_FELID_FOUNDATION_SPECIES_COUNT} approved felid identifiers; "
             f"got {len(raw_species)}"
         )
 
-    registry_by_accession: dict[str, FelidAssembly] = {
-        assembly.accession: assembly for assembly in APPROVED_FELID_ASSEMBLIES
+    registry_by_identifier: dict[str, FelidAssembly] = {
+        assembly.identifier: assembly for assembly in APPROVED_FELID_ASSEMBLIES
     }
 
-    seen_accessions: set[str] = set()
+    seen_identifiers: set[str] = set()
     entries: list[FelidSpeciesEntry] = []
     for index, item in enumerate(raw_species):
         if not isinstance(item, dict):
             raise ValueError(
-                f"species[{index}] must be a table with 'species' and 'accession' keys"
+                f"species[{index}] must be a table with 'species' and 'identifier' keys"
+            )
+        if "accession" in item:
+            raise ValueError(
+                "TOML key 'accession' was renamed to 'identifier'. "
+                "Update your config file to use 'identifier = ...' instead."
             )
         try:
             species_name = item["species"]
-            accession = item["accession"]
+            identifier = item["identifier"]
         except KeyError as exc:
             raise ValueError(f"species[{index}] is missing required field: {exc.args[0]}") from exc
-        if accession in seen_accessions:
-            raise ValueError(f"species list contains duplicate accession {accession!r}")
-        if accession not in APPROVED_FELID_ACCESSIONS:
+        if identifier in seen_identifiers:
+            raise ValueError(f"species list contains duplicate identifier {identifier!r}")
+        if identifier not in APPROVED_FELID_IDENTIFIERS:
             raise ValueError(
-                f"species[{index}].accession {accession!r} is not an approved felid accession"
+                f"species[{index}].identifier {identifier!r} is not an approved felid identifier"
             )
-        registry_entry = registry_by_accession[accession]
+        registry_entry = registry_by_identifier[identifier]
         if species_name != registry_entry.species:
             raise ValueError(
                 f"species[{index}].species {species_name!r} does not match "
                 f"the approved registry entry {registry_entry.species!r} "
-                f"for accession {accession}"
+                f"for identifier {identifier}"
             )
-        seen_accessions.add(accession)
+        seen_identifiers.add(identifier)
         entries.append(
             FelidSpeciesEntry(
                 species=registry_entry.species,
-                accession=registry_entry.accession,
+                identifier=registry_entry.identifier,
                 assembly_name=registry_entry.assembly_name,
                 species_slug=_slugify_species(registry_entry.species),
             )
         )
 
-    entries.sort(key=lambda entry: entry.accession)
+    entries.sort(key=lambda entry: entry.identifier)
     return tuple(entries)
 
 
@@ -976,7 +981,7 @@ def load_felid_foundation_pipeline_config(
     sections (``pipeline``, ``paths``, ``species``, ``windowing``,
     ``split``, ``tokenizer``, ``export``, ``runtime``). Key validations:
 
-    * ``[[species]]`` list against :data:`APPROVED_FELID_ACCESSIONS`,
+    * ``[[species]]`` list against :data:`APPROVED_FELID_IDENTIFIERS`,
       rejecting unknown, duplicate, or mislabeled entries, and requiring
       at least :data:`REQUIRED_FELID_FOUNDATION_SPECIES_COUNT` species.
     * Windowing arithmetic (positive window, valid overlap, ambiguity
@@ -1227,7 +1232,7 @@ def describe_felid_foundation_config(path: str | Path) -> str:
     """
     config = load_felid_foundation_pipeline_config(path)
     species_lines = [
-        f"  - {entry.species} ({entry.accession} / {entry.assembly_name})"
+        f"  - {entry.species} ({entry.identifier} / {entry.assembly_name})"
         for entry in config.species
     ]
     external_tools_display = (
