@@ -5,7 +5,7 @@ tokenized felid foundation corpus. It handles model loading with pad-token
 fallbacks, mixed-precision training via accelerate, checkpoint management
 with atomic writes, and integration testing via synthetic or real models.
 
-Key design decisions (tagged with # TRADE-OFF:):
+Key design decisions:
 - IterableDataset is used (streaming reader); resume restarts at epoch boundary.
 - Perplexity is clamped at exp(20) to protect against bf16 noise.
 - Pad-token guard implements all three fallback strategies (eos/unk/add_pad).
@@ -141,8 +141,9 @@ def _build_model_and_tokenizer(
 ) -> tuple[Any, Any, str, bool]:
     """Load model and tokenizer, applying pad-token guard and MLM head check.
 
-    Implements §3.2 (pad-token guard with all three branches) and §3.3
-    (MLM head missing-keys check).
+    Attempts to set the tokenizer's pad_token_id using configured fallback
+    strategy (eos > unk > add_pad). Also checks for MLM head in missing_keys
+    and warns if randomly initialized.
 
     Args:
         config: Training configuration with model_identifier and model_revision.
@@ -156,7 +157,7 @@ def _build_model_and_tokenizer(
     # Load tokenizer via existing helper
     tokenizer, _ = load_dnabert2_tokenizer()
 
-    # §3.2: Pad-token guard with all three branches
+    # Pad-token guard with all three branches
     pad_token_fallback_used = "none"
     if tokenizer.pad_token_id is None:
         # TRADE-OFF: pad-token fallback is a pragmatic choice because DNABERT-2
@@ -194,7 +195,7 @@ def _build_model_and_tokenizer(
     if pad_token_fallback_used == "add_pad":
         model.resize_token_embeddings(len(tokenizer))
 
-    # §3.3: MLM head missing-keys check
+    # MLM head missing-keys check
     mlm_head_random_init = False
     missing_keys = loading_info.get("missing_keys", [])
     mlm_head_prefixes = ("cls.", "mlm_head", "lm_head")
@@ -215,7 +216,7 @@ def _build_optimizer(
     learning_rate: float,
     weight_decay: float,
 ) -> AdamW:
-    """Build AdamW optimizer with weight decay groups per §3.4.
+    """Build AdamW optimizer with weight decay groups.
 
     Bias and LayerNorm parameters are excluded from weight decay.
 
@@ -250,7 +251,7 @@ def _build_scheduler(
     warmup_steps: int,
     max_steps: int,
 ) -> Any:
-    """Build cosine schedule with linear warmup per §3.4.
+    """Build cosine schedule with linear warmup.
 
     Args:
         optimizer: AdamW optimizer to schedule.
@@ -336,9 +337,9 @@ def _build_dataloaders(
             num_workers=config.num_workers,
         )
     except CorpusReaderError as exc:
-        # TRADE-OFF: Substring match is used here to identify "validation split missing"
-        # as a non-fatal condition, while letting other CorpusReaderError variants
-        # (empty shard, schema errors) propagate loudly during startup.
+        # Substring match tolerates missing validation split (non-fatal) while propagating
+        # other errors (empty shard, schema issues). This allows training on train-only
+        # corpora but fails fast if corpus configuration is broken.
         if "validation" not in str(exc) or "not found" not in str(exc).lower():
             raise
         # Validation split not available
@@ -352,10 +353,11 @@ def _compute_eval_max_steps(
     per_device_eval_batch_size: int,
     world_size: int,
 ) -> int:
-    """Compute fixed eval step count to prevent DDP deadlock per §1.2.
+    """Compute fixed eval step count to prevent DDP deadlock.
 
     All ranks must iterate exactly this many batches. Any leftover rows
-    are dropped and logged.
+    are dropped and logged. This fixed step count prevents different ranks
+    from exiting at different times, which would hang the collective barrier.
 
     Args:
         eval_reader: Validation IterableDataset with record_count property.
@@ -365,8 +367,8 @@ def _compute_eval_max_steps(
     Returns:
         Fixed maximum evaluation steps.
     """
-    # TRADE-OFF: eval-step cap is derived from record_count to prevent DDP deadlock
-    # when ranks yield different batch counts. Leftover rows are dropped.
+    # Derive eval-step cap from record_count. Leftover rows are dropped when total
+    # record_count is not evenly divisible by global_batch_size.
     record_count = eval_reader.record_count
     global_batch_size = per_device_eval_batch_size * world_size
     eval_max_steps = max(1, record_count // global_batch_size)
@@ -388,7 +390,9 @@ def atomic_dir_replace(target: Path) -> Iterator[Path]:
     tmp.mkdir(parents=True)
     try:
         yield tmp
-        # TRADE-OFF: rename-old-aside prevents target disappearance during replacement
+        # Atomic swap: move old target aside before renaming tmp to target, allowing
+        # crash recovery. This trades space for safety: old checkpoints are retained
+        # briefly and must be cleaned up after successful swap.
         if target.exists():
             old_target = target.parent / f".old_{target.name}_{os.getpid()}"
             os.replace(str(target), str(old_target))
@@ -407,12 +411,15 @@ def atomic_dir_replace(target: Path) -> Iterator[Path]:
 
 
 def _recover_atomic_dir(target: Path) -> bool:
-    """Recover from a mid-replace crash by restoring the most recent .old_* directory."""
+    """Recover from a mid-replace crash by restoring the most recent .old_* directory.
+
+    Trades forward progress (losing the failed checkpoint attempt) for safety:
+    restores the last known-good state and allows training to continue. If no
+    .old_ backup exists, recovery is impossible and False is returned.
+    """
     if target.exists():
         return False
 
-    # TRADE-OFF: During mid-rename crash, target is lost but .old_ retains previous valid state.
-    # Restoring .old_ is crash-safe but inherently reverts to previous state.
     # Search for siblings matching `.old_<target.name>_*`
     candidates = list(target.parent.glob(f".old_{target.name}_*"))
     if not candidates:
@@ -427,9 +434,11 @@ def _recover_atomic_dir(target: Path) -> bool:
 
 def _broadcast_save_failure(accelerator: Accelerator, save_failed: bool) -> bool:
     """Broadcast save failure across ranks to prevent deadlocks.
-    Uses set_trigger if available (newer Accelerate), else gathers a tensor.
+
+    Trades performance (gather fallback) for compatibility: uses set_trigger if
+    available (newer Accelerate), else uses tensor gather. Ensures all ranks
+    agree on failure state before raising, preventing deadlock.
     """
-    # TRADE-OFF: Fallback logic for older Accelerate versions ensures compatibility
     if hasattr(accelerator, "set_trigger"):
         if save_failed:
             accelerator.set_trigger()
@@ -447,7 +456,11 @@ def _save_json_atomically(
     path: Path,
     content: dict[str, Any],
 ) -> None:
-    """Write checkpoint sidecar atomically via temp file per §3.8.
+    """Write checkpoint sidecar atomically via temp file.
+
+    Uses atomic rename to ensure the sidecar is either fully written or absent,
+    never partially written. PID suffix on temp file prevents collisions during
+    concurrent writes (rank-0 and recovery attempts on same node).
 
     Args:
         path: Target file path.
@@ -458,8 +471,7 @@ def _save_json_atomically(
     """
     path.parent.mkdir(parents=True, exist_ok=True)
 
-    # Fix #14: Write JSON as a FILE with atomic rename.
-    # Use unique tmp suffix per PID to be crash-safe during concurrent writes.
+    # Write JSON to temp file with unique PID-based suffix, then atomically rename.
     tmp_path = path.with_name(f"{path.name}.{os.getpid()}.tmp")
     try:
         tmp_path.write_text(json.dumps(content))
@@ -476,7 +488,11 @@ def _startup_probe_metrics(
     step: int,
     accelerator: Accelerator,
 ) -> dict[str, float]:
-    """Compute startup probe metrics for the first 20 steps per §3.7.
+    """Compute startup probe metrics for the first 20 steps.
+
+    Logs mean sequence length and observed mask rate to detect data problems
+    early (e.g., misaligned tokenization, MLM probability config issues).
+    Only computed on rank-0 and for the first 20 optimizer updates.
 
     Args:
         batch: Data batch with attention_mask and labels.
@@ -511,9 +527,10 @@ def run_felid_foundation_training(
 ) -> TrainingRunResult:
     """Run felid foundation continued pre-training for DNABERT-2.
 
-    Implements the full training loop per Technical Design §3, including
-    model loading, mixed-precision training, checkpoint management, and
-    integration testing.
+    Implements the full training loop: model loading with pad-token fallback,
+    mixed-precision training via bf16, checkpoint management with atomic writes,
+    gradient accumulation, evaluation with fixed DDP-safe step counts, and
+    integration testing via synthetic or real models.
 
     Args:
         config_path: Path to TOML training configuration.
@@ -555,7 +572,7 @@ def run_felid_foundation_training(
     scheduler = _build_scheduler(optimizer, config.warmup_steps, config.max_steps)
     train_loader, eval_loader = _build_dataloaders(config, tokenizer)
 
-    # Initialize Accelerator with mixed precision (§3.5)
+    # Initialize Accelerator with bf16 mixed precision
     accelerator = Accelerator(
         mixed_precision="bf16",
         gradient_accumulation_steps=config.gradient_accumulation_steps,
@@ -566,7 +583,7 @@ def run_felid_foundation_training(
     # Check for resumed state
     latest_state_path = output_dir / "latest" / "accelerate_state"
 
-    # Fix 28: Recover from mid-rename crash (rank-0 only to avoid race on shared FS)
+    # Recover from mid-rename crash (rank-0 only to avoid race on shared FS)
     if accelerator.is_main_process:
         _recover_atomic_dir(output_dir / "latest" / "accelerate_state")
         _recover_atomic_dir(output_dir / "best" / "accelerate_state")
@@ -575,7 +592,7 @@ def run_felid_foundation_training(
     accelerator.wait_for_everyone()
 
     resumed = latest_state_path.exists()
-    # Fix #16: Align read path with write path (both in output_dir / "best" / "best_eval_loss.json")
+    # Read best eval loss from sidecar (aligned with write path in checkpoint save)
     best_eval_loss_file = output_dir / "best" / "best_eval_loss.json"
     best_eval_loss = None
     if best_eval_loss_file.exists():
@@ -585,16 +602,15 @@ def run_felid_foundation_training(
             pass
 
     # Prepare for distributed training
-    # TRADE-OFF: Dataloaders are NOT passed through accelerator.prepare because Accelerate would
-    # either (a) dispatch from rank-0 only [dispatch_batches=True default for IterableDataset,
-    # drops N-1/N of data] or (b) wrap in IterableDatasetShard which double-shards on top of
-    # our reader's file-level sharding. Manual device placement is used instead.
-    # Gradient accumulation via accelerator.accumulate() still works correctly because its
-    # sync_gradients flag is maintained by self.step (incremented at each accumulate() call),
-    # not by the prepared dataloader's state. See accelerate/accelerator.py:1228 _do_sync().
+    # Dataloaders are NOT passed through accelerator.prepare because Accelerate would either:
+    # (a) dispatch from rank-0 only (drops N-1/N of data), or (b) double-shard on top of our
+    # reader's file-level sharding. Instead, manual device placement is used and the reader
+    # handles all sharding. Gradient accumulation via accelerator.accumulate() works because
+    # its sync_gradients flag is tied to self.step, not the dataloader. See
+    # accelerate/accelerator.py:1228 _do_sync().
     model, optimizer, scheduler = accelerator.prepare(model, optimizer, scheduler)
 
-    # §3.10 (Fix #10): Model trainability verification (AC#5)
+    # Model trainability verification
     # Count trainable vs. total parameters after construction and verify all are trainable.
     trainable = sum(1 for p in model.parameters() if p.requires_grad)
     total = sum(1 for _ in model.parameters())
@@ -611,18 +627,16 @@ def run_felid_foundation_training(
         },
     )
 
-    # Resume if needed (§3.9)
-    # TRADE-OFF: IterableDataset does not restore the cursor position on resume;
-    # the dataloader restarts at the epoch boundary. This may cause the first batch
-    # after resume to contain duplicate rows from earlier in the epoch.
-    # Training loop
+    # Resume if needed
+    # IterableDataset cannot restore cursor position; restart at epoch boundary.
+    # This trades perfect resume (a few duplicate rows in first batch) for robustness.
     step = 0
     if resumed:
         accelerator.load_state(str(latest_state_path))
 
-        # TRADE-OFF: step is restored from sidecar (not accelerate_state) because
-        # Python ints are not part of save_state. Sidecar is best-effort; old
-        # checkpoints without it resume at step=0 with a warning.
+        # Step counter is restored from JSON sidecar (not accelerate_state) because
+        # Python ints are not serializable by Accelerate. Sidecar is best-effort;
+        # old checkpoints without it resume at step=0 with a warning.
         train_state_path = latest_state_path.parent / "train_state.json"
         if train_state_path.exists():
             try:
@@ -655,7 +669,7 @@ def run_felid_foundation_training(
 
     try:
         for _epoch in range(1, 1000):  # Iterate until max_steps reached
-            # Fix #18: Set epoch on reader for deterministic multi-epoch shuffling
+            # Set epoch on reader for deterministic multi-epoch shuffling
             train_loader.dataset.set_epoch(_epoch - 1)  # 0-indexed
             for batch in train_loader:
                 if step >= config.max_steps:
@@ -668,7 +682,7 @@ def run_felid_foundation_training(
                     outputs = model(**batch)
                     loss = outputs.loss
 
-                    # §3.6: NaN/Inf guard
+                    # NaN/Inf guard: skip accumulation and count as anomaly
                     loss_f = loss.detach().float()
                     if torch.isnan(loss_f).any() or torch.isinf(loss_f).any():
                         train_metric.nan_count += 1
@@ -677,30 +691,29 @@ def run_felid_foundation_training(
                         train_metric.loss_sum += loss_f.mean().item()
                         train_metric.step_count += 1
 
-                    # §3.6 (Fix #9): Token accuracy accumulation for train loop.
+                    # Token accuracy accumulation for train loop.
                     # Compute predictions and accumulate against masked labels.
-                    # TRADE-OFF: argmax over full vocab is the dominant new cost;
-                    # computed inside torch.no_grad() and only for masked positions when feasible.
+                    # Argmax over full vocab is computed inside torch.no_grad() to avoid
+                    # polluting the backward pass with unnecessary graph nodes.
                     with torch.no_grad():
                         preds = outputs.logits.argmax(dim=-1)
                         labels = batch.get("labels")
                         if labels is not None:
                             mask = labels != -100
-                            # TRADE-OFF: Computing correct predictions locally avoids DDP gather
-                            # inside the accumulation loop. We accumulate locally and defer gather
-                            # to the log step.
+                            # Accumulate locally to avoid DDP gather inside the loop; defer
+                            # global reduce to the log step for efficiency.
                             train_metric.token_correct += ((preds == labels) & mask).sum().item()
                             train_metric.token_masked += mask.sum().item()
 
                     # Backward pass
                     accelerator.backward(loss)
 
-                    # Gradient clipping (§3.5)
+                    # Gradient clipping
                     grad_norm = accelerator.clip_grad_norm_(
                         model.parameters(), config.gradient_clip
                     )
 
-                    # Fix 1: Collect grad norms on sync steps before step/zero_grad
+                    # Collect grad norms on sync steps (before step/zero_grad) and guard against NaN
                     skip_step = False
                     if accelerator.sync_gradients:
                         if torch.isnan(grad_norm).any() or torch.isinf(grad_norm).any():
@@ -722,11 +735,10 @@ def run_felid_foundation_training(
 
                     if not skip_step:
                         optimizer.step()
-                        # Fix #17: Guard scheduler.step() by sync_gradients.
-                        # accumulate() no-ops optimizer.step() and optimizer.zero_grad(),
-                        # but NOT scheduler.step(). Without this guard, the scheduler advances
-                        # once per accumulation micro-step instead of once per optimizer update,
-                        # exhausting the learning rate schedule prematurely.
+                        # Guard scheduler.step() by sync_gradients. The accumulate() context
+                        # no-ops optimizer.step/zero_grad but NOT scheduler.step. Without
+                        # this guard, scheduler advances per micro-step, exhausting the
+                        # learning rate schedule prematurely.
                         if accelerator.sync_gradients:
                             scheduler.step()
                     optimizer.zero_grad()
@@ -736,7 +748,7 @@ def run_felid_foundation_training(
                     # cadence aligns with scheduler
                     step += 1
 
-                    # Log metrics at log_every (§3.6: windowed averages)
+                    # Log metrics at log_every (windowed averages reset after each log)
                     if step % config.log_every == 0:
                         mean_loss = (
                             float("nan")
@@ -754,13 +766,12 @@ def run_felid_foundation_training(
                         global_correct = global_counts[0].item()
                         global_masked = global_counts[1].item()
 
-                        # §3.6 (Fix #12): NaN convention: token_accuracy is NaN when token_masked==0
-                        # rather than 0.0, to distinguish "no masked tokens" from "zero accuracy".
-                        # TRADE-OFF: This convention helps downstream analysis identify data issues.
+                        # Return NaN for token_accuracy when no masked tokens (distinguishes
+                        # "no data" from "zero accuracy"), helping identify tokenization issues.
                         token_acc = (
                             float("nan") if global_masked == 0 else global_correct / global_masked
                         )
-                        # TRADE-OFF: perplexity clamped at 20 to prevent bf16 overflow
+                        # Perplexity clamped at 20 to prevent bf16 overflow (exp grows too fast)
                         ppl = (
                             float("nan")
                             if train_metric.step_count == 0
@@ -777,13 +788,13 @@ def run_felid_foundation_training(
                             "train/lr": scheduler.get_last_lr()[0],
                         }
 
-                        # §3.7: Startup probe for first 20 steps (rank-0 only)
+                        # Startup probe for first 20 steps (rank-0 only)
                         startup_logs = _startup_probe_metrics(batch, step, accelerator)
                         logs.update(startup_logs)
 
                         accelerator.log(logs, step=step)
 
-                        # §3.7 (Fix #13): Log grad_norm_hist as TensorBoard histogram (rank-0 only).
+                        # Log grad_norm_hist as TensorBoard histogram (rank-0 only).
                         # Must be done separately from accelerator.log because histograms need
                         # direct access to the TensorBoard writer, not the generic log interface.
                         if accelerator.is_main_process and startup_grad_norms:
@@ -798,7 +809,7 @@ def run_felid_foundation_training(
 
                         train_metric.reset()
 
-                    # Evaluation at eval_every (§1.2: fixed eval_max_steps)
+                    # Evaluation at eval_every (fixed eval_max_steps prevents DDP deadlock)
                     if eval_loader is not None and step % config.eval_every == 0:
                         eval_max_steps = config.eval_max_steps
                         if eval_max_steps is None:
@@ -834,7 +845,7 @@ def run_felid_foundation_training(
                                 loss = outputs.loss
 
                                 loss_f = loss.detach().float()
-                                # Fix 3: Gather eval loss across ranks before accumulation
+                                # Gather eval loss across ranks before accumulation (DDP-safe)
                                 gathered_loss = accelerator.gather_for_metrics(loss_f)
                                 if not (
                                     torch.isnan(gathered_loss).any()
@@ -843,7 +854,7 @@ def run_felid_foundation_training(
                                     eval_metric.loss_sum += gathered_loss.mean().item()
                                     eval_metric.step_count += 1
 
-                                # §3.6 (Fix #11): Token accuracy accumulation for eval loop.
+                                # Token accuracy accumulation for eval loop.
                                 # Compute predictions and accumulate against masked labels locally.
                                 preds = outputs.logits.argmax(dim=-1)
                                 labels = eval_batch.get("labels")
@@ -866,7 +877,7 @@ def run_felid_foundation_training(
                             else float("nan")
                         )
 
-                        # §3.6 (Fix #12): NaN convention for eval token_accuracy
+                        # Return NaN for eval token_accuracy when no masked tokens
                         eval_token_acc = (
                             float("nan")
                             if eval_metric.token_masked == 0
@@ -887,11 +898,9 @@ def run_felid_foundation_training(
                             step=step,
                         )
 
-                        # TRADE-OFF: When all eval batches are non-finite,
-                        # the running mean is undefined. We skip the best-comparison
-                        # entirely (rather than treating it as 0.0 or +inf) to avoid
-                        # spurious-best poisoning and silently treating 'no data'
-                        # as 'worst'. Logged as a warning so operators can investigate.
+                        # Skip best-checkpoint update if all eval batches were non-finite.
+                        # Avoids poisoning best-loss with NaN or treating "no data" as "worst".
+                        # Warn so operators can investigate potential data/tokenization issues.
                         if eval_metric.step_count == 0:
                             logger.warning(
                                 "Eval at step %d produced no finite loss values "
@@ -904,7 +913,7 @@ def run_felid_foundation_training(
                             # Save best checkpoint
                             best_dir = output_dir / "best"
 
-                            # Fix 4: DDP-safe checkpointing staged through tmp
+                            # Stage all state through tmp, then atomically swap (DDP-safe)
                             tmp_best_accel_state = best_dir / ".tmp_accelerate_state"
                             accelerator.save_state(str(tmp_best_accel_state))
 
@@ -935,15 +944,14 @@ def run_felid_foundation_training(
                                     with atomic_dir_replace(best_dir / "tokenizer") as tmp_tok_dir:
                                         tokenizer.save_pretrained(str(tmp_tok_dir))
                                 except Exception as e:
-                                    # TRADE-OFF: Rank-0 exception broadcasted
-                                    # to prevent ranks deadlocking.
+                                    # Catch exception to broadcast to other ranks (no deadlock)
                                     logger.error(
                                         "Rank-0 checkpoint save failed: %s", e, exc_info=True
                                     )
                                     save_failed = True
                                     saved_exc = e
                             accelerator.wait_for_everyone()
-                            # TRADE-OFF: Collective called before rank-0 raise to prevent deadlock.
+                            # Broadcast failure before rank-0 raise (prevents deadlock)
                             saw_failure = _broadcast_save_failure(accelerator, save_failed)
                             if save_failed:
                                 raise saved_exc
@@ -980,12 +988,12 @@ def run_felid_foundation_training(
                                     {"step": step, "best_eval_loss": best_eval_loss},
                                 )
                             except Exception as e:
-                                # TRADE-OFF: Rank-0 checkpoint exception is caught and broadcasted
+                                # Catch exception to broadcast to other ranks (prevents deadlock)
                                 logger.error("Rank-0 checkpoint save failed: %s", e, exc_info=True)
                                 save_failed = True
                                 saved_exc = e
                         accelerator.wait_for_everyone()
-                        # TRADE-OFF: Collective called before rank-0 raise to prevent deadlock.
+                        # Broadcast failure before rank-0 raise (prevents deadlock)
                         saw_failure = _broadcast_save_failure(accelerator, save_failed)
                         if save_failed:
                             raise saved_exc
@@ -1020,7 +1028,7 @@ def integration_test(
 ) -> None:
     """Run integration test on synthetic data with real or tiny model.
 
-    Asserts all five Technical Design §5 assertions:
+    Asserts five critical system integration points:
     1. Forward returns finite loss.
     2. Optimizer step changes at least one parameter (L2 diff > 0).
     3. save_pretrained writes config.json + safetensors.

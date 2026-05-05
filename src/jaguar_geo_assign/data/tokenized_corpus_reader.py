@@ -59,11 +59,9 @@ def _get_distributed_state() -> tuple[int, int, int, int]:
     Attempts to use accelerate.state.PartialState; falls back to environment
     variables (RANK, WORLD_SIZE, LOCAL_RANK, LOCAL_WORLD_SIZE) and PyTorch
     worker info. This ensures the reader works in single-GPU, multi-GPU/DDP,
-    and multi-worker DataLoader contexts.
-
-    # TRADE-OFF: environment variable fallback is used when accelerate is not
-    # available or in early initialization. Ensures compatibility across training
-    # frameworks.
+    and multi-worker DataLoader contexts. Environment fallback ensures compatibility
+    across training frameworks and handles early initialization before Accelerate
+    state is available.
     """
     process_index = 0
     num_processes = 1
@@ -199,8 +197,8 @@ class TokenizedCorpusReader(IterableDataset):
 
         global_workers = max(1, world_size) * max(1, num_workers)
         if len(self._files) < global_workers:
-            # TRADE-OFF: Empty-shard deadlock guard catches configurations that would
-            # result in a trailing rank receiving 0 batches, which deadlocks DDP.
+            # Prevent empty-shard deadlock: if fewer files than global workers, some
+            # ranks will receive 0 batches, causing all ranks to hang on collective ops.
             raise CorpusReaderError(
                 f"Found {len(self._files)} files in {self.corpus_root} but DDP needs at least "
                 f"{global_workers} (world_size={world_size} x num_workers={num_workers}). "
@@ -288,8 +286,9 @@ class TokenizedCorpusReader(IterableDataset):
         # Compute distributed state
         process_index, num_processes, worker_id, num_workers = _get_distributed_state()
 
-        # # TRADE-OFF: global_worker_id formula ensures each worker reads a disjoint
-        # subset of files without overlap or gaps. Used for DDP + multi-worker setup.
+        # Global worker ID ensures disjoint file assignment: each worker gets a unique
+        # offset (0 to num_processes * num_workers - 1) for round-robin file distribution.
+        # Prevents overlap and gaps in multi-GPU multi-worker setup.
         global_worker_id = process_index * num_workers + worker_id
         global_world_size = num_processes * num_workers
 
