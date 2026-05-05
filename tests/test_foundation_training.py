@@ -530,69 +530,98 @@ def test_train_token_accuracy_accumulates(tmp_path: Path, cpu_accelerator, tiny_
             raise AssertionError("train/token_accuracy not found in any accelerator.log call")
 
 
-def test_nan_loss_skips_token_accuracy_accumulation() -> None:
+def test_nan_loss_skips_token_accuracy_accumulation(
+    tmp_path: Path, cpu_accelerator, tiny_bert_model
+) -> None:
     """Regression test: NaN-loss step does NOT corrupt token-accuracy counters.
 
-    Verifies that when a training step produces NaN loss, the token-accuracy
-    accumulation block (token_correct, token_masked) is skipped. This prevents
-    garbage argmax results from NaN logits from being counted against real labels.
-
-    This is a unit test of the metric accumulation logic. It directly tests that
-    the NaN/Inf guard correctly blocks token-accuracy accumulation on problematic
-    steps, ensuring the reported accuracy reflects only valid (finite-loss) steps.
+    End-to-end invocation of run_felid_foundation_training that verifies when a
+    training step produces NaN loss, the token-accuracy accumulation block
+    (token_correct, token_masked) is skipped. This prevents garbage argmax results
+    from NaN logits from being counted against real labels. Falsification check
+    passed: un-indenting the production with torch.no_grad() block makes this test
+    fail as required.
     """
-    train_metric = MetricAccumulator()
+    # Write tiny corpus with 1 train record
+    metadata_path = _write_tiny_corpus(tmp_path, {"train": 1})
+    config_file = write_train_config(tmp_path, metadata_path)
 
-    # Simulate step 1: NaN loss (token_correct and token_masked should NOT change)
-    loss_f = torch.tensor(float("nan"))
-    if torch.isnan(loss_f).any() or torch.isinf(loss_f).any():
-        train_metric.nan_count += 1
-        # Token accuracy should NOT be accumulated here
-    else:
-        train_metric.loss_sum += loss_f.mean().item()
-        train_metric.step_count += 1
-        train_metric.token_correct += 1
-        train_metric.token_masked += 4
+    tokenizer = FakeTokenizer()
 
-    # After NaN step: nan_count=1, but token counters are 0
-    assert train_metric.nan_count == 1, "NaN step should increment nan_count"
-    assert train_metric.token_correct == 0, "NaN step should NOT accumulate token_correct"
-    assert train_metric.token_masked == 0, "NaN step should NOT accumulate token_masked"
+    patch_loaders = "jaguar_geo_assign.pretrain.foundation_training._build_dataloaders"
+    patch_build = "jaguar_geo_assign.pretrain.foundation_training._build_model_and_tokenizer"
 
-    # Simulate step 2: finite loss (token_correct and token_masked SHOULD change)
-    loss_f = torch.tensor(1.5)
-    if torch.isnan(loss_f).any() or torch.isinf(loss_f).any():
-        train_metric.nan_count += 1
-    else:
-        train_metric.loss_sum += loss_f.mean().item()
-        train_metric.step_count += 1
-        # Now accumulate token accuracy
-        train_metric.token_correct += 2
-        train_metric.token_masked += 4
+    with patch(patch_loaders) as mock_loaders, patch(patch_build) as mock_build:
+        mock_build.return_value = (tiny_bert_model, tokenizer, "none", False)
+        mock_loaders.return_value = (make_dummy_loader(), None)
 
-    # After finite step: nan_count=1, token_correct=2, token_masked=4
-    assert train_metric.nan_count == 1, "Should still have 1 NaN step"
-    assert train_metric.step_count == 1, "Should have 1 finite step"
-    assert train_metric.token_correct == 2, "Token_correct accumulated only on finite step"
-    assert train_metric.token_masked == 4, "Token_masked accumulated only on finite step"
+        # Capture what gets passed to reduce(); inspect token counts
+        reduce_calls = []
 
-    # Verify mean loss is computed only from finite steps
-    mean_loss = (
-        train_metric.loss_sum / train_metric.step_count
-        if train_metric.step_count > 0
-        else float("nan")
-    )
-    assert not math.isnan(mean_loss), "Mean loss should be finite"
-    assert abs(mean_loss - 1.5) < 1e-6, "Mean loss should equal the single finite loss"
+        def capture_reduce(local_counts: torch.Tensor, **kwargs) -> torch.Tensor:
+            """Capture the local token counts before reduction."""
+            reduce_calls.append(local_counts.clone().detach())
+            # Return the same values (identity; we're single-process)
+            return local_counts.clone()
 
-    # Verify token accuracy is computed correctly
-    token_acc = (
-        float("nan")
-        if train_metric.token_masked == 0
-        else train_metric.token_correct / train_metric.token_masked
-    )
-    assert not math.isnan(token_acc), "Token accuracy should be finite"
-    assert abs(token_acc - 0.5) < 1e-6, "Token accuracy should be 2/4 = 0.5"
+        with (
+            patch("accelerate.Accelerator.reduce") as mock_reduce,
+            patch(
+                "accelerate.Accelerator.sync_gradients",
+                new_callable=PropertyMock,
+            ) as mock_sync,
+            patch("accelerate.Accelerator.log") as mock_log,
+        ):
+            # Configure reduce to capture calls and return identity
+            mock_reduce.side_effect = capture_reduce
+            # Sync gradients on every 4th step (mimic normal training)
+            mock_sync.side_effect = [False, False, False, True] * 10
+            mock_log.return_value = None
+
+            # Patch model.forward to return NaN loss on first call only
+            original_forward = tiny_bert_model.forward
+            call_count = [0]
+
+            def nan_loss_forward(**kwargs):
+                """Return NaN loss on first call, real loss on subsequent calls."""
+                call_count[0] += 1
+                outputs = original_forward(**kwargs)
+                if call_count[0] == 1:
+                    # Return NaN loss with NaN logits (simulating pathological step).
+                    # Use requires_grad=True so backward pass can traverse the graph.
+                    nan_loss = torch.tensor(
+                        float("nan"),
+                        dtype=outputs.loss.dtype,
+                        requires_grad=True,
+                    )
+                    return type(outputs)(
+                        loss=nan_loss,
+                        logits=torch.full_like(outputs.logits, float("nan")),
+                    )
+                return outputs
+
+            with patch.object(tiny_bert_model, "forward", side_effect=nan_loss_forward):
+                run_felid_foundation_training(config_file, integration_test_mode="off")
+
+            # Assert: the first reduce call should have [0, 0] (no token-accuracy
+            # accumulated on the NaN step). If token-accuracy block was NOT
+            # skipped, these would be non-zero garbage values from NaN logits.
+            assert len(reduce_calls) > 0, (
+                "reduce() should have been called at least once (at first log step)"
+            )
+
+            first_reduce_call = reduce_calls[0]
+            token_correct, token_masked = (
+                first_reduce_call[0].item(),
+                first_reduce_call[1].item(),
+            )
+
+            assert token_correct == 0.0, (
+                f"NaN step should NOT accumulate token_correct; got {token_correct}"
+            )
+            assert token_masked == 0.0, (
+                f"NaN step should NOT accumulate token_masked; got {token_masked}"
+            )
 
 
 def test_trainability_assertion_runs_and_logs() -> None:
