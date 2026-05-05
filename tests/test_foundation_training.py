@@ -2150,3 +2150,102 @@ def test_broadcast_save_failure_barrier_order() -> None:
         f"Call order violated: set_trigger({set_trigger_idx}) → "
         f"wait_for_everyone({wait_idx}) → check_trigger({check_idx})"
     )
+
+
+def test_nan_loss_skips_eval_token_accuracy_accumulation(
+    tmp_path: Path, cpu_accelerator, tiny_bert_model
+) -> None:
+    """Regression test: NaN-loss step in eval does NOT corrupt token-accuracy counters.
+
+    End-to-end invocation of run_felid_foundation_training that verifies when an
+    eval step produces NaN loss, the token-accuracy accumulation block
+    (token_correct, token_masked) is skipped. This prevents garbage argmax results
+    from NaN logits from being counted against real labels. Falsification check
+    passed: un-indenting the eval token-accuracy block outside the `if not NaN/Inf`
+    guard makes this test fail as required.
+    """
+    # Write tiny corpus with 1 train record and 1 eval record
+    metadata_path = _write_tiny_corpus(tmp_path, {"train": 1, "eval": 1})
+    config_file = write_train_config(
+        tmp_path,
+        metadata_path,
+        max_steps=2,  # Run for 2 steps to reach eval (step 0, step 1 triggers eval)
+        eval_every=1,  # Eval on every step
+    )
+
+    tokenizer = FakeTokenizer()
+
+    patch_loaders = "jaguar_geo_assign.pretrain.foundation_training._build_dataloaders"
+    patch_build = "jaguar_geo_assign.pretrain.foundation_training._build_model_and_tokenizer"
+
+    with patch(patch_loaders) as mock_loaders, patch(patch_build) as mock_build:
+        mock_build.return_value = (tiny_bert_model, tokenizer, "none", False)
+        # Return (train_loader, eval_loader) tuple
+        mock_loaders.return_value = (make_dummy_loader(), make_dummy_loader())
+
+        # Capture accelerator.log calls to inspect eval/token_accuracy
+        log_calls = []
+
+        def capture_log(data=None, **kwargs) -> None:
+            """Capture log calls to inspect token-accuracy values."""
+            if data is not None:
+                log_calls.append(data.copy() if hasattr(data, "copy") else data)
+
+        with (
+            patch("accelerate.Accelerator.log") as mock_log,
+            patch(
+                "accelerate.Accelerator.sync_gradients",
+                new_callable=PropertyMock,
+            ) as mock_sync,
+        ):
+            mock_log.side_effect = capture_log
+            # Sync gradients on every 4th step (mimic normal training)
+            mock_sync.side_effect = [False, False, False, True] * 10
+
+            # Patch model.forward to return NaN loss and logits during eval phase
+            original_forward = tiny_bert_model.forward
+            call_count = [0]
+
+            def nan_loss_eval_forward(**kwargs):
+                """Return NaN loss on eval step, real loss on train steps."""
+                call_count[0] += 1
+                outputs = original_forward(**kwargs)
+                # Detect eval phase: model should be in eval mode during eval loop
+                is_eval_mode = not tiny_bert_model.training
+                if is_eval_mode and call_count[0] >= 2:
+                    # Simulate pathological eval step with NaN loss and NaN logits
+                    nan_loss = torch.tensor(
+                        float("nan"),
+                        dtype=outputs.loss.dtype,
+                        requires_grad=True,
+                    )
+                    return type(outputs)(
+                        loss=nan_loss,
+                        logits=torch.full_like(outputs.logits, float("nan")),
+                    )
+                return outputs
+
+            with patch.object(tiny_bert_model, "forward", side_effect=nan_loss_eval_forward):
+                run_felid_foundation_training(config_file, integration_test_mode="off")
+
+            # Assert: find eval/token_accuracy in logged data
+            eval_token_accuracy = None
+            for log_data in log_calls:
+                if isinstance(log_data, dict) and "eval/token_accuracy" in log_data:
+                    eval_token_accuracy = log_data["eval/token_accuracy"]
+                    break
+
+            # If NaN-loss eval step was the only eval step (due to max_steps=2, eval_every=1),
+            # then token_masked should be 0 (no accumulation happened) and token_accuracy is NaN.
+            # If the bug is present (token-accuracy block NOT guarded), token_masked would be
+            # non-zero (garbage from NaN logits) and eval_token_accuracy would be some
+            # finite garbage value.
+            assert eval_token_accuracy is not None, (
+                "eval/token_accuracy not found in any accelerator.log call"
+            )
+            assert math.isnan(eval_token_accuracy), (
+                f"Eval step with NaN loss should produce NaN eval/token_accuracy; "
+                f"got {eval_token_accuracy}. If this assertion fails when "
+                f"token-accuracy block is moved outside the NaN/Inf guard, "
+                f"the bug is NOT fixed."
+            )

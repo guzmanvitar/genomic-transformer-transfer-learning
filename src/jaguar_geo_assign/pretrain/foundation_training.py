@@ -857,21 +857,21 @@ def run_felid_foundation_training(
                                     eval_metric.loss_sum += gathered_loss.mean().item()
                                     eval_metric.step_count += 1
 
-                                # Token accuracy accumulation for eval loop.
-                                # Compute predictions and accumulate against masked labels locally.
-                                preds = outputs.logits.argmax(dim=-1)
-                                labels = eval_batch.get("labels")
-                                if labels is not None:
-                                    gathered_preds = accelerator.gather_for_metrics(preds)
-                                    gathered_labels = accelerator.gather_for_metrics(labels)
-                                    gathered_mask = gathered_labels != -100
-                                    if accelerator.is_main_process:
-                                        eval_metric.token_correct += (
-                                            ((gathered_preds == gathered_labels) & gathered_mask)
-                                            .sum()
-                                            .item()
-                                        )
-                                        eval_metric.token_masked += gathered_mask.sum().item()
+                                    # Token accuracy accumulation for eval loop.
+                                    # Only accumulate on finite-loss steps; NaN/Inf logits
+                                    # produce garbage argmax results that corrupt the metric.
+                                    preds = outputs.logits.argmax(dim=-1)
+                                    labels = eval_batch.get("labels")
+                                    if labels is not None:
+                                        gathered_preds = accelerator.gather_for_metrics(preds)
+                                        gathered_labels = accelerator.gather_for_metrics(labels)
+                                        gathered_mask = gathered_labels != -100
+                                        if accelerator.is_main_process:
+                                            mask_match = (
+                                                gathered_preds == gathered_labels
+                                            ) & gathered_mask
+                                            eval_metric.token_correct += mask_match.sum().item()
+                                            eval_metric.token_masked += gathered_mask.sum().item()
 
                         model.train()
                         mean_eval_loss = (
