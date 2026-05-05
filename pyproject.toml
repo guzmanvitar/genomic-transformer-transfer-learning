@@ -5,7 +5,10 @@ description = "Leakage-safe transfer learning scaffold for jaguar geographic ass
 readme = "README.md"
 requires-python = ">=3.11,<3.12"
 dependencies = [
+    "accelerate>=1.13.0",
     "pyarrow>=16,<20",
+    "tensorboard>=2.20.0",
+    "torch>=2.11.0",
     "transformers>=5.6,<6",
 ]
 

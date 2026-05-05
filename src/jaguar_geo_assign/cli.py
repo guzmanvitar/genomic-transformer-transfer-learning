@@ -56,6 +56,7 @@ def build_parser() -> argparse.ArgumentParser:
     * ``validate-felid-foundation-config`` – validate a felid foundation config.
     * ``describe-felid-foundation-config`` – summarise a felid foundation config.
     * ``check-felid-foundation-runtime`` – check felid foundation runtime dependencies.
+    * ``train-felid-foundation`` – run felid foundation continued pre-training (DNABERT-2 MLM).
 
     Returns:
         A fully-configured :class:`argparse.ArgumentParser` ready for
@@ -140,6 +141,25 @@ def build_parser() -> argparse.ArgumentParser:
         help="Check external runtime dependencies for the felid foundation pipeline.",
     )
     felid_runtime.add_argument("config", type=Path)
+
+    train_foundation = subparsers.add_parser(
+        "train-felid-foundation",
+        help=(
+            "Train DNABERT-2 on the felid foundation tokenized corpus with continued pre-training."
+        ),
+    )
+    train_foundation.add_argument(
+        "--config",
+        type=Path,
+        required=True,
+        help="Path to the felid foundation training TOML config.",
+    )
+    train_foundation.add_argument(
+        "--integration-test",
+        action="store_true",
+        default=False,
+        help="Run integration test mode (no HF Hub access needed for tiny model).",
+    )
 
     return parser
 
@@ -262,6 +282,21 @@ def main(argv: Sequence[str] | None = None) -> int:
             else "no external tools required"
         )
         print(f"Runtime contract satisfied for '{config.name}': {tools_summary}")
+        return 0
+
+    if args.command == "train-felid-foundation":
+        # Lazy import to keep CLI startup fast and avoid importing torch/transformers
+        # for unrelated subcommands
+        from .pretrain.foundation_training import integration_test, run_felid_foundation_training
+
+        try:
+            if args.integration_test:
+                integration_test(use_real_model=False)
+            else:
+                run_felid_foundation_training(args.config)
+        except (RuntimeError, ValueError) as error:
+            print(str(error))
+            return 1
         return 0
 
     config_name = None

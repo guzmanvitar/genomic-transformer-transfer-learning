@@ -1264,3 +1264,161 @@ def describe_felid_foundation_config(path: str | Path) -> str:
             f"Runtime tools: {external_tools_display}",
         ]
     )
+
+
+@dataclass(frozen=True)
+class FoundationTrainingConfig:
+    """Immutable, validated configuration for felid foundation continued pre-training.
+
+    Composed of required corpus metadata path, model identifier, and step counts,
+    plus defaulted hyperparameters for training (batch size, learning rate, warmup,
+    checkpointing) and evaluation. Every field is validated by
+    :func:`load_foundation_training_config` before construction.
+
+    Attributes:
+        corpus_metadata_path: Path to metadata.json produced by TokenizedCorpusWriter.
+        model_identifier: HuggingFace model ID (pinned to zhihan1996/DNABERT-2-117M).
+        model_revision: Git revision hash for exact model reproducibility.
+        max_steps: Total training steps (required; no automatic epoch-based scaling).
+        output_dir: Root directory for checkpoints and logs.
+        max_seq_length: Maximum sequence length (truncation in reader).
+        mlm_probability: Masking probability for dynamic masking (0.15 standard).
+        per_device_train_batch_size: Batch size per GPU/worker (before accumulation).
+        per_device_eval_batch_size: Batch size per GPU/worker for validation.
+        gradient_accumulation_steps: Accumulate gradients before optimizer step.
+        learning_rate: Initial learning rate for AdamW.
+        weight_decay: L2 regularization coefficient.
+        warmup_steps: Linear warmup steps before cosine decay.
+        eval_every: Validation frequency (steps).
+        eval_max_steps: Max validation steps per epoch (auto-derived if None).
+        save_every: Checkpoint save frequency (steps).
+        log_every: Logging frequency (steps).
+        gradient_clip: Gradient norm clipping value.
+        seed: Random seed for reproducibility.
+        num_workers: DataLoader worker processes.
+        shuffle_buffer_size: Row-level shuffle buffer size.
+        tensorboard_subdir: Subdirectory under output_dir for TensorBoard logs.
+        pad_token_fallback: Strategy if tokenizer lacks pad_token (eos/unk/add_pad).
+    """
+
+    corpus_metadata_path: Path
+    model_identifier: str
+    model_revision: str
+    max_steps: int
+    output_dir: Path = Path("models/foundation_felid")
+    max_seq_length: int = 512
+    mlm_probability: float = 0.15
+    per_device_train_batch_size: int = 8
+    per_device_eval_batch_size: int = 8
+    gradient_accumulation_steps: int = 1
+    learning_rate: float = 1e-4
+    weight_decay: float = 0.01
+    warmup_steps: int = 1000
+    eval_every: int = 500
+    eval_max_steps: int | None = None
+    save_every: int = 1000
+    log_every: int = 10
+    gradient_clip: float = 1.0
+    seed: int = 42
+    num_workers: int = 4
+    shuffle_buffer_size: int = 8192
+    tensorboard_subdir: str = "tensorboard"
+    pad_token_fallback: str = "eos"
+
+
+def load_foundation_training_config(path: str | Path) -> FoundationTrainingConfig:
+    """Load and validate a felid foundation training TOML config.
+
+    Enforces that required fields (corpus_metadata_path, model_identifier,
+    model_revision, max_steps) are present and valid, and that optional
+    hyperparameters fall within sensible ranges. The model_identifier is
+    pinned to zhihan1996/DNABERT-2-117M by contract; other fields are
+    lightly validated (e.g., learning_rate > 0, batch sizes > 0).
+
+    Args:
+        path: Filesystem path to a TOML training config file.
+
+    Returns:
+        A fully validated, frozen :class:`FoundationTrainingConfig`.
+
+    Raises:
+        ValueError: If any contract check fails or a required field is missing.
+        KeyError: If a required TOML section or key is missing.
+    """
+    raw = tomllib.loads(Path(path).read_text(encoding="utf-8"))
+    try:
+        training = raw["training"]
+        corpus_metadata_path = Path(training["corpus_metadata_path"])
+        model_identifier = training["model_identifier"]
+        model_revision = training["model_revision"]
+        max_steps = int(training["max_steps"])
+
+        # Defaults and optional fields
+        output_dir = Path(training.get("output_dir", "models/foundation_felid"))
+        max_seq_length = int(training.get("max_seq_length", 512))
+        mlm_probability = float(training.get("mlm_probability", 0.15))
+        per_device_train_batch_size = int(training.get("per_device_train_batch_size", 8))
+        per_device_eval_batch_size = int(training.get("per_device_eval_batch_size", 8))
+        gradient_accumulation_steps = int(training.get("gradient_accumulation_steps", 1))
+        learning_rate = float(training.get("learning_rate", 1e-4))
+        weight_decay = float(training.get("weight_decay", 0.01))
+        warmup_steps = int(training.get("warmup_steps", 1000))
+        eval_every = int(training.get("eval_every", 500))
+        eval_max_steps_raw = training.get("eval_max_steps")
+        eval_max_steps = int(eval_max_steps_raw) if eval_max_steps_raw is not None else None
+        save_every = int(training.get("save_every", 1000))
+        log_every = int(training.get("log_every", 10))
+        gradient_clip = float(training.get("gradient_clip", 1.0))
+        seed = int(training.get("seed", 42))
+        num_workers = int(training.get("num_workers", 4))
+        shuffle_buffer_size = int(training.get("shuffle_buffer_size", 8192))
+        tensorboard_subdir = training.get("tensorboard_subdir", "tensorboard")
+        pad_token_fallback = training.get("pad_token_fallback", "eos")
+
+        # Validation
+        if not corpus_metadata_path.is_absolute():
+            raise ValueError("training.corpus_metadata_path must be an absolute path")
+        if model_identifier != "zhihan1996/DNABERT-2-117M":
+            raise ValueError(
+                "training.model_identifier must be pinned to zhihan1996/DNABERT-2-117M"
+            )
+        if max_steps <= 0:
+            raise ValueError("training.max_steps must be positive")
+        if learning_rate <= 0:
+            raise ValueError("training.learning_rate must be positive")
+        if per_device_train_batch_size <= 0:
+            raise ValueError("training.per_device_train_batch_size must be positive")
+        if per_device_eval_batch_size <= 0:
+            raise ValueError("training.per_device_eval_batch_size must be positive")
+        if pad_token_fallback not in {"eos", "unk", "add_pad"}:
+            raise ValueError("training.pad_token_fallback must be one of: eos, unk, add_pad")
+
+    except KeyError as exc:
+        msg = f"Foundation training config is missing required field: {exc.args[0]}"
+        raise ValueError(msg) from exc
+
+    return FoundationTrainingConfig(
+        corpus_metadata_path=corpus_metadata_path,
+        model_identifier=model_identifier,
+        model_revision=model_revision,
+        max_steps=max_steps,
+        output_dir=output_dir,
+        max_seq_length=max_seq_length,
+        mlm_probability=mlm_probability,
+        per_device_train_batch_size=per_device_train_batch_size,
+        per_device_eval_batch_size=per_device_eval_batch_size,
+        gradient_accumulation_steps=gradient_accumulation_steps,
+        learning_rate=learning_rate,
+        weight_decay=weight_decay,
+        warmup_steps=warmup_steps,
+        eval_every=eval_every,
+        eval_max_steps=eval_max_steps,
+        save_every=save_every,
+        log_every=log_every,
+        gradient_clip=gradient_clip,
+        seed=seed,
+        num_workers=num_workers,
+        shuffle_buffer_size=shuffle_buffer_size,
+        tensorboard_subdir=tensorboard_subdir,
+        pad_token_fallback=pad_token_fallback,
+    )

@@ -1,0 +1,136 @@
+# DNABERT-2 Felid Foundation Continued Pre-training Configuration
+#
+# This configuration file documents all hyperparameters for the felid
+# foundation continued pre-training pipeline. All values are production
+# defaults tuned for bf16 multi-GPU training (Ampere or newer).
+#
+# Required environment:
+# - Felid foundation tokenized corpus at corpus_metadata_path
+# - CUDA-capable GPU with bf16 support (Ampere/Ada generation recommended)
+# - Python 3.10+, torch 2.1+, transformers 5.6+, accelerate 1.0+
+
+[training]
+# ============================================================================
+# REQUIRED FIELDS — No defaults
+# ============================================================================
+
+# Absolute path to metadata.json produced by TokenizedCorpusWriter.
+# Before running training, ensure the corpus is built:
+#   uv run jaguar-geo-assign felid-foundation-pretrain <corpus-config.toml>
+corpus_metadata_path = "/path/to/felid/foundation/corpus/metadata.json"
+
+# HuggingFace model identifier (pinned to DNABERT-2-117M per contract).
+model_identifier = "zhihan1996/DNABERT-2-117M"
+
+# Git commit hash for exact model reproducibility.
+# Pinning the revision ensures deterministic warm-start and auditability.
+model_revision = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+
+# Total training steps. Use record_count from corpus metadata to estimate:
+#   max_steps = (record_count / (per_device_train_batch_size * world_size)) * num_epochs
+# For the full felid corpus (~2M tokens), 10k steps ≈ 1 epoch on 8 GPUs.
+max_steps = 10000
+
+# ============================================================================
+# OPTIONAL FIELDS — All have production defaults
+# ============================================================================
+
+# Checkpoint and TensorBoard output root directory.
+# Created automatically if it does not exist.
+output_dir = "models/foundation_felid"
+
+# Maximum sequence length (tokens). Reader will truncate longer windows.
+# DNABERT-2 position embeddings support 512 tokens.
+max_seq_length = 512
+
+# Masking probability for dynamic MLM (standard is 0.15 for 15% masking).
+mlm_probability = 0.15
+
+# Per-device batch size for training (before gradient accumulation).
+# Adjust downward if OOM errors occur on smaller GPUs (e.g., 4 or 6).
+per_device_train_batch_size = 8
+
+# Per-device batch size for validation.
+# Smaller than training is common; set to 8 or 16.
+per_device_eval_batch_size = 8
+
+# Gradient accumulation steps. Increases effective batch size without OOM.
+# Effective batch size = per_device_train_batch_size * gradient_accumulation_steps * world_size
+# Recommended: 1 for large-batch setups, 2-4 for memory-constrained setups.
+gradient_accumulation_steps = 1
+
+# Initial learning rate for AdamW optimizer. Applied to linear warmup ramp.
+# Standard MLM: 1e-4 or 5e-5. Smaller values (~5e-5) for longer warmup.
+learning_rate = 0.0001
+
+# L2 regularization (weight decay) coefficient in AdamW.
+# Applied only to non-bias and non-LayerNorm parameters (per §3.4).
+weight_decay = 0.01
+
+# Linear warmup steps before cosine annealing begins.
+# Typical range: 500–2000 steps. Higher warmup for longer training.
+warmup_steps = 1000
+
+# Validation frequency (every N training steps).
+# Set to 0 to skip validation; recommended range is 500–2000.
+eval_every = 500
+
+# Maximum validation steps per epoch (OPTIONAL: auto-derived from record_count if omitted).
+# Auto-derivation prevents DDP deadlock by capping eval at a fixed step count.
+# If set explicitly, must be <= record_count / (per_device_eval_batch_size * world_size).
+# Uncomment and set to enable explicit cap:
+# eval_max_steps = 5000
+
+# Checkpoint save frequency (every N training steps).
+# "latest" checkpoint is overwritten; "best" is kept only if eval loss improves.
+save_every = 1000
+
+# Logging frequency (every N steps). Metrics are windowed averages over this window.
+# Recommended range: 10–100 steps.
+log_every = 10
+
+# Gradient norm clipping threshold (max L2 norm before scaling).
+# Standard: 1.0. Increase to 2.0 for large models with unstable loss.
+gradient_clip = 1.0
+
+# Random seed for reproducibility.
+# Used for file shuffling, row-level shuffle buffer, and optimizer initialization.
+seed = 42
+
+# Number of DataLoader worker processes per rank.
+# Increase if data loading is the bottleneck (e.g., 8, 16).
+num_workers = 4
+
+# Row-level shuffle buffer size (number of rows cached for random sampling).
+# Larger values (~8192) improve mixing at the cost of memory; smaller values
+# (~1024) are suitable for memory-constrained setups. Validation always uses 1.
+shuffle_buffer_size = 8192
+
+# Subdirectory under output_dir for TensorBoard event files.
+# Run: tensorboard --logdir=<output_dir>/tensorboard
+tensorboard_subdir = "tensorboard"
+
+# Fallback strategy if DNABERT-2 tokenizer lacks pad_token_id (likely).
+# Options:
+#   "eos" — use existing eos_token_id (default, best performance)
+#   "unk" — use existing unk_token_id (fallback if eos not available)
+#   "add_pad" — inject a new [PAD] token and resize embeddings (slowest warm-start)
+pad_token_fallback = "eos"
+
+# ============================================================================
+# DEPLOYMENT NOTES
+# ============================================================================
+#
+# Multi-GPU training (recommended):
+#   uv run accelerate launch --multi_gpu --num_processes 8 \
+#     -m jaguar_geo_assign.cli train-felid-foundation --config this_file.toml
+#
+# Single-GPU training:
+#   uv run python -m jaguar_geo_assign.cli train-felid-foundation --config this_file.toml
+#
+# Integration test (validates save/load, warm-start, and loss computation):
+#   uv run python -m jaguar_geo_assign.cli train-felid-foundation --config this_file.toml --integration-test
+#
+# Monitor training:
+#   tensorboard --logdir=<output_dir>/tensorboard &
+#   # In browser: http://localhost:6006/
