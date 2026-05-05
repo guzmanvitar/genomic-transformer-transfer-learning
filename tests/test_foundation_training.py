@@ -549,7 +549,7 @@ def test_trainability_assertion_runs_and_logs() -> None:
     accelerator = Accelerator()
     model = accelerator.prepare(model)
 
-    # Verify trainability check (Fix #10)
+    # Verify trainability check
     # Count trainable vs. total parameters after accelerator.prepare
     trainable = sum(1 for p in model.parameters() if p.requires_grad)
     total = sum(1 for _ in model.parameters())
@@ -567,7 +567,7 @@ def test_trainability_assertion_runs_and_logs() -> None:
 def test_startup_grad_norm_histogram_emitted(
     tmp_path: Path, cpu_accelerator, tiny_bert_model
 ) -> None:
-    """NEW test (Fix #13): Verify startup/grad_norm_hist is emitted as TensorBoard histogram.
+    """Verify startup/grad_norm_hist is emitted as TensorBoard histogram.
 
     Uses unittest.mock to patch the TensorBoard tracker's add_histogram method,
     runs a couple of training steps, and verifies that add_histogram was called
@@ -601,16 +601,10 @@ def test_startup_grad_norm_histogram_emitted(
             assert found, "startup/grad_norm_hist was not logged"
 
 
-def test_startup_probe_collects_grads_before_zero_grad(tmp_path: Path) -> None:
-    # Just pass because test_startup_grad_norm_histogram_emitted already tests this
-    # to avoid duplication, and both assertions are tested in one.
-    pass
-
-
 def test_save_checkpoint_atomically_json_is_a_file(tmp_path: Path) -> None:
     """Test that _save_checkpoint_atomically writes JSON as a file, not a directory.
 
-    Fix #14: Verifies that best_eval_loss.json is a regular file (Path.is_file() == True)
+    Verifies that best_eval_loss.json is a regular file (Path.is_file() == True)
     and not a directory, and that the JSON content can be read back correctly.
 
     Args:
@@ -638,7 +632,7 @@ def test_save_checkpoint_atomically_json_is_a_file(tmp_path: Path) -> None:
 def test_startup_probe_handles_zero_grad(tmp_path: Path) -> None:
     """Test that _startup_probe_metrics handles empty gradient list gracefully.
 
-    Fix #15: Verifies that calling _startup_probe_metrics after optimizer.zero_grad()
+    Verifies that calling _startup_probe_metrics after optimizer.zero_grad()
     does not raise RuntimeError from torch.stack([]).
 
     Args:
@@ -688,7 +682,7 @@ def test_startup_probe_handles_zero_grad(tmp_path: Path) -> None:
 def test_best_eval_loss_round_trip_on_resume(tmp_path: Path) -> None:
     """Test that best_eval_loss.json read/write paths are aligned.
 
-    Fix #16: Verifies that the sidecar is written to and read from
+    Verifies that the sidecar is written to and read from
     output_dir / "best" / "best_eval_loss.json", not split between paths.
 
     Args:
@@ -715,7 +709,7 @@ def test_best_eval_loss_round_trip_on_resume(tmp_path: Path) -> None:
 def test_scheduler_steps_only_on_sync_gradients(tmp_path: Path) -> None:
     """Test that scheduler only advances when gradients are synchronized.
 
-    Fix #17: Verifies that with gradient_accumulation_steps > 1, the scheduler
+    Verifies that with gradient_accumulation_steps > 1, the scheduler
     advances exactly once per optimizer update (when sync_gradients=True),
     not once per micro-step.
 
@@ -749,7 +743,7 @@ def test_scheduler_steps_only_on_sync_gradients(tmp_path: Path) -> None:
     model, optimizer, scheduler = accelerator.prepare(model, optimizer, scheduler)
     model = model.to("cpu")
 
-    # Create synthetic batches (CPU)
+    # Create synthetic batches
     synthetic_batch = {
         "input_ids": torch.tensor(
             [[101, 1010, 1010, 102, 0, 0], [101, 1010, 1010, 1010, 102, 0]], device="cpu"
@@ -777,7 +771,7 @@ def test_scheduler_steps_only_on_sync_gradients(tmp_path: Path) -> None:
             # Backward
             accelerator.backward(loss)
 
-            # Optimizer and scheduler steps (guarded by sync_gradients as in Fix #17)
+            # Optimizer and scheduler steps
             if accelerator.sync_gradients:
                 optimizer.step()
                 scheduler_steps += 1
@@ -796,7 +790,7 @@ def test_scheduler_steps_only_on_sync_gradients(tmp_path: Path) -> None:
 def test_corpus_reader_epoch_seed_changes_iteration_order(tmp_path: Path) -> None:
     """Test that TokenizedCorpusReader.set_epoch changes the RNG seed for shuffle.
 
-    Fix #18: Verifies that calling set_epoch() updates the internal epoch state,
+    Verifies that calling set_epoch() updates the internal epoch state,
     which is XORed with the seed to produce different random permutations
     across epochs (seed ^ epoch). This ensures data diversity in multi-epoch training.
 
@@ -844,7 +838,7 @@ def test_corpus_reader_epoch_seed_changes_iteration_order(tmp_path: Path) -> Non
 def test_step_counter_aligns_with_optimizer_updates(
     tmp_path: Path, cpu_accelerator, tiny_bert_model
 ) -> None:
-    """NEW test (Fix #2): Verify step counter aligns with optimizer updates.
+    """Verify step counter aligns with optimizer updates.
 
     With 8 micro-batches and gradient_accumulation_steps=4, there should be
     exactly 2 global optimizer steps. The scheduler and logger should also
@@ -882,7 +876,7 @@ def test_step_counter_aligns_with_optimizer_updates(
 
 
 def test_eval_loss_gathered_across_ranks(tmp_path: Path, tiny_bert_model) -> None:
-    """NEW test (Fix #3): Verify eval loss is gathered across ranks.
+    """Verify eval loss is gathered across ranks.
 
     Runs a tiny training loop with eval_every=1 and verifies that
     accelerator.gather_for_metrics was called on the loss tensor.
@@ -951,7 +945,7 @@ def test_eval_loss_gathered_across_ranks(tmp_path: Path, tiny_bert_model) -> Non
 def test_checkpoint_writes_are_rank_zero_only(
     tmp_path: Path, cpu_accelerator, tiny_bert_model
 ) -> None:
-    """NEW test (Fix #4): Verify DDP-safe checkpointing and atomic dir helper.
+    """Verify DDP-safe checkpointing and atomic dir helper.
 
     Verifies that when is_main_process=False, no files are written to best/hf_model
     or best_eval_loss.json. When True, they are written, and the atomic helper
@@ -1001,7 +995,7 @@ def test_checkpoint_writes_are_rank_zero_only(
 
 
 def test_nan_grad_skips_optimizer_step(tmp_path: Path, cpu_accelerator, tiny_bert_model) -> None:
-    """NEW test (Fix #1): NaN-gradient guard must skip optimizer step."""
+    """NaN-gradient guard must skip optimizer step."""
     metadata_path = _write_tiny_corpus(tmp_path, {"train": 1})
     config_file = write_train_config(tmp_path, metadata_path)
 
@@ -1054,7 +1048,7 @@ def test_nan_grad_skips_optimizer_step(tmp_path: Path, cpu_accelerator, tiny_ber
 def test_token_metric_accumulation_no_ddp_in_accumulate_context(
     tmp_path: Path, cpu_accelerator, tiny_bert_model
 ) -> None:
-    """NEW test (Fix #2): Verify token metric accumulation avoids DDP gather inside context."""
+    """Verify token metric accumulation avoids DDP gather inside context."""
     metadata_path = _write_tiny_corpus(tmp_path, {"train": 4})
     config_file = write_train_config(tmp_path, metadata_path, gradient_accumulation_steps=4)
 
@@ -1086,7 +1080,7 @@ def test_token_metric_accumulation_no_ddp_in_accumulate_context(
 def test_atomic_dir_replace_survives_simulated_crash(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """NEW test (Fix #3): Verify atomic_dir_replace TOCTOU window fix."""
+    """Verify atomic_dir_replace TOCTOU window fix."""
 
     target = tmp_path / "target_dir"
     target.mkdir(parents=True)
@@ -1117,7 +1111,7 @@ def test_atomic_dir_replace_survives_simulated_crash(
 def test_accelerate_state_written_through_tmp_dir(
     tmp_path: Path, cpu_accelerator, tiny_bert_model
 ) -> None:
-    """NEW test (Fix #4): Verify accelerate_state is staged through tmp dir."""
+    """Verify accelerate_state is staged through tmp dir."""
     metadata_path = _write_tiny_corpus(tmp_path, {"train": 1})
     config_file = write_train_config(tmp_path, metadata_path, save_every=1)
 
@@ -1152,7 +1146,7 @@ def test_accelerate_state_written_through_tmp_dir(
 def test_eval_accuracy_uses_gather_for_metrics(
     tmp_path: Path, cpu_accelerator, tiny_bert_model
 ) -> None:
-    """NEW test (Fix #27): Verify eval accuracy gathers preds/labels across ranks."""
+    """Verify eval accuracy gathers preds/labels across ranks."""
     metadata_path = _write_tiny_corpus(tmp_path, {"train": 1, "validation": 2})
     config_file = write_train_config(
         tmp_path, metadata_path, eval_every=1, per_device_eval_batch_size=1
@@ -1205,7 +1199,7 @@ def test_eval_accuracy_uses_gather_for_metrics(
 
 
 def test_atomic_dir_replace_recovers_from_crash(tmp_path: Path) -> None:
-    """NEW test (Fix #28): Verify _recover_atomic_dir handles mid-crash .old_ recovery."""
+    """Verify _recover_atomic_dir handles mid-crash .old_ recovery."""
 
     target = tmp_path / "target"
 
@@ -1229,7 +1223,7 @@ def test_atomic_dir_replace_recovers_from_crash(tmp_path: Path) -> None:
 def test_best_eval_loss_resume_handles_zero(
     tmp_path: Path, cpu_accelerator, tiny_bert_model
 ) -> None:
-    """NEW test (Fix #29): Verify best_eval_loss = 0.0 is not treated as falsy inf."""
+    """Verify best_eval_loss = 0.0 is not treated as falsy inf."""
     out_dir = tmp_path / "out"
     best_dir = out_dir / "best"
     best_dir.mkdir(parents=True)
@@ -1275,7 +1269,7 @@ eval_every = 1
 
 
 def test_rank0_save_exception_no_deadlock(tmp_path: Path, cpu_accelerator, tiny_bert_model) -> None:
-    """NEW test (Fix #30): Verify rank-0 save exception does not deadlock other ranks."""
+    """Verify rank-0 save exception does not deadlock other ranks."""
     metadata_path = _write_tiny_corpus(tmp_path, {"train": 1, "validation": 1})
     config_file = write_train_config(
         tmp_path, metadata_path, eval_every=1, per_device_eval_batch_size=1
@@ -1311,7 +1305,7 @@ def test_rank0_save_exception_no_deadlock(tmp_path: Path, cpu_accelerator, tiny_
 def test_non_rank0_save_exception_raises_runtime_error(
     tmp_path: Path, cpu_accelerator, tiny_bert_model
 ) -> None:
-    """NEW test: Verify non-failing ranks raise RuntimeError when broadcast says saw_failure."""
+    """Verify non-failing ranks raise RuntimeError when broadcast says saw_failure."""
     metadata_path = _write_tiny_corpus(tmp_path, {"train": 1, "validation": 1})
     config_file = write_train_config(
         tmp_path, metadata_path, eval_every=1, per_device_eval_batch_size=1
@@ -1343,7 +1337,7 @@ def test_non_rank0_save_exception_raises_runtime_error(
 
 
 def test_corpus_reader_rejects_empty_shard(tmp_path: Path) -> None:
-    """NEW test (Fix #31): Verify empty-shard deadlock guard."""
+    """Verify empty-shard deadlock guard."""
     metadata_path = _write_tiny_corpus(tmp_path, {"train": 2})
 
     # 2 files, global_workers = 4*1 = 4. 2 < 4, should raise CorpusReaderError.
@@ -1354,7 +1348,7 @@ def test_corpus_reader_rejects_empty_shard(tmp_path: Path) -> None:
 
 
 def test_accelerator_honors_world_size_env_vars() -> None:
-    """NEW test (Fix #32): Verify Accelerator detects num_processes from WORLD_SIZE."""
+    """Verify Accelerator detects num_processes from WORLD_SIZE."""
 
     with patch.dict(
         os.environ,
@@ -1379,7 +1373,7 @@ def test_accelerator_honors_world_size_env_vars() -> None:
 
 
 def test_reader_full_ddp_sharding_coverage(tmp_path: Path) -> None:
-    """NEW test (Fix #33, #39): Verify DDP sharding distributes files evenly without duplicates."""
+    """Verify DDP sharding distributes files evenly without duplicates."""
 
     class FakeBatch:
         def __init__(self, locus_id):
@@ -1462,7 +1456,7 @@ def test_reader_full_ddp_sharding_coverage(tmp_path: Path) -> None:
 
 
 def test_mid_rename_crash_recovery_all_dirs(tmp_path: Path) -> None:
-    """NEW test (Fix #37): Verify that all 4 critical directories are recovered on startup."""
+    """Verify that all 4 critical directories are recovered on startup."""
 
     metadata_path = _write_tiny_corpus(tmp_path, {"train": 1})
     out_dir = tmp_path / "out"
@@ -1541,7 +1535,7 @@ eval_every = 1
 
 
 def test_recover_atomic_dir_runs_on_main_only(tmp_path: Path) -> None:
-    """NEW test (Fix #28b): Verify _recover_atomic_dir guard - rank-0 only on shared FS.
+    """Verify _recover_atomic_dir guard - rank-0 only on shared FS.
 
     Tests that when is_main_process=True, _recover_atomic_dir is called 4 times.
     When is_main_process=False, it is called 0 times (guarded by accelerator check).
@@ -1629,7 +1623,7 @@ eval_every = 1
 
 
 def test_build_dataloaders_propagates_non_split_corpus_errors(tmp_path: Path) -> None:
-    """NEW test (Fix #41): _build_dataloaders propagates non-split-missing errors."""
+    """_build_dataloaders propagates non-split-missing errors."""
 
     config = FoundationTrainingConfig(
         corpus_metadata_path=tmp_path / "metadata.json",
@@ -1656,7 +1650,7 @@ def test_build_dataloaders_propagates_non_split_corpus_errors(tmp_path: Path) ->
 
 
 def test_build_dataloaders_handles_missing_validation_split(tmp_path: Path) -> None:
-    """NEW test (Fix #41): _build_dataloaders must catch specific split missing error."""
+    """_build_dataloaders must catch specific split missing error."""
 
     config = FoundationTrainingConfig(
         corpus_metadata_path=tmp_path / "metadata.json",
@@ -1738,7 +1732,7 @@ def test_eval_loop_respects_max_steps(tmp_path: Path, cpu_accelerator, tiny_bert
 
 
 def test_resume_restores_step_counter(tmp_path: Path, cpu_accelerator, tiny_bert_model) -> None:
-    """NEW test (Fix #44): Verify resume restores step counter from train_state.json."""
+    """Verify resume restores step counter from train_state.json."""
     out_dir = tmp_path / "out"
     latest_state = out_dir / "latest" / "accelerate_state"
     latest_state.mkdir(parents=True)
@@ -1784,7 +1778,7 @@ eval_every = 1
 def test_resume_handles_missing_train_state(
     tmp_path: Path, cpu_accelerator, tiny_bert_model
 ) -> None:
-    """NEW test (Fix #44): Verify resume gracefully handles missing train_state.json."""
+    """Verify resume gracefully handles missing train_state.json."""
     out_dir = tmp_path / "out"
     latest_state = out_dir / "latest" / "accelerate_state"
     latest_state.mkdir(parents=True)
@@ -1827,7 +1821,7 @@ eval_every = 1
 def test_resume_handles_corrupt_train_state(
     tmp_path: Path, cpu_accelerator, tiny_bert_model
 ) -> None:
-    """NEW test (Fix #44): Verify resume gracefully handles corrupt train_state.json."""
+    """Verify resume gracefully handles corrupt train_state.json."""
     out_dir = tmp_path / "out"
     latest_state = out_dir / "latest" / "accelerate_state"
     latest_state.mkdir(parents=True)
@@ -1868,7 +1862,7 @@ eval_every = 1
 
 
 def test_all_nan_eval_skips_best_save(tmp_path: Path, cpu_accelerator, tiny_bert_model) -> None:
-    """NEW test (Fix #45): Verify all-NaN eval batches do not save best checkpoint."""
+    """Verify all-NaN eval batches do not save best checkpoint."""
     metadata_path = _write_tiny_corpus(tmp_path, {"train": 1, "validation": 2})
     config_file = write_train_config(
         tmp_path, metadata_path, eval_every=1, per_device_eval_batch_size=1
@@ -1910,16 +1904,13 @@ def test_all_nan_eval_skips_best_save(tmp_path: Path, cpu_accelerator, tiny_bert
 def test_train_mean_loss_is_nan_when_all_steps_nan() -> None:
     """Verify that mean_loss returns NaN when step_count == 0.
 
-    Fix #3: Tests the NaN convention for mean_loss when no valid steps occurred
+    Tests the NaN convention for mean_loss when no valid steps occurred
     in the log window. This mirrors the eval-side convention from test_all_nan_eval_skips_best_save
     and the perplexity NaN convention (lines 752-756 in foundation_training.py).
 
     This is a unit test of the logic, not an integration test, to avoid AcceleratorState
     isolation issues when run as part of the full test suite.
     """
-    # Import MetricAccumulator to test the NaN logic directly
-    from jaguar_geo_assign.pretrain.foundation_training import MetricAccumulator
-
     # Create an empty metric accumulator (step_count == 0)
     train_metric = MetricAccumulator(
         step_count=0,
