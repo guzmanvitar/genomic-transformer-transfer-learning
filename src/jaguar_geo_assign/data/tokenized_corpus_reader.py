@@ -144,7 +144,7 @@ class TokenizedCorpusReader(IterableDataset):
         self.shuffle_buffer_size = shuffle_buffer_size
         self.seed = seed
         self.corpus_root = self.metadata_path.parent
-        self._epoch = 0  # Fix #18: Track epoch for deterministic multi-epoch shuffling
+        self._epoch = 0  # Track epoch for deterministic multi-epoch shuffling
 
         # Validation split disables shuffling
         self.file_shuffle = file_shuffle and (split != "validation")
@@ -252,7 +252,7 @@ class TokenizedCorpusReader(IterableDataset):
     def set_epoch(self, epoch: int) -> None:
         """Set the epoch number for reproducible multi-epoch training.
 
-        Fix #18: Mirrors torch.utils.data.distributed.DistributedSampler.set_epoch.
+        Mirrors torch.utils.data.distributed.DistributedSampler.set_epoch.
         The epoch is XORed with the random seed inside __iter__ so that the file
         permutation (and row-level RNG) differs across epochs, ensuring data diversity
         in multi-epoch runs. Without this, the same shuffle permutation is reused,
@@ -301,7 +301,7 @@ class TokenizedCorpusReader(IterableDataset):
             )
 
         # File-level shuffle: use epoch-dependent seed for multi-epoch diversity
-        # Fix #18: Use self._epoch (set by trainer via set_epoch) instead of hardcoded 0
+        # Use self._epoch (set by trainer via set_epoch) instead of hardcoded 0
         files = list(self._files)
         if self.file_shuffle:
             # Shuffle with epoch-dependent seed for reproducibility across restarts

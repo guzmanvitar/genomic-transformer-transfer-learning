@@ -36,6 +36,7 @@ from jaguar_geo_assign.data.tokenized_corpus_reader import (
 )  # noqa: E402
 from jaguar_geo_assign.pretrain.foundation_training import (
     MetricAccumulator,
+    _broadcast_save_failure,
     _build_dataloaders,
     _compute_eval_max_steps,
     _recover_atomic_dir,
@@ -103,8 +104,8 @@ def _write_tiny_corpus(tmp_path: Path, split_records: dict[str, int]) -> Path:
 
     Args:
         tmp_path: Temporary directory.
-        split_records: Mapping from split name to number of records per file
-            (e.g., {"train": 10, "validation": 5}).
+        split_records: Mapping from split name to number of files per split
+            (e.g., {"train": 4, "validation": 2}). Each file will contain one record.
 
     Returns:
         Path to metadata.json.
@@ -119,19 +120,19 @@ def _write_tiny_corpus(tmp_path: Path, split_records: dict[str, int]) -> Path:
         contract=DEFAULT_PARQUET_EXPORT_CONTRACT,
         provenance=None,
     ) as writer:
-        for split, num_records in split_records.items():
-            windows = []
-            for i in range(num_records):
+        for split, num_files in split_records.items():
+            # Write one record per batch to create multiple Parquet files
+            for file_idx in range(num_files):
                 sequence = "ACGTACGTACGT"
                 window_record = WindowRecord(
-                    sample_id=f"{split}_sample_{i % 3}",
-                    individual_id=f"{split}_ind_{i % 3}",
+                    sample_id=f"{split}_sample_{file_idx % 3}",
+                    individual_id=f"{split}_ind_{file_idx % 3}",
                     contig="chr1",
                     source="test",
                     split=split,
-                    locus_id=f"{split}_locus_{i:04d}",
-                    block_start=i * 100,
-                    block_end=(i + 1) * 100,
+                    locus_id=f"{split}_locus_{file_idx:04d}",
+                    block_start=file_idx * 100,
+                    block_end=(file_idx + 1) * 100,
                     window_start=0,
                     window_end=12,
                     sequence=sequence,
@@ -148,8 +149,8 @@ def _write_tiny_corpus(tmp_path: Path, split_records: dict[str, int]) -> Path:
                     token_to_base_ratio=len(tokenized["input_ids"]) / len(sequence),
                     tokenizer=TokenizerProvenance(),
                 )
-                windows.append(tokenized_window)
-            writer.write_batch(tuple(windows))
+                # One write_batch call per file to create separate Parquet files
+                writer.write_batch((tokenized_window,))
 
     return output_dir / "metadata.json"
 
@@ -1936,3 +1937,122 @@ def test_train_mean_loss_is_nan_when_all_steps_nan() -> None:
     # Also verify the perplexity convention: NaN when step_count == 0
     ppl = float("nan") if train_metric.step_count == 0 else math.exp(min(mean_loss, 20.0))
     assert math.isnan(ppl), f"Expected perplexity to be NaN when step_count == 0, but got {ppl}"
+
+
+def test_reader_disjoint_when_bypassing_prepare(tmp_path: Path) -> None:
+    """Verify file-level sharding is disjoint across ranks (no double-sharding).
+
+    Tests Fix A: By NOT passing dataloaders to accelerator.prepare, we avoid the
+    IterableDatasetShard double-sharding bug. This test creates a multi-file corpus
+    and verifies that two ranks (process_index=0 and 1) read disjoint file sets,
+    with their union covering the full corpus.
+
+    Acceptance:
+    - Reader rank 0 and reader rank 1 yield records from disjoint file sets
+    - Union of file paths from both ranks covers all corpus files
+    """
+    pytest.importorskip("pyarrow.parquet")
+    if Accelerator is None:
+        pytest.skip("accelerate not available")
+
+    # Create a 4-file corpus (ensures 2 ranks get 2 files each)
+    metadata_path = _write_tiny_corpus(tmp_path, {"train": 4})
+
+    # Patch _get_distributed_state to simulate rank 0
+    with (
+        patch(
+            "jaguar_geo_assign.data.tokenized_corpus_reader._get_distributed_state"
+        ) as mock_state,
+        patch.object(TokenizedCorpusReader, "_probe_parquet_schema", return_value=None),
+    ):
+        mock_state.return_value = (0, 2, 0, 1)  # rank 0 of 2, single worker
+        reader_0 = TokenizedCorpusReader(
+            metadata_path,
+            "train",
+            seed=42,
+            world_size=2,
+        )
+        reader_0_records = list(reader_0)
+
+    # Patch _get_distributed_state to simulate rank 1
+    with (
+        patch(
+            "jaguar_geo_assign.data.tokenized_corpus_reader._get_distributed_state"
+        ) as mock_state,
+        patch.object(TokenizedCorpusReader, "_probe_parquet_schema", return_value=None),
+    ):
+        mock_state.return_value = (1, 2, 0, 1)  # rank 1 of 2, single worker
+        reader_1 = TokenizedCorpusReader(
+            metadata_path,
+            "train",
+            seed=42,
+            world_size=2,
+        )
+        reader_1_records = list(reader_1)
+
+    # Both readers must have yielded records (no empty shard deadlock)
+    assert len(reader_0_records) > 0, "Rank 0 reader yielded no records"
+    assert len(reader_1_records) > 0, "Rank 1 reader yielded no records"
+
+    # Extract locus_ids from window objects to verify file-level sharding is disjoint
+    # Rank 0 should have file 0 and 2; Rank 1 should have files 1 and 3
+    loci_0 = {r.get("window", {}).get("locus_id") for r in reader_0_records if r.get("window")}
+    loci_1 = {r.get("window", {}).get("locus_id") for r in reader_1_records if r.get("window")}
+
+    # Assert disjointness
+    intersection = loci_0 & loci_1
+    assert len(intersection) == 0, (
+        f"Ranks have overlapping locus_ids (disjoint sharding failed): {intersection}"
+    )
+
+    # Assert union covers the corpus (each rank processed different files)
+    union = loci_0 | loci_1
+    assert union, "Union of locus_ids is empty"
+    assert len(union) == 4, f"Expected 4 unique locus_ids (one per file), got {len(union)}"
+
+
+def test_broadcast_save_failure_barrier_order() -> None:
+    """Verify _broadcast_save_failure calls set_trigger → wait_for_everyone → check_trigger.
+
+    Tests Fix B: The barrier must be inserted between set_trigger and check_trigger
+    to ensure all ranks reach the collective before rank-0 raises.
+
+    Acceptance:
+    - Method call order is exactly [set_trigger, wait_for_everyone, check_trigger]
+    """
+    if Accelerator is None:
+        pytest.skip("accelerate not available")
+
+    # Create a mock accelerator with set_trigger, wait_for_everyone, check_trigger
+    # hasattr(mock, "set_trigger") will return True naturally without patching
+    mock_accel = MagicMock()
+    mock_accel.set_trigger = MagicMock()
+    mock_accel.wait_for_everyone = MagicMock()
+    mock_accel.check_trigger = MagicMock(return_value=True)
+
+    # Call the function; hasattr will find set_trigger exists on the mock
+    _broadcast_save_failure(mock_accel, save_failed=True)
+
+    # Verify the call order via method_calls
+    calls = mock_accel.method_calls
+    assert len(calls) >= 3, f"Expected at least 3 method calls, got {len(calls)}: {calls}"
+
+    # Extract call names
+    call_names = [call[0] for call in calls]
+
+    # Find the indices
+    try:
+        set_trigger_idx = call_names.index("set_trigger")
+        wait_idx = call_names.index("wait_for_everyone")
+        check_idx = call_names.index("check_trigger")
+    except ValueError as e:
+        pytest.fail(
+            f"Expected calls [set_trigger, wait_for_everyone, check_trigger] not found in "
+            f"{call_names}. Error: {e}"
+        )
+
+    # Verify ordering: barrier must come between set_trigger and check_trigger
+    assert set_trigger_idx < wait_idx < check_idx, (
+        f"Call order violated: set_trigger({set_trigger_idx}) → "
+        f"wait_for_everyone({wait_idx}) → check_trigger({check_idx})"
+    )

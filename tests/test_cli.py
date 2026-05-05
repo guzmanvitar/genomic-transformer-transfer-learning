@@ -16,6 +16,7 @@ import stat
 import textwrap
 from dataclasses import replace
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
@@ -1652,9 +1653,7 @@ def test_train_felid_foundation_with_integration_test_flag_calls_integration_tes
 
 
 def test_integration_test_flag_uses_tiny_model(capsys) -> None:
-    """NEW test (Fix #36): Verify --integration-test flag invokes tiny model mode."""
-    from unittest.mock import patch
-
+    """Verify --integration-test flag invokes tiny model mode."""
     with patch(
         "jaguar_geo_assign.pretrain.foundation_training.integration_test"
     ) as mock_integration:

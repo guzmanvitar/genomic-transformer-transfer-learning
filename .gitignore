@@ -223,3 +223,7 @@ dev_docs
 
 # Foundation training checkpoints and logs
 models/foundation_felid/
+
+
+# Playwright MCP tooling artifacts
+.playwright-mcp/

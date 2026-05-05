@@ -433,6 +433,7 @@ def _broadcast_save_failure(accelerator: Accelerator, save_failed: bool) -> bool
     if hasattr(accelerator, "set_trigger"):
         if save_failed:
             accelerator.set_trigger()
+        accelerator.wait_for_everyone()  # Barrier: ensure all ranks reach this point
         return accelerator.check_trigger()
     else:
         fail_tensor = torch.tensor(
@@ -584,10 +585,14 @@ def run_felid_foundation_training(
             pass
 
     # Prepare for distributed training
-    model, optimizer, train_loader, scheduler = accelerator.prepare(
-        model, optimizer, train_loader, scheduler
-    )
-    eval_loader = accelerator.prepare(eval_loader) if eval_loader is not None else None
+    # TRADE-OFF: Dataloaders are NOT passed through accelerator.prepare because Accelerate would
+    # either (a) dispatch from rank-0 only [dispatch_batches=True default for IterableDataset,
+    # drops N-1/N of data] or (b) wrap in IterableDatasetShard which double-shards on top of
+    # our reader's file-level sharding. Manual device placement is used instead.
+    # Gradient accumulation via accelerator.accumulate() still works correctly because its
+    # sync_gradients flag is maintained by self.step (incremented at each accumulate() call),
+    # not by the prepared dataloader's state. See accelerate/accelerator.py:1228 _do_sync().
+    model, optimizer, scheduler = accelerator.prepare(model, optimizer, scheduler)
 
     # §3.10 (Fix #10): Model trainability verification (AC#5)
     # Count trainable vs. total parameters after construction and verify all are trainable.
@@ -655,6 +660,9 @@ def run_felid_foundation_training(
             for batch in train_loader:
                 if step >= config.max_steps:
                     break
+
+                # Manual device placement (dataloaders bypassed accelerator.prepare)
+                batch = {k: v.to(accelerator.device, non_blocking=True) for k, v in batch.items()}
 
                 with accelerator.accumulate(model):
                     outputs = model(**batch)
@@ -815,6 +823,12 @@ def run_felid_foundation_training(
                             for eval_step, eval_batch in enumerate(eval_loader):
                                 if eval_step >= eval_max_steps:
                                     break
+
+                                # Manual device placement (dataloaders bypassed accelerator.prepare)
+                                eval_batch = {
+                                    k: v.to(accelerator.device, non_blocking=True)
+                                    for k, v in eval_batch.items()
+                                }
 
                                 outputs = model(**eval_batch)
                                 loss = outputs.loss
