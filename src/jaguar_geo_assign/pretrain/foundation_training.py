@@ -474,7 +474,6 @@ def _startup_probe_metrics(
     batch: dict[str, torch.Tensor],
     step: int,
     accelerator: Accelerator,
-    model: Any,
 ) -> dict[str, float]:
     """Compute startup probe metrics for the first 20 steps per §3.7.
 
@@ -482,7 +481,6 @@ def _startup_probe_metrics(
         batch: Data batch with attention_mask and labels.
         step: Current training step (1-indexed).
         accelerator: Accelerate trainer for rank detection.
-        model: Model for computing per-parameter gradient norms (rank-0 only).
 
     Returns:
         Dict of metric name -> value for rank-0-only logging (excludes grad_norm_hist).
@@ -730,7 +728,11 @@ def run_felid_foundation_training(
 
                     # Log metrics at log_every (§3.6: windowed averages)
                     if step % config.log_every == 0:
-                        mean_loss = train_metric.loss_sum / max(train_metric.step_count, 1)
+                        mean_loss = (
+                            float("nan")
+                            if train_metric.step_count == 0
+                            else train_metric.loss_sum / train_metric.step_count
+                        )
 
                         # DDP-safe global token accuracy reduce
                         local_counts = torch.tensor(
@@ -766,7 +768,7 @@ def run_felid_foundation_training(
                         }
 
                         # §3.7: Startup probe for first 20 steps (rank-0 only)
-                        startup_logs = _startup_probe_metrics(batch, step, accelerator, model)
+                        startup_logs = _startup_probe_metrics(batch, step, accelerator)
                         logs.update(startup_logs)
 
                         accelerator.log(logs, step=step)

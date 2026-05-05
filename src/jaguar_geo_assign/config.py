@@ -1372,10 +1372,7 @@ def load_foundation_training_config(path: str | Path) -> FoundationTrainingConfi
 
         # Validation
         if not corpus_metadata_path.is_absolute():
-            raise ValueError(
-                "training.corpus_metadata_path must be an absolute path "
-                "or resolvable relative to the config directory"
-            )
+            raise ValueError("training.corpus_metadata_path must be an absolute path")
         if model_identifier != "zhihan1996/DNABERT-2-117M":
             raise ValueError(
                 "training.model_identifier must be pinned to zhihan1996/DNABERT-2-117M"
