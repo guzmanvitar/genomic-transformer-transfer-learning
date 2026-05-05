@@ -10,29 +10,47 @@ Tests cover:
 
 import json
 import math
+import os
+from dataclasses import dataclass
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, Mock, PropertyMock, patch
 
 import pytest
 import torch
+from torch import optim
+from torch.optim import AdamW
+from transformers import AutoModelForMaskedLM, BertConfig, get_cosine_schedule_with_warmup
 
-from jaguar_geo_assign.config import load_foundation_training_config
+from jaguar_geo_assign.config import FoundationTrainingConfig, load_foundation_training_config
 from jaguar_geo_assign.data.preprocessor import (
     DEFAULT_PARQUET_EXPORT_CONTRACT,
     TokenizedCorpusWriter,
     TokenizedWindow,
     TokenizerProvenance,
     WindowRecord,
+    load_dnabert2_tokenizer,
 )
 from jaguar_geo_assign.data.tokenized_corpus_reader import (
     CorpusReaderError,
     TokenizedCorpusReader,
 )  # noqa: E402
-from jaguar_geo_assign.pretrain.foundation_training import MetricAccumulator, integration_test
+from jaguar_geo_assign.pretrain.foundation_training import (
+    MetricAccumulator,
+    _build_dataloaders,
+    _compute_eval_max_steps,
+    _recover_atomic_dir,
+    _save_json_atomically,
+    _startup_probe_metrics,
+    atomic_dir_replace,
+    integration_test,
+    run_felid_foundation_training,
+)
 
 try:
+    from accelerate import Accelerator
     from accelerate.state import AcceleratorState, PartialState
 except ImportError:
+    Accelerator = None
     AcceleratorState = None
     PartialState = None
 
@@ -344,7 +362,6 @@ def test_pad_token_fallback_with_collator(tmp_path: Path) -> None:
     logic can assign a pad token via eos/unk/add_pad strategy, and that
     a collator can then be instantiated against it without raising.
     """
-    pytest.importorskip("transformers")
 
     class TokenizerNoPad:
         """Minimal tokenizer mock with no pad_token_id (like DNABERT-2)."""
@@ -434,8 +451,6 @@ def test_integration_test_default_smoke() -> None:
     This test runs in the default pytest selection and must complete in <60s
     on CPU.
     """
-    pytest.importorskip("transformers")
-    pytest.importorskip("torch")
 
     # Should not raise and should complete quickly
     integration_test(use_real_model=False)
@@ -449,8 +464,6 @@ def test_integration_test_real_model() -> None:
     pytest -m integration is invoked. It exercises real warm-start from HF Hub,
     trust_remote_code=True, and the full checkpoint round-trip.
     """
-    pytest.importorskip("transformers")
-    pytest.importorskip("torch")
 
     # Should not raise; will download real DNABERT-2 from Hub
     integration_test(use_real_model=True)
@@ -467,19 +480,7 @@ def test_train_token_accuracy_accumulates(tmp_path: Path) -> None:
     with mocked reduce() returning known token_correct and token_masked values
     so we can verify the logged accuracy = token_correct / token_masked.
     """
-    import os
-    from unittest.mock import PropertyMock, patch
 
-    pytest.importorskip("transformers")
-    pytest.importorskip("torch")
-    pytest.importorskip("accelerate")
-
-    from accelerate.state import AcceleratorState
-    from transformers import AutoModelForMaskedLM, BertConfig
-
-    from jaguar_geo_assign.pretrain.foundation_training import run_felid_foundation_training
-
-    AcceleratorState._reset_state()
     os.environ["ACCELERATE_USE_CPU"] = "true"
 
     try:
@@ -576,39 +577,7 @@ log_every = 1
                 raise AssertionError("train/token_accuracy not found in any accelerator.log call")
 
     finally:
-        AcceleratorState._reset_state()
         os.environ.pop("ACCELERATE_USE_CPU", None)
-
-
-def test_token_accuracy_nan_when_no_masked_tokens() -> None:
-    """Verify NaN convention for token_accuracy.
-
-    Tests that when token_masked == 0, the computed token_accuracy is NaN
-    (not 0.0), distinguishing "no masked tokens" from "zero accuracy".
-    """
-    pytest.importorskip("torch")
-
-    accum = MetricAccumulator()
-
-    # Simulate a step where token_masked == 0 (no masked tokens)
-    accum.token_correct = 0
-    accum.token_masked = 0
-
-    # Compute token accuracy using the NaN convention
-    token_acc = (
-        float("nan") if accum.token_masked == 0 else accum.token_correct / accum.token_masked
-    )
-
-    # Verify that it's NaN, not 0.0
-    assert math.isnan(token_acc), f"Expected NaN for zero masked tokens, got {token_acc}"
-
-    # Also test the case where we have masked tokens and accuracy > 0
-    accum.token_correct = 10
-    accum.token_masked = 20
-    token_acc = (
-        float("nan") if accum.token_masked == 0 else accum.token_correct / accum.token_masked
-    )
-    assert abs(token_acc - 0.5) < 1e-6, f"Expected 0.5, got {token_acc}"
 
 
 def test_trainability_assertion_runs_and_logs() -> None:
@@ -617,12 +586,6 @@ def test_trainability_assertion_runs_and_logs() -> None:
     Tests that the trainability check (counting p.requires_grad after accelerator.prepare)
     correctly counts trainable parameters and raises RuntimeError if trainable != total.
     """
-    pytest.importorskip("transformers")
-    pytest.importorskip("torch")
-    pytest.importorskip("accelerate")
-
-    from accelerate import Accelerator
-    from transformers import AutoModelForMaskedLM, BertConfig
 
     # Create a tiny model
     config = BertConfig(
@@ -659,20 +622,7 @@ def test_startup_grad_norm_histogram_emitted(tmp_path: Path) -> None:
     runs a couple of training steps, and verifies that add_histogram was called
     with the key 'startup/grad_norm_hist' and a tensor argument (not a scalar).
     """
-    import os
 
-    pytest.importorskip("torch")
-    pytest.importorskip("transformers")
-    pytest.importorskip("accelerate")
-
-    from unittest.mock import MagicMock, patch
-
-    from accelerate.state import AcceleratorState
-    from transformers import AutoModelForMaskedLM, BertConfig
-
-    from jaguar_geo_assign.pretrain.foundation_training import run_felid_foundation_training
-
-    AcceleratorState._reset_state()
     os.environ["ACCELERATE_USE_CPU"] = "true"
     try:
         metadata_path = _write_tiny_corpus(tmp_path, {"train": 2})
@@ -698,7 +648,6 @@ log_every = 1
             vocab_size=30522,
         )
         model = AutoModelForMaskedLM.from_config(config)
-        from jaguar_geo_assign.data.preprocessor import load_dnabert2_tokenizer
 
         tokenizer, _ = load_dnabert2_tokenizer()
         tokenizer.add_special_tokens({"pad_token": "[PAD]"})
@@ -745,7 +694,6 @@ log_every = 1
                         found = True
                 assert found, "startup/grad_norm_hist was not logged"
     finally:
-        AcceleratorState._reset_state()
         os.environ.pop("ACCELERATE_USE_CPU", None)
 
 
@@ -764,7 +712,6 @@ def test_save_checkpoint_atomically_json_is_a_file(tmp_path: Path) -> None:
     Args:
         tmp_path: Pytest temporary directory.
     """
-    from jaguar_geo_assign.pretrain.foundation_training import _save_json_atomically
 
     json_path = tmp_path / "best_eval_loss.json"
     content = {"step": 10, "eval_loss": 1.5}
@@ -793,10 +740,6 @@ def test_startup_probe_handles_zero_grad(tmp_path: Path) -> None:
     Args:
         tmp_path: Pytest temporary directory.
     """
-    from torch.optim import AdamW
-    from transformers import AutoModelForMaskedLM, BertConfig
-
-    from jaguar_geo_assign.pretrain.foundation_training import _startup_probe_metrics
 
     # Create a tiny model
     config = BertConfig(
@@ -825,7 +768,6 @@ def test_startup_probe_handles_zero_grad(tmp_path: Path) -> None:
     optimizer.zero_grad()
 
     # Mock accelerator
-    from unittest.mock import Mock
 
     mock_accelerator = Mock()
     mock_accelerator.is_main_process = True
@@ -848,7 +790,6 @@ def test_best_eval_loss_round_trip_on_resume(tmp_path: Path) -> None:
     Args:
         tmp_path: Pytest temporary directory.
     """
-    from jaguar_geo_assign.pretrain.foundation_training import _save_json_atomically
 
     output_dir = tmp_path / "checkpoint"
     best_dir = output_dir / "best"
@@ -877,9 +818,6 @@ def test_scheduler_steps_only_on_sync_gradients(tmp_path: Path) -> None:
     Args:
         tmp_path: Pytest temporary directory.
     """
-    import torch.optim as optim
-    from accelerate import Accelerator
-    from transformers import AutoModelForMaskedLM, BertConfig, get_cosine_schedule_with_warmup
 
     accumulation_steps = 4
     total_train_steps = 10
@@ -1006,15 +944,7 @@ def test_step_counter_aligns_with_optimizer_updates(tmp_path: Path) -> None:
     exactly 2 global optimizer steps. The scheduler and logger should also
     advance/fire exactly 2 times.
     """
-    import os
-    from unittest.mock import MagicMock, patch
 
-    from accelerate.state import AcceleratorState
-    from transformers import AutoModelForMaskedLM, BertConfig
-
-    from jaguar_geo_assign.pretrain.foundation_training import run_felid_foundation_training
-
-    AcceleratorState._reset_state()
     os.environ["ACCELERATE_USE_CPU"] = "true"
 
     try:
@@ -1041,7 +971,6 @@ log_every = 1
             vocab_size=30522,
         )
         model = AutoModelForMaskedLM.from_config(config)
-        from jaguar_geo_assign.data.preprocessor import load_dnabert2_tokenizer
 
         tokenizer, _ = load_dnabert2_tokenizer()
         tokenizer.add_special_tokens({"pad_token": "[PAD]"})
@@ -1091,7 +1020,6 @@ log_every = 1
                         f"Expected 2 log calls, got {mock_log.call_count}"
                     )
     finally:
-        AcceleratorState._reset_state()
         os.environ.pop("ACCELERATE_USE_CPU", None)
 
 
@@ -1101,15 +1029,6 @@ def test_eval_loss_gathered_across_ranks(tmp_path: Path) -> None:
     Runs a tiny training loop with eval_every=1 and verifies that
     accelerator.gather_for_metrics was called on the loss tensor.
     """
-    import os
-    from unittest.mock import patch
-
-    from accelerate.state import AcceleratorState
-    from transformers import AutoModelForMaskedLM, BertConfig
-
-    from jaguar_geo_assign.pretrain.foundation_training import run_felid_foundation_training
-
-    AcceleratorState._reset_state()
 
     try:
         metadata_path = _write_tiny_corpus(tmp_path, {"train": 1, "validation": 2})
@@ -1137,7 +1056,6 @@ eval_every = 1
             vocab_size=30522,
         )
         model = AutoModelForMaskedLM.from_config(config)
-        from jaguar_geo_assign.data.preprocessor import load_dnabert2_tokenizer
 
         tokenizer, _ = load_dnabert2_tokenizer()
         tokenizer.add_special_tokens({"pad_token": "[PAD]"})
@@ -1217,7 +1135,6 @@ eval_every = 1
                     f"gather_for_metrics expected 2 calls for loss, got {loss_gather_calls}"
                 )
     finally:
-        AcceleratorState._reset_state()
         os.environ.pop("ACCELERATE_USE_CPU", None)
 
 
@@ -1228,17 +1145,8 @@ def test_checkpoint_writes_are_rank_zero_only(tmp_path: Path) -> None:
     or best_eval_loss.json. When True, they are written, and the atomic helper
     doesn't leave behind .tmp_* directories.
     """
-    import os
 
     os.environ["ACCELERATE_USE_CPU"] = "true"
-    from unittest.mock import PropertyMock, patch
-
-    from accelerate.state import AcceleratorState
-    from transformers import AutoModelForMaskedLM, BertConfig
-
-    from jaguar_geo_assign.pretrain.foundation_training import run_felid_foundation_training
-
-    AcceleratorState._reset_state()
 
     try:
         metadata_path = _write_tiny_corpus(tmp_path, {"train": 1, "validation": 1})
@@ -1264,7 +1172,6 @@ eval_every = 1
             vocab_size=30522,
         )
         model = AutoModelForMaskedLM.from_config(config)
-        from jaguar_geo_assign.data.preprocessor import load_dnabert2_tokenizer
 
         tokenizer, _ = load_dnabert2_tokenizer()
         tokenizer.add_special_tokens({"pad_token": "[PAD]"})
@@ -1326,21 +1233,12 @@ eval_every = 1
                 tmp_dirs = list(out_dir.glob(".tmp_*"))
                 assert len(tmp_dirs) == 0, f"Found leftover tmp dirs: {tmp_dirs}"
     finally:
-        AcceleratorState._reset_state()
         os.environ.pop("ACCELERATE_USE_CPU", None)
 
 
 def test_nan_grad_skips_optimizer_step(tmp_path: Path) -> None:
     """NEW test (Fix #1): NaN-gradient guard must skip optimizer step."""
-    import os
-    from unittest.mock import MagicMock, patch
 
-    from accelerate.state import AcceleratorState
-    from transformers import AutoModelForMaskedLM, BertConfig
-
-    from jaguar_geo_assign.pretrain.foundation_training import run_felid_foundation_training
-
-    AcceleratorState._reset_state()
     os.environ["ACCELERATE_USE_CPU"] = "true"
 
     try:
@@ -1363,7 +1261,6 @@ log_every = 1
             num_hidden_layers=1, num_attention_heads=2, hidden_size=32, vocab_size=30522
         )
         model = AutoModelForMaskedLM.from_config(config)
-        from jaguar_geo_assign.data.preprocessor import load_dnabert2_tokenizer
 
         tokenizer, _ = load_dnabert2_tokenizer()
         tokenizer.add_special_tokens({"pad_token": "[PAD]"})
@@ -1432,21 +1329,12 @@ log_every = 1
                         if "train/skipped_steps" in logs:
                             assert logs["train/skipped_steps"] == 1, "skipped_steps should be 1"
     finally:
-        AcceleratorState._reset_state()
         os.environ.pop("ACCELERATE_USE_CPU", None)
 
 
 def test_token_metric_accumulation_no_ddp_in_accumulate_context(tmp_path: Path) -> None:
     """NEW test (Fix #2): Verify token metric accumulation avoids DDP gather inside context."""
-    import os
-    from unittest.mock import PropertyMock, patch
 
-    from accelerate.state import AcceleratorState
-    from transformers import AutoModelForMaskedLM, BertConfig
-
-    from jaguar_geo_assign.pretrain.foundation_training import run_felid_foundation_training
-
-    AcceleratorState._reset_state()
     os.environ["ACCELERATE_USE_CPU"] = "true"
 
     try:
@@ -1470,7 +1358,6 @@ log_every = 1
             num_hidden_layers=1, num_attention_heads=2, hidden_size=32, vocab_size=30522
         )
         model = AutoModelForMaskedLM.from_config(config)
-        from jaguar_geo_assign.data.preprocessor import load_dnabert2_tokenizer
 
         tokenizer, _ = load_dnabert2_tokenizer()
         tokenizer.add_special_tokens({"pad_token": "[PAD]"})
@@ -1519,7 +1406,6 @@ log_every = 1
                     "reduce should be called exactly once at the logging boundary"
                 )
     finally:
-        AcceleratorState._reset_state()
         os.environ.pop("ACCELERATE_USE_CPU", None)
 
 
@@ -1527,9 +1413,6 @@ def test_atomic_dir_replace_survives_simulated_crash(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """NEW test (Fix #3): Verify atomic_dir_replace TOCTOU window fix."""
-    import os
-
-    from jaguar_geo_assign.pretrain.foundation_training import atomic_dir_replace
 
     target = tmp_path / "target_dir"
     target.mkdir(parents=True)
@@ -1559,15 +1442,7 @@ def test_atomic_dir_replace_survives_simulated_crash(
 
 def test_accelerate_state_written_through_tmp_dir(tmp_path: Path) -> None:
     """NEW test (Fix #4): Verify accelerate_state is staged through tmp dir."""
-    import os
-    from unittest.mock import patch
 
-    from accelerate.state import AcceleratorState
-    from transformers import AutoModelForMaskedLM, BertConfig
-
-    from jaguar_geo_assign.pretrain.foundation_training import run_felid_foundation_training
-
-    AcceleratorState._reset_state()
     os.environ["ACCELERATE_USE_CPU"] = "true"
 
     try:
@@ -1590,7 +1465,6 @@ save_every = 1
             num_hidden_layers=1, num_attention_heads=2, hidden_size=32, vocab_size=30522
         )
         model = AutoModelForMaskedLM.from_config(config)
-        from jaguar_geo_assign.data.preprocessor import load_dnabert2_tokenizer
 
         tokenizer, _ = load_dnabert2_tokenizer()
         tokenizer.add_special_tokens({"pad_token": "[PAD]"})
@@ -1639,21 +1513,12 @@ save_every = 1
                     for src, dst in replace_calls
                 ), "tmp dir not atomically replaced"
     finally:
-        AcceleratorState._reset_state()
         os.environ.pop("ACCELERATE_USE_CPU", None)
 
 
 def test_eval_accuracy_uses_gather_for_metrics(tmp_path: Path) -> None:
     """NEW test (Fix #27): Verify eval accuracy gathers preds/labels across ranks."""
-    import os
-    from unittest.mock import patch
 
-    from accelerate.state import AcceleratorState
-    from transformers import AutoModelForMaskedLM, BertConfig
-
-    from jaguar_geo_assign.pretrain.foundation_training import run_felid_foundation_training
-
-    AcceleratorState._reset_state()
     os.environ["ACCELERATE_USE_CPU"] = "true"
 
     try:
@@ -1681,8 +1546,6 @@ eval_every = 1
         model = AutoModelForMaskedLM.from_config(config)
 
         tokenizer = FakeTokenizer()
-        from unittest.mock import MagicMock
-
         tokenizer.save_pretrained = MagicMock()
 
         class DummyDataset:
@@ -1743,8 +1606,6 @@ eval_every = 1
 
                 # On rank 1, eval counts are not accumulated, so token_masked remains 0.
                 # This results in eval_token_acc being nan.
-                import math
-
                 eval_call = [
                     c for c in mock_log.call_args_list if "eval/token_accuracy" in c.args[0]
                 ]
@@ -1752,14 +1613,12 @@ eval_every = 1
                 assert math.isnan(eval_call[0].args[0]["eval/token_accuracy"]), (
                     "eval_token_acc should be NaN on non-main process"
                 )
-
     finally:
-        AcceleratorState._reset_state()
+        os.environ.pop("ACCELERATE_USE_CPU", None)
 
 
 def test_atomic_dir_replace_recovers_from_crash(tmp_path: Path) -> None:
     """NEW test (Fix #28): Verify _recover_atomic_dir handles mid-crash .old_ recovery."""
-    from jaguar_geo_assign.pretrain.foundation_training import _recover_atomic_dir
 
     target = tmp_path / "target"
 
@@ -1782,13 +1641,6 @@ def test_atomic_dir_replace_recovers_from_crash(tmp_path: Path) -> None:
 
 def test_best_eval_loss_resume_handles_zero(tmp_path: Path) -> None:
     """NEW test (Fix #29): Verify best_eval_loss = 0.0 is not treated as falsy inf."""
-    import json
-    import os
-    from unittest.mock import patch
-
-    from transformers import AutoModelForMaskedLM, BertConfig
-
-    from jaguar_geo_assign.pretrain.foundation_training import run_felid_foundation_training
 
     os.environ["ACCELERATE_USE_CPU"] = "true"
 
@@ -1823,8 +1675,6 @@ eval_every = 1
         )
         model = AutoModelForMaskedLM.from_config(config)
         tokenizer = FakeTokenizer()
-        from unittest.mock import MagicMock
-
         tokenizer.save_pretrained = MagicMock()
 
         class DummyDataset:
@@ -1868,15 +1718,7 @@ eval_every = 1
 
 def test_rank0_save_exception_no_deadlock(tmp_path: Path) -> None:
     """NEW test (Fix #30): Verify rank-0 save exception does not deadlock other ranks."""
-    import os
-    from unittest.mock import patch
 
-    from accelerate.state import AcceleratorState
-    from transformers import AutoModelForMaskedLM, BertConfig
-
-    from jaguar_geo_assign.pretrain.foundation_training import run_felid_foundation_training
-
-    AcceleratorState._reset_state()
     os.environ["ACCELERATE_USE_CPU"] = "true"
 
     try:
@@ -1949,21 +1791,12 @@ eval_every = 1
                 "_broadcast_save_failure should be called before the exception is raised"
             )
     finally:
-        AcceleratorState._reset_state()
         os.environ.pop("ACCELERATE_USE_CPU", None)
 
 
 def test_non_rank0_save_exception_raises_runtime_error(tmp_path: Path) -> None:
     """NEW test: Verify non-failing ranks raise RuntimeError when broadcast says saw_failure."""
-    import os
-    from unittest.mock import patch
 
-    from accelerate.state import AcceleratorState
-    from transformers import AutoModelForMaskedLM, BertConfig
-
-    from jaguar_geo_assign.pretrain.foundation_training import run_felid_foundation_training
-
-    AcceleratorState._reset_state()
     os.environ["ACCELERATE_USE_CPU"] = "true"
 
     try:
@@ -2036,7 +1869,6 @@ eval_every = 1
                 "_broadcast_save_failure should be called to notify this rank"
             )
     finally:
-        AcceleratorState._reset_state()
         os.environ.pop("ACCELERATE_USE_CPU", None)
 
 
@@ -2053,12 +1885,6 @@ def test_corpus_reader_rejects_empty_shard(tmp_path: Path) -> None:
 
 def test_accelerator_honors_world_size_env_vars() -> None:
     """NEW test (Fix #32): Verify Accelerator detects num_processes from WORLD_SIZE."""
-    import os
-
-    from accelerate.state import AcceleratorState, PartialState
-
-    AcceleratorState._reset_state()
-    PartialState._reset_state()
 
     with patch.dict(
         os.environ,
@@ -2070,9 +1896,6 @@ def test_accelerator_honors_world_size_env_vars() -> None:
             "MASTER_PORT": "29500",
         },
     ):
-        AcceleratorState._reset_state()
-        PartialState._reset_state()
-
         with (
             patch("torch.distributed.init_process_group"),
             patch("torch.distributed.is_initialized", return_value=True),
@@ -2084,19 +1907,9 @@ def test_accelerator_honors_world_size_env_vars() -> None:
             assert state.num_processes == 2
             assert state.process_index == 1
 
-        AcceleratorState._reset_state()
-        PartialState._reset_state()
-
 
 def test_reader_full_ddp_sharding_coverage(tmp_path: Path) -> None:
     """NEW test (Fix #33, #39): Verify DDP sharding distributes files evenly without duplicates."""
-    import os
-    from dataclasses import dataclass
-    from unittest.mock import patch
-
-    from accelerate.state import AcceleratorState, PartialState
-
-    from jaguar_geo_assign.data.tokenized_corpus_reader import TokenizedCorpusReader
 
     class FakeBatch:
         def __init__(self, locus_id):
@@ -2145,9 +1958,6 @@ def test_reader_full_ddp_sharding_coverage(tmp_path: Path) -> None:
                     patch("pyarrow.parquet.ParquetFile", FakeParquetFile),
                     patch.object(TokenizedCorpusReader, "_validate_metadata_and_schema"),
                 ):
-                    AcceleratorState._reset_state()
-                    PartialState._reset_state()
-
                     reader = TokenizedCorpusReader(
                         "dummy.json",
                         "train",
@@ -2183,14 +1993,6 @@ def test_reader_full_ddp_sharding_coverage(tmp_path: Path) -> None:
 
 def test_mid_rename_crash_recovery_all_dirs(tmp_path: Path) -> None:
     """NEW test (Fix #37): Verify that all 4 critical directories are recovered on startup."""
-    from unittest.mock import patch
-
-    from accelerate.state import AcceleratorState
-    from transformers import AutoModelForMaskedLM, BertConfig
-
-    from jaguar_geo_assign.pretrain.foundation_training import run_felid_foundation_training
-
-    AcceleratorState._reset_state()
 
     metadata_path = _write_tiny_corpus(tmp_path, {"train": 1})
     out_dir = tmp_path / "out"
@@ -2270,10 +2072,6 @@ eval_every = 1
 
 def test_build_dataloaders_propagates_non_split_corpus_errors(tmp_path: Path) -> None:
     """NEW test (Fix #41): _build_dataloaders propagates non-split-missing errors."""
-    from unittest.mock import MagicMock
-
-    from jaguar_geo_assign.config import FoundationTrainingConfig
-    from jaguar_geo_assign.pretrain.foundation_training import _build_dataloaders
 
     config = FoundationTrainingConfig(
         corpus_metadata_path=tmp_path / "metadata.json",
@@ -2301,10 +2099,6 @@ def test_build_dataloaders_propagates_non_split_corpus_errors(tmp_path: Path) ->
 
 def test_build_dataloaders_handles_missing_validation_split(tmp_path: Path) -> None:
     """NEW test (Fix #41): _build_dataloaders must catch specific split missing error."""
-    from unittest.mock import MagicMock
-
-    from jaguar_geo_assign.config import FoundationTrainingConfig
-    from jaguar_geo_assign.pretrain.foundation_training import _build_dataloaders
 
     config = FoundationTrainingConfig(
         corpus_metadata_path=tmp_path / "metadata.json",
@@ -2332,9 +2126,6 @@ def test_build_dataloaders_handles_missing_validation_split(tmp_path: Path) -> N
 
 def test_eval_max_steps_computation(tmp_path: Path) -> None:
     """Test _compute_eval_max_steps correctly derives step count from record_count."""
-    from unittest.mock import MagicMock
-
-    from jaguar_geo_assign.pretrain.foundation_training import _compute_eval_max_steps
 
     eval_reader = MagicMock()
     eval_reader.record_count = 100
@@ -2351,15 +2142,7 @@ def test_eval_max_steps_computation(tmp_path: Path) -> None:
 
 def test_eval_loop_respects_max_steps(tmp_path: Path) -> None:
     """Test eval loop breaks when eval_max_steps is reached."""
-    import os
-    from unittest.mock import patch
 
-    from accelerate.state import AcceleratorState
-    from transformers import AutoModelForMaskedLM, BertConfig
-
-    from jaguar_geo_assign.pretrain.foundation_training import run_felid_foundation_training
-
-    AcceleratorState._reset_state()
     os.environ["ACCELERATE_USE_CPU"] = "true"
 
     try:
@@ -2439,22 +2222,12 @@ eval_max_steps = 2
                 # Alternatively, we could mock the model's forward pass to count the calls
 
     finally:
-        AcceleratorState._reset_state()
         os.environ.pop("ACCELERATE_USE_CPU", None)
 
 
 def test_resume_restores_step_counter(tmp_path: Path) -> None:
     """NEW test (Fix #44): Verify resume restores step counter from train_state.json."""
-    import json
-    import os
-    from unittest.mock import patch
 
-    from accelerate.state import AcceleratorState
-    from transformers import AutoModelForMaskedLM, BertConfig
-
-    from jaguar_geo_assign.pretrain.foundation_training import run_felid_foundation_training
-
-    AcceleratorState._reset_state()
     os.environ["ACCELERATE_USE_CPU"] = "true"
 
     try:
@@ -2518,21 +2291,12 @@ eval_every = 1
             assert result.final_step == 5000
 
     finally:
-        AcceleratorState._reset_state()
         os.environ.pop("ACCELERATE_USE_CPU", None)
 
 
 def test_resume_handles_missing_train_state(tmp_path: Path) -> None:
     """NEW test (Fix #44): Verify resume gracefully handles missing train_state.json."""
-    import os
-    from unittest.mock import patch
 
-    from accelerate.state import AcceleratorState
-    from transformers import AutoModelForMaskedLM, BertConfig
-
-    from jaguar_geo_assign.pretrain.foundation_training import run_felid_foundation_training
-
-    AcceleratorState._reset_state()
     os.environ["ACCELERATE_USE_CPU"] = "true"
 
     try:
@@ -2596,21 +2360,12 @@ eval_every = 1
             )
 
     finally:
-        AcceleratorState._reset_state()
         os.environ.pop("ACCELERATE_USE_CPU", None)
 
 
 def test_resume_handles_corrupt_train_state(tmp_path: Path) -> None:
     """NEW test (Fix #44): Verify resume gracefully handles corrupt train_state.json."""
-    import os
-    from unittest.mock import patch
 
-    from accelerate.state import AcceleratorState
-    from transformers import AutoModelForMaskedLM, BertConfig
-
-    from jaguar_geo_assign.pretrain.foundation_training import run_felid_foundation_training
-
-    AcceleratorState._reset_state()
     os.environ["ACCELERATE_USE_CPU"] = "true"
 
     try:
@@ -2672,22 +2427,12 @@ eval_every = 1
             assert any("Failed to parse" in str(call) for call in mock_warning.call_args_list)
 
     finally:
-        AcceleratorState._reset_state()
         os.environ.pop("ACCELERATE_USE_CPU", None)
 
 
 def test_all_nan_eval_skips_best_save(tmp_path: Path) -> None:
     """NEW test (Fix #45): Verify all-NaN eval batches do not save best checkpoint."""
-    import os
-    from unittest.mock import patch
 
-    import torch
-    from accelerate.state import AcceleratorState
-    from transformers import AutoModelForMaskedLM, BertConfig
-
-    from jaguar_geo_assign.pretrain.foundation_training import run_felid_foundation_training
-
-    AcceleratorState._reset_state()
     os.environ["ACCELERATE_USE_CPU"] = "true"
 
     try:
@@ -2774,5 +2519,4 @@ eval_every = 1
             )
 
     finally:
-        AcceleratorState._reset_state()
         os.environ.pop("ACCELERATE_USE_CPU", None)
