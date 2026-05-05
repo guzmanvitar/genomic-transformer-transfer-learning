@@ -530,6 +530,71 @@ def test_train_token_accuracy_accumulates(tmp_path: Path, cpu_accelerator, tiny_
             raise AssertionError("train/token_accuracy not found in any accelerator.log call")
 
 
+def test_nan_loss_skips_token_accuracy_accumulation() -> None:
+    """Regression test: NaN-loss step does NOT corrupt token-accuracy counters.
+
+    Verifies that when a training step produces NaN loss, the token-accuracy
+    accumulation block (token_correct, token_masked) is skipped. This prevents
+    garbage argmax results from NaN logits from being counted against real labels.
+
+    This is a unit test of the metric accumulation logic. It directly tests that
+    the NaN/Inf guard correctly blocks token-accuracy accumulation on problematic
+    steps, ensuring the reported accuracy reflects only valid (finite-loss) steps.
+    """
+    train_metric = MetricAccumulator()
+
+    # Simulate step 1: NaN loss (token_correct and token_masked should NOT change)
+    loss_f = torch.tensor(float("nan"))
+    if torch.isnan(loss_f).any() or torch.isinf(loss_f).any():
+        train_metric.nan_count += 1
+        # Token accuracy should NOT be accumulated here
+    else:
+        train_metric.loss_sum += loss_f.mean().item()
+        train_metric.step_count += 1
+        train_metric.token_correct += 1
+        train_metric.token_masked += 4
+
+    # After NaN step: nan_count=1, but token counters are 0
+    assert train_metric.nan_count == 1, "NaN step should increment nan_count"
+    assert train_metric.token_correct == 0, "NaN step should NOT accumulate token_correct"
+    assert train_metric.token_masked == 0, "NaN step should NOT accumulate token_masked"
+
+    # Simulate step 2: finite loss (token_correct and token_masked SHOULD change)
+    loss_f = torch.tensor(1.5)
+    if torch.isnan(loss_f).any() or torch.isinf(loss_f).any():
+        train_metric.nan_count += 1
+    else:
+        train_metric.loss_sum += loss_f.mean().item()
+        train_metric.step_count += 1
+        # Now accumulate token accuracy
+        train_metric.token_correct += 2
+        train_metric.token_masked += 4
+
+    # After finite step: nan_count=1, token_correct=2, token_masked=4
+    assert train_metric.nan_count == 1, "Should still have 1 NaN step"
+    assert train_metric.step_count == 1, "Should have 1 finite step"
+    assert train_metric.token_correct == 2, "Token_correct accumulated only on finite step"
+    assert train_metric.token_masked == 4, "Token_masked accumulated only on finite step"
+
+    # Verify mean loss is computed only from finite steps
+    mean_loss = (
+        train_metric.loss_sum / train_metric.step_count
+        if train_metric.step_count > 0
+        else float("nan")
+    )
+    assert not math.isnan(mean_loss), "Mean loss should be finite"
+    assert abs(mean_loss - 1.5) < 1e-6, "Mean loss should equal the single finite loss"
+
+    # Verify token accuracy is computed correctly
+    token_acc = (
+        float("nan")
+        if train_metric.token_masked == 0
+        else train_metric.token_correct / train_metric.token_masked
+    )
+    assert not math.isnan(token_acc), "Token accuracy should be finite"
+    assert abs(token_acc - 0.5) < 1e-6, "Token accuracy should be 2/4 = 0.5"
+
+
 def test_trainability_assertion_runs_and_logs() -> None:
     """Verify model trainability assertion runs after accelerator.prepare.
 

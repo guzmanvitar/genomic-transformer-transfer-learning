@@ -691,19 +691,22 @@ def run_felid_foundation_training(
                         train_metric.loss_sum += loss_f.mean().item()
                         train_metric.step_count += 1
 
-                    # Token accuracy accumulation for train loop.
-                    # Compute predictions and accumulate against masked labels.
-                    # Argmax over full vocab is computed inside torch.no_grad() to avoid
-                    # polluting the backward pass with unnecessary graph nodes.
-                    with torch.no_grad():
-                        preds = outputs.logits.argmax(dim=-1)
-                        labels = batch.get("labels")
-                        if labels is not None:
-                            mask = labels != -100
-                            # Accumulate locally to avoid DDP gather inside the loop; defer
-                            # global reduce to the log step for efficiency.
-                            train_metric.token_correct += ((preds == labels) & mask).sum().item()
-                            train_metric.token_masked += mask.sum().item()
+                        # Token accuracy accumulation for train loop.
+                        # Only accumulate on finite-loss steps; NaN/Inf logits produce
+                        # garbage argmax results that corrupt the accuracy metric.
+                        # Argmax over full vocab is computed inside torch.no_grad() to avoid
+                        # polluting the backward pass with unnecessary graph nodes.
+                        with torch.no_grad():
+                            preds = outputs.logits.argmax(dim=-1)
+                            labels = batch.get("labels")
+                            if labels is not None:
+                                mask = labels != -100
+                                # Accumulate locally to avoid DDP gather inside the
+                                # loop; defer global reduce to the log step for efficiency.
+                                train_metric.token_correct += (
+                                    ((preds == labels) & mask).sum().item()
+                                )
+                                train_metric.token_masked += mask.sum().item()
 
                     # Backward pass
                     accelerator.backward(loss)
