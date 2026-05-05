@@ -1540,6 +1540,94 @@ eval_every = 1
         assert not list(p.parent.glob(f".old_{p.name}_*")), f".old_ dir not cleaned up for {p}"
 
 
+def test_recover_atomic_dir_runs_on_main_only(tmp_path: Path) -> None:
+    """NEW test (Fix #28b): Verify _recover_atomic_dir guard - rank-0 only on shared FS.
+
+    Tests that when is_main_process=True, _recover_atomic_dir is called 4 times.
+    When is_main_process=False, it is called 0 times (guarded by accelerator check).
+    This prevents DDP race on os.replace(.old_..., target) when all ranks compete
+    on a shared filesystem.
+    """
+    metadata_path = _write_tiny_corpus(tmp_path, {"train": 1})
+    out_dir = tmp_path / "out"
+
+    config_file = tmp_path / "train_config.toml"
+    config_file.write_text(f"""
+[training]
+corpus_metadata_path = "{metadata_path}"
+model_identifier = "zhihan1996/DNABERT-2-117M"
+model_revision = "main"
+output_dir = "{out_dir}"
+max_steps = 1
+learning_rate = 1e-4
+seed = 42
+per_device_train_batch_size = 1
+per_device_eval_batch_size = 1
+gradient_accumulation_steps = 1
+log_every = 1
+eval_every = 1
+""")
+
+    with (
+        patch("jaguar_geo_assign.pretrain.foundation_training._build_dataloaders") as mock_loaders,
+        patch(
+            "jaguar_geo_assign.pretrain.foundation_training._build_model_and_tokenizer"
+        ) as mock_build,
+        patch("jaguar_geo_assign.pretrain.foundation_training._recover_atomic_dir") as mock_recover,
+    ):
+        # Setup: tiny model and tokenizer
+        config = BertConfig(
+            num_hidden_layers=1, num_attention_heads=2, hidden_size=32, vocab_size=30522
+        )
+        model = AutoModelForMaskedLM.from_config(config)
+        tokenizer = FakeTokenizer()
+        mock_build.return_value = (model, tokenizer, "none", False)
+
+        class DummyDataset:
+            record_count = 1
+
+            def set_epoch(self, epoch):
+                pass
+
+        class DummyLoader:
+            dataset = DummyDataset()
+
+            def __iter__(self):
+                return iter([])
+
+            def __len__(self):
+                return 1
+
+        mock_loaders.return_value = (DummyLoader(), DummyLoader())
+
+        # Test 1: is_main_process = True → _recover_atomic_dir called 4 times
+        patch_is_main = "accelerate.Accelerator.is_main_process"
+        with patch(patch_is_main, new_callable=PropertyMock) as mock_is_main:
+            mock_is_main.return_value = True
+            mock_recover.reset_mock()
+            try:
+                run_felid_foundation_training(config_file, integration_test_mode="off")
+            except Exception:
+                pass  # We expect some failure due to minimal mocking
+            assert mock_recover.call_count == 4, (
+                f"Expected _recover_atomic_dir to be called 4 times on main process, "
+                f"got {mock_recover.call_count}"
+            )
+
+        # Test 2: is_main_process = False → _recover_atomic_dir called 0 times
+        with patch(patch_is_main, new_callable=PropertyMock) as mock_is_main:
+            mock_is_main.return_value = False
+            mock_recover.reset_mock()
+            try:
+                run_felid_foundation_training(config_file, integration_test_mode="off")
+            except Exception:
+                pass  # We expect some failure due to minimal mocking
+            assert mock_recover.call_count == 0, (
+                f"Expected _recover_atomic_dir to NOT be called on non-main process, "
+                f"got {mock_recover.call_count}"
+            )
+
+
 def test_build_dataloaders_propagates_non_split_corpus_errors(tmp_path: Path) -> None:
     """NEW test (Fix #41): _build_dataloaders propagates non-split-missing errors."""
 

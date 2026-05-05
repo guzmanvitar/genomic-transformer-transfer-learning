@@ -565,11 +565,13 @@ def run_felid_foundation_training(
     # Check for resumed state
     latest_state_path = output_dir / "latest" / "accelerate_state"
 
-    # Fix 28: Recover from mid-rename crash
-    _recover_atomic_dir(output_dir / "latest" / "accelerate_state")
-    _recover_atomic_dir(output_dir / "best" / "accelerate_state")
-    _recover_atomic_dir(output_dir / "best" / "hf_model")
-    _recover_atomic_dir(output_dir / "best" / "tokenizer")
+    # Fix 28: Recover from mid-rename crash (rank-0 only to avoid race on shared FS)
+    if accelerator.is_main_process:
+        _recover_atomic_dir(output_dir / "latest" / "accelerate_state")
+        _recover_atomic_dir(output_dir / "best" / "accelerate_state")
+        _recover_atomic_dir(output_dir / "best" / "hf_model")
+        _recover_atomic_dir(output_dir / "best" / "tokenizer")
+    accelerator.wait_for_everyone()
 
     resumed = latest_state_path.exists()
     # Fix #16: Align read path with write path (both in output_dir / "best" / "best_eval_loss.json")
@@ -1087,7 +1089,9 @@ def integration_test(
         logger.info("✓ Assertion 3: save_pretrained writes config.json + safetensors")
 
         # Assertion 4: from_pretrained reload yields identical state_dict keys
-        reloaded = AutoModelForMaskedLM.from_pretrained(str(model_dir))
+        reloaded = AutoModelForMaskedLM.from_pretrained(
+            str(model_dir), trust_remote_code=use_real_model
+        )
         orig_keys = set(model.state_dict().keys())
         reload_keys = set(reloaded.state_dict().keys())
         assert orig_keys == reload_keys, f"State dict keys differ: {orig_keys ^ reload_keys}"
