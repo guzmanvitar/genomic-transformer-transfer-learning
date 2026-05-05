@@ -28,6 +28,7 @@ from jaguar_geo_assign.data.tokenized_corpus_reader import (
     CorpusReaderError,
     TokenizedCorpusReader,
 )  # noqa: E402
+from jaguar_geo_assign.pretrain.foundation_training import MetricAccumulator, integration_test
 
 try:
     from accelerate.state import AcceleratorState, PartialState
@@ -339,7 +340,7 @@ max_steps = 10000
 def test_pad_token_fallback_with_collator(tmp_path: Path) -> None:
     """Test (c): Variable-length collator with pad-token fallback.
 
-    Verifies that when a tokenizer lacks pad_token_id, the §3.2 fallback
+    Verifies that when a tokenizer lacks pad_token_id, the fallback
     logic can assign a pad token via eos/unk/add_pad strategy, and that
     a collator can then be instantiated against it without raising.
     """
@@ -365,7 +366,7 @@ def test_pad_token_fallback_with_collator(tmp_path: Path) -> None:
 
     tokenizer = TokenizerNoPad()
 
-    # §3.2: Apply pad-token fallback (eos strategy)
+    # Apply pad-token fallback (eos strategy)
     assert tokenizer.pad_token_id is None, "Tokenizer should start without pad_token"
 
     if tokenizer.pad_token_id is None:
@@ -394,8 +395,6 @@ def test_metric_accumulator_nan_handling() -> None:
     finite loss and asserts the mean equals that finite value.
     After reset(), nan_count is 0.
     """
-    from jaguar_geo_assign.pretrain.foundation_training import MetricAccumulator
-
     accum = MetricAccumulator()
 
     # Push a NaN loss
@@ -433,13 +432,10 @@ def test_integration_test_default_smoke() -> None:
     """Smoke test: integration_test(use_real_model=False) runs end-to-end on CPU.
 
     This test runs in the default pytest selection and must complete in <60s
-    on CPU. It asserts all five Technical Design §5 assertions on a tiny
-    synthetic model and corpus.
+    on CPU.
     """
     pytest.importorskip("transformers")
     pytest.importorskip("torch")
-
-    from jaguar_geo_assign.pretrain.foundation_training import integration_test
 
     # Should not raise and should complete quickly
     integration_test(use_real_model=False)
@@ -456,66 +452,141 @@ def test_integration_test_real_model() -> None:
     pytest.importorskip("transformers")
     pytest.importorskip("torch")
 
-    from jaguar_geo_assign.pretrain.foundation_training import integration_test
-
     # Should not raise; will download real DNABERT-2 from Hub
     integration_test(use_real_model=True)
 
 
 def test_train_token_accuracy_accumulates(tmp_path: Path) -> None:
-    """NEW test (Fix #9): Verify train/token_accuracy is accumulated and logged.
+    """Verify train/token_accuracy appears in accelerator.log calls.
 
-    Runs integration_test(use_real_model=False) and verifies that the
-    train/token_accuracy metric was logged at least once with a value
-    strictly between 0 and 1 (i.e., it changed from the default 0.0).
+    Runs a minimal training loop with mocked dataloaders and model to verify
+    that the train/token_accuracy metric is properly accumulated and logged
+    via accelerator.log with the correct computed value.
 
-    This test demonstrates that token accuracy is properly accumulated
-    during the training loop per §3.6 (Fix #9).
+    Uses a setup pattern matching test_grad_norm_reduce_uses_global_token_accuracy,
+    with mocked reduce() returning known token_correct and token_masked values
+    so we can verify the logged accuracy = token_correct / token_masked.
     """
+    import os
+    from unittest.mock import PropertyMock, patch
+
     pytest.importorskip("transformers")
     pytest.importorskip("torch")
+    pytest.importorskip("accelerate")
 
-    from jaguar_geo_assign.pretrain.foundation_training import integration_test
+    from accelerate.state import AcceleratorState
+    from transformers import AutoModelForMaskedLM, BertConfig
 
-    # Run integration test in tiny-model mode (fast, no HF Hub)
-    # Since we can't easily inspect TensorBoard logs in this test harness,
-    # we verify by checking that integration_test completes without raising.
-    # The token accuracy accumulation is verified via the metric computation
-    # in the training loop (see foundation_training.py lines 541-573).
-    integration_test(use_real_model=False)
-    # If we get here, the test passed (no exception raised)
+    from jaguar_geo_assign.pretrain.foundation_training import run_felid_foundation_training
 
+    AcceleratorState._reset_state()
+    os.environ["ACCELERATE_USE_CPU"] = "true"
 
-def test_eval_token_accuracy_logged(tmp_path: Path) -> None:
-    """NEW test (Fix #11): Verify eval/token_accuracy is logged alongside eval metrics.
+    try:
+        # Write tiny corpus with 1 train record
+        metadata_path = _write_tiny_corpus(tmp_path, {"train": 1})
+        config_file = tmp_path / "train_config.toml"
+        config_file.write_text(f"""
+[training]
+corpus_metadata_path = "{metadata_path}"
+model_identifier = "zhihan1996/DNABERT-2-117M"
+model_revision = "main"
+output_dir = "{tmp_path}/out"
+max_steps = 1
+learning_rate = 1e-4
+seed = 42
+per_device_train_batch_size = 1
+gradient_accumulation_steps = 1
+log_every = 1
+""")
 
-    Runs integration_test(use_real_model=False) and verifies that the eval loop
-    properly accumulates and logs the eval/token_accuracy metric per §3.6 (Fix #11).
+        # Create tiny BertConfig model
+        config = BertConfig(
+            num_hidden_layers=1, num_attention_heads=2, hidden_size=32, vocab_size=30522
+        )
+        model = AutoModelForMaskedLM.from_config(config)
 
-    The metric mirrors the train-loop accumulation using gather_for_metrics to
-    correctly aggregate across DDP ranks.
-    """
-    pytest.importorskip("transformers")
-    pytest.importorskip("torch")
+        # FakeTokenizer already defined in this file
+        tokenizer = FakeTokenizer()
 
-    from jaguar_geo_assign.pretrain.foundation_training import integration_test
+        # DummyDataset and DummyLoader to yield a batch with masked labels
+        class DummyDataset:
+            def set_epoch(self, epoch):
+                pass
 
-    # Run integration test; eval/token_accuracy is logged in the eval section
-    # (see foundation_training.py lines 668-699).
-    integration_test(use_real_model=False)
-    # If we get here, the test passed (no exception raised)
+        class DummyLoader:
+            dataset = DummyDataset()
+
+            def __iter__(self):
+                from accelerate import Accelerator
+
+                device = Accelerator().device
+                # Yield one batch with at least one non-masked label
+                # labels=-100 means masked (ignored), labels=200 means token to predict
+                yield {
+                    "input_ids": torch.tensor([[101, 200, 102, 0]], device=device),
+                    "attention_mask": torch.tensor([[1, 1, 1, 0]], device=device),
+                    "labels": torch.tensor([[-100, 200, -100, -100]], device=device),
+                }
+
+            def __len__(self):
+                return 1
+
+        patch_loaders = "jaguar_geo_assign.pretrain.foundation_training._build_dataloaders"
+        patch_build = "jaguar_geo_assign.pretrain.foundation_training._build_model_and_tokenizer"
+
+        with patch(patch_loaders) as mock_loaders, patch(patch_build) as mock_build:
+            mock_build.return_value = (model, tokenizer, "none", False)
+            mock_loaders.return_value = (DummyLoader(), None)
+
+            with (
+                patch("accelerate.Accelerator.reduce") as mock_reduce,
+                patch(
+                    "accelerate.Accelerator.sync_gradients", new_callable=PropertyMock
+                ) as mock_sync,
+                patch("accelerate.Accelerator.log") as mock_log,
+            ):
+                # Mock reduce to return [token_correct=1.0, token_masked=4.0]
+                # This gives token_accuracy = 1.0 / 4.0 = 0.25
+                mock_reduce.return_value = torch.tensor([1.0, 4.0])
+                mock_sync.side_effect = [False, False, False, True] * 10
+                mock_log.return_value = None
+
+                run_felid_foundation_training(config_file, integration_test_mode="off")
+
+                # Verify accelerator.log was called with train/token_accuracy
+                log_calls = mock_log.call_args_list
+                train_acc_calls = [c for c in log_calls if "train/token_accuracy" in str(c.args[0])]
+
+                assert len(train_acc_calls) > 0, (
+                    "accelerator.log should be called with train/token_accuracy"
+                )
+
+                # Extract the logged accuracy value and verify it equals 0.25
+                for call in train_acc_calls:
+                    # call.args[0] is the dict argument to log
+                    if isinstance(call.args[0], dict) and "train/token_accuracy" in call.args[0]:
+                        logged_value = call.args[0]["train/token_accuracy"]
+                        assert pytest.approx(logged_value) == 0.25, (
+                            f"train/token_accuracy should be 0.25 (1.0/4.0), got {logged_value}"
+                        )
+                        return  # Found and verified the value
+
+                # If we get here, we didn't find train/token_accuracy in any log call
+                raise AssertionError("train/token_accuracy not found in any accelerator.log call")
+
+    finally:
+        AcceleratorState._reset_state()
+        os.environ.pop("ACCELERATE_USE_CPU", None)
 
 
 def test_token_accuracy_nan_when_no_masked_tokens() -> None:
-    """NEW test (Fix #12): Verify NaN convention for token_accuracy.
+    """Verify NaN convention for token_accuracy.
 
     Tests that when token_masked == 0, the computed token_accuracy is NaN
-    (not 0.0), distinguishing "no masked tokens" from "zero accuracy" per
-    §3.6 (Fix #12).
+    (not 0.0), distinguishing "no masked tokens" from "zero accuracy".
     """
     pytest.importorskip("torch")
-
-    from jaguar_geo_assign.pretrain.foundation_training import MetricAccumulator
 
     accum = MetricAccumulator()
 
@@ -523,7 +594,7 @@ def test_token_accuracy_nan_when_no_masked_tokens() -> None:
     accum.token_correct = 0
     accum.token_masked = 0
 
-    # Compute token accuracy using the NaN convention (Fix #12)
+    # Compute token accuracy using the NaN convention
     token_acc = (
         float("nan") if accum.token_masked == 0 else accum.token_correct / accum.token_masked
     )
@@ -541,13 +612,10 @@ def test_token_accuracy_nan_when_no_masked_tokens() -> None:
 
 
 def test_trainability_assertion_runs_and_logs() -> None:
-    """NEW test (Fix #10): Verify model trainability assertion runs after accelerator.prepare.
+    """Verify model trainability assertion runs after accelerator.prepare.
 
     Tests that the trainability check (counting p.requires_grad after accelerator.prepare)
     correctly counts trainable parameters and raises RuntimeError if trainable != total.
-
-    This test demonstrates AC#5 compliance: "verified by counting `p.requires_grad`
-    after construction".
     """
     pytest.importorskip("transformers")
     pytest.importorskip("torch")
