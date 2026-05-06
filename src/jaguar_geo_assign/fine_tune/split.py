@@ -23,6 +23,10 @@ def create_stratified_group_kfold(
 ) -> list[tuple[np.ndarray, np.ndarray]]:
     """Create stratified group k-fold splits grouped by individual and stratified by biome.
 
+    Groups are based on individual_id (to prevent individual leakage across folds) and
+    stratification preserves biome distribution. Pre-validates that each biome has at
+    least n_splits individuals to ensure valid stratified splits.
+
     Args:
         metadata_df: DataFrame indexed by sample_id with columns:
             - individual_id: Biological individual identifier
@@ -32,6 +36,9 @@ def create_stratified_group_kfold(
 
     Returns:
         List of (train_indices, val_indices) tuples for each fold.
+
+    Raises:
+        ValueError: If any biome has fewer than n_splits individuals (required for stratification).
     """
     if "individual_id" not in metadata_df.columns:
         raise ValueError("metadata_df must have 'individual_id' column")
@@ -46,15 +53,25 @@ def create_stratified_group_kfold(
 
     _LOGGER.info(f"Creating {n_splits}-fold splits for {len(individual_metadata)} individuals")
 
-    # Encode biome labels for stratification
+    # Validate minimum individuals per biome before attempting stratified split
     unique_biomes = individual_metadata["biome_population_label"].unique()
+    for biome in unique_biomes:
+        n_individuals_in_biome = (individual_metadata["biome_population_label"] == biome).sum()
+        if n_individuals_in_biome < n_splits:
+            raise ValueError(
+                f"Biome '{biome}' has only {n_individuals_in_biome} individuals but "
+                f"n_splits={n_splits} requires at least {n_splits} per biome for stratification."
+            )
+
+    # Encode biome labels for stratification
     biome_to_id = {biome: idx for idx, biome in enumerate(unique_biomes)}
     biome_encoded = individual_metadata["biome_population_label"].map(biome_to_id).values
 
     _LOGGER.info(f"Biomes: {list(unique_biomes)}")
 
-    # Apply StratifiedGroupKFold
-    group_ids = np.arange(len(individual_metadata))
+    # Apply StratifiedGroupKFold with actual individual_id as groups
+    # This ensures samples from the same individual never cross train/val boundaries
+    group_ids = individual_metadata["individual_id"].values
 
     sgkf = StratifiedGroupKFold(n_splits=n_splits, shuffle=True, random_state=random_state)
     folds = list(

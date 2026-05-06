@@ -17,3 +17,23 @@ JAGUAR_METADATA_FIELDS = (
     "latitude",  # decimal degrees, WGS-84
     "longitude",  # decimal degrees, WGS-84
 )
+
+# Fine-tuning metadata fields - subset required for MTL dataset construction
+JAGUAR_FINETUNE_METADATA_FIELDS = (
+    "sample_id",
+    "individual_id",
+    "biome_population_label",
+    "latitude",
+    "longitude",
+)
+
+# Canonical biome/population classes for fine-tuning.
+# These are the valid values for biome_population_label in the metadata.
+# Used for deterministic label encoding and stratification in k-fold splits.
+BIOME_CLASSES = (
+    "savanna",
+    "rainforest",
+    "dry_forest",
+    "caatinga",
+    "cerrado",
+)

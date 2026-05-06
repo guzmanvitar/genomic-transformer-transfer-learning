@@ -17,6 +17,8 @@ import pandas as pd
 from sklearn.preprocessing import StandardScaler
 from torch.utils.data import Dataset
 
+from jaguar_geo_assign.data.contracts import BIOME_CLASSES
+
 _LOGGER = logging.getLogger(__name__)
 
 
@@ -55,8 +57,11 @@ class NormalizationArtifact:
         Returns:
             Array of same shape with values in original coordinate range.
         """
-        stds_arr = np.array(self.stds)
-        means_arr = np.array(self.means)
+        stds_arr = np.array(self.stds, dtype=np.float32)
+        means_arr = np.array(self.means, dtype=np.float32)
+        # Clamp stds to avoid division by zero or numerical instability
+        # StandardScaler uses 1/scale_ in transform, so we guard against zero stds
+        stds_arr = np.maximum(stds_arr, 1e-6)
         return normalized_coords * stds_arr + means_arr
 
 
@@ -161,11 +166,15 @@ class JaguarGeoDataset(Dataset):
         # Add biome label if available
         try:
             biome_label = self.metadata_df.loc[window.sample_id, "biome_population_label"]
-            # Convert string labels to integers (0, 1, 2, ...)
-            # In practice, this would use a label encoder fitted on training data
+            # Convert string labels to integers using canonical BIOME_CLASSES mapping
+            # This ensures deterministic, validated label assignment across all splits
             if isinstance(biome_label, str):
-                # Use hash for deterministic label assignment
-                result["biome_label"] = hash(biome_label) % 10  # 10 possible classes
+                if biome_label not in BIOME_CLASSES:
+                    raise ValueError(
+                        f"Biome label '{biome_label}' for sample {window.sample_id} "
+                        f"is not in canonical BIOME_CLASSES {BIOME_CLASSES}"
+                    )
+                result["biome_label"] = BIOME_CLASSES.index(biome_label)
             else:
                 result["biome_label"] = int(biome_label)
         except KeyError:

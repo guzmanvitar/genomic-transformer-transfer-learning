@@ -15,13 +15,65 @@ from typing import Any
 import pandas as pd
 import torch
 from sklearn.preprocessing import StandardScaler
-from torch.utils.data import DataLoader, RandomSampler, SequentialSampler
+from torch.utils.data import DataLoader, SequentialSampler, WeightedRandomSampler
 
 from jaguar_geo_assign.data.finetune_windows import FinetuneWindow
 from jaguar_geo_assign.fine_tune.mtl_dataset import JaguarGeoDataset, NormalizationArtifact
 from jaguar_geo_assign.fine_tune.split import assign_fold_indices, create_stratified_group_kfold
 
 _LOGGER = logging.getLogger(__name__)
+
+
+def compute_sample_weights(
+    windows: list[FinetuneWindow],
+    metadata_df: pd.DataFrame,
+) -> list[float]:
+    """Compute per-window sampling weights to correct for individual bias.
+
+    Individuals with more windows would otherwise dominate training (high heterozygosity).
+    We weight each window by 1 / (total_windows_for_its_individual) so that each
+    individual contributes equally to the loss, regardless of how many windows they have.
+
+    Args:
+        windows: List of FinetuneWindow objects.
+        metadata_df: DataFrame with individual_id in index or as a column.
+
+    Returns:
+        List of sampling weights, one per window, summing to len(windows).
+    """
+    # Count windows per individual
+    window_counts = {}
+    for window in windows:
+        sample_id = window.sample_id
+        if sample_id in metadata_df.index:
+            # Handle case where sample_id might appear multiple times (multiple rows)
+            # by taking the first occurrence
+            ind_row = metadata_df.loc[[sample_id]].iloc[0]
+            individual_id = ind_row["individual_id"]
+            window_counts[individual_id] = window_counts.get(individual_id, 0) + 1
+
+    # Assign weight = 1 / window_count to each window
+    weights = []
+    for window in windows:
+        sample_id = window.sample_id
+        if sample_id in metadata_df.index:
+            # Handle case where sample_id might appear multiple times (multiple rows)
+            # by taking the first occurrence
+            ind_row = metadata_df.loc[[sample_id]].iloc[0]
+            individual_id = ind_row["individual_id"]
+            # Weight inversely proportional to individual's window count
+            weight = 1.0 / window_counts[individual_id]
+        else:
+            # Fallback if sample not in metadata (should not happen in practice)
+            weight = 1.0
+        weights.append(weight)
+
+    # Normalize so weights sum to len(windows) (PyTorch convention)
+    total_weight = sum(weights)
+    if total_weight > 0:
+        weights = [w * len(windows) / total_weight for w in weights]
+
+    return weights
 
 
 def collate_mtl_batch(batch: list[dict[str, Any]]) -> dict[str, Any]:
@@ -137,7 +189,11 @@ def build_dataloaders(
     num_workers: int = 0,
     random_state: int = 42,
 ) -> tuple[DataLoader, DataLoader, NormalizationArtifact]:
-    """Build train and validation dataloaders with k-fold split.
+    """Build train and validation dataloaders with k-fold split and balanced sampling.
+
+    Uses WeightedRandomSampler on the training set to correct for individuals with
+    high heterozygosity (more windows). Each window is weighted inversely by its
+    individual's total window count, ensuring equal per-individual contributions to loss.
 
     Returns:
         Tuple of (train_loader, val_loader, normalization_artifact).
@@ -155,10 +211,19 @@ def build_dataloaders(
 
     _LOGGER.info(f"Train: {len(train_dataset)}, Val: {len(val_dataset)}")
 
+    # Compute weights for training windows to correct sampling bias
+    # Individuals with more windows would otherwise dominate the training signal
+    train_weights = compute_sample_weights(train_dataset._filtered_windows, metadata_df)
+    train_sampler = WeightedRandomSampler(
+        weights=train_weights,
+        num_samples=len(train_dataset),
+        replacement=True,
+    )
+
     train_loader = DataLoader(
         train_dataset,
         batch_size=train_batch_size,
-        sampler=RandomSampler(train_dataset),
+        sampler=train_sampler,
         collate_fn=collate_mtl_batch,
         num_workers=num_workers,
         drop_last=True,

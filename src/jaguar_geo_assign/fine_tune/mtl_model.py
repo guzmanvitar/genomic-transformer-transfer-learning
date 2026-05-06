@@ -139,3 +139,33 @@ class GeographicAssignmentMTL(nn.Module):
     def get_trainable_parameters(self) -> int:
         """Count the number of trainable parameters in the model."""
         return sum(p.numel() for p in self.parameters() if p.requires_grad)
+
+    def save_pretrained(self, save_directory: str | None = None) -> None:
+        """Save model state and heads to a directory.
+
+        Saves both the backbone DNABERT-2 model and the custom MTL heads.
+        In production, this integrates with the checkpoint management system.
+
+        Args:
+            save_directory: Directory to save model to.
+        """
+        if save_directory is None:
+            raise ValueError("save_directory must be provided")
+
+        import json
+        from pathlib import Path
+
+        save_path = Path(save_directory)
+        save_path.mkdir(parents=True, exist_ok=True)
+
+        # Save state dict
+        state_dict = self.state_dict()
+        torch.save(state_dict, save_path / "pytorch_model.bin")
+
+        # Save config for later loading
+        config_dict = {
+            "num_biome_classes": self.classification_head[-1].out_features,
+            "hidden_size": self.hidden_size,
+            "model_class": "GeographicAssignmentMTL",
+        }
+        (save_path / "config.json").write_text(json.dumps(config_dict, indent=2))
