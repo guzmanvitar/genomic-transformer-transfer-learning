@@ -91,7 +91,7 @@ class JaguarMTLOutput:
     biome_logits: torch.Tensor | None = None
 
 
-class JaguarMultiTaskModel(nn.Module):
+class JaguarMTLModel(nn.Module):
     """DNABERT-2-based multi-task model for jaguar downstream tasks.
 
     The model wraps a transformer backbone (e.g. DNABERT-2) and attaches two
@@ -126,7 +126,7 @@ class JaguarMultiTaskModel(nn.Module):
         config = getattr(backbone, "config", None)
         hidden_size = getattr(config, "hidden_size", None) if config is not None else None
         if hidden_size is None:
-            raise ValueError("backbone must expose config.hidden_size for JaguarMultiTaskModel")
+            raise ValueError("backbone must expose config.hidden_size for JaguarMTLModel")
 
         if num_biomes is not None and num_biomes < 2:
             raise ValueError("num_biomes must be >= 2 when provided")
