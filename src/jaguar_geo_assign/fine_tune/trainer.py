@@ -420,8 +420,20 @@ def _compute_mtl_loss(
 
     coord_pred = outputs.coordinate
     coord_target = batch["coord_target"]
+
+    # For numerical stability and broader device support (e.g. CPU
+    # backends without full bf16/fp16 coverage), always compute the
+    # regression loss in float32 even when the model runs under
+    # mixed-precision. Gradients still back-propagate correctly.
+    if coord_pred.dtype in (torch.float16, torch.bfloat16):
+        coord_pred_reg = coord_pred.float()
+        coord_target_reg = coord_target.to(device=coord_pred.device, dtype=torch.float32)
+    else:
+        coord_pred_reg = coord_pred
+        coord_target_reg = coord_target.to(device=coord_pred.device, dtype=coord_pred.dtype)
+
     reg_loss_fn = nn.SmoothL1Loss(beta=huber_delta)
-    reg_loss = reg_loss_fn(coord_pred, coord_target)
+    reg_loss = reg_loss_fn(coord_pred_reg, coord_target_reg)
 
     cls_logits = getattr(outputs, "biome_logits", None)
     if cls_logits is not None and cls_loss_weight != 0.0:
@@ -503,12 +515,12 @@ def _run_evaluation(
         if cls_list:
             all_cls = accelerator.gather_for_metrics(torch.cat(cls_list))
         else:
-            # Coordinate-only configuration: supply an empty logits tensor so
-            # ``compute_eval_metrics`` can still compute coordinate metrics while
-            # marking classification metrics as NaN.
+            # Coordinate-only configuration: supply an empty logits tensor with
+            # zero biome dimension so ``compute_eval_metrics`` computes
+            # coordinate metrics while returning NaN classification metrics.
             all_cls = torch.empty(
+                all_coord_pred.shape[0],
                 0,
-                config.n_biomes,
                 dtype=all_coord_pred.dtype,
                 device=all_coord_pred.device,
             )
@@ -1020,9 +1032,9 @@ def integration_test(
             log_with="tensorboard",
             project_dir=str(output_dir / "tensorboard"),
         )
-        (model,) = accelerator.prepare(model)
+        model = accelerator.prepare(model)
         optimizer = AdamW(model.parameters(), lr=1e-4)
-        (optimizer,) = accelerator.prepare(optimizer)
+        optimizer = accelerator.prepare(optimizer)
         accelerator.init_trackers("jaguar_mtl_integration_test")
 
         vocab_size = int(getattr(backbone.config, "vocab_size", 128))
