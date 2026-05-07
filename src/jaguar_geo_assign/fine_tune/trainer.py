@@ -507,6 +507,7 @@ def _run_evaluation(
             mean_eval_loss = (
                 eval_total_loss / max(eval_steps, 1) if eval_steps > 0 else float("nan")
             )
+            model.train()
             return mean_eval_loss, best_eval_haversine_km, best_eval_macro_f1
 
         all_coord_pred = accelerator.gather_for_metrics(torch.cat(coord_pred_list))
