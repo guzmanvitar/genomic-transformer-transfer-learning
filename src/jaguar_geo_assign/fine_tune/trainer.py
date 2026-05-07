@@ -445,6 +445,30 @@ def _compute_mtl_loss(
     return total, cls_loss, reg_loss
 
 
+def _compute_grad_norm(model: nn.Module, norm_type: float = 2.0) -> Tensor:
+    """Return the L2 norm of current gradients without applying clipping.
+
+    This helper is used when ``config.gradient_clip == 0``, where the contract
+    interprets zero as *disabling* gradient clipping. We still want a scalar
+    gradient norm for NaN/Inf guards and optional logging, but must avoid
+    calling :meth:`accelerator.clip_grad_norm_` with ``max_norm=0`` as that
+    would zero-out all gradients.
+    """
+
+    params_with_grad = [p for p in model.parameters() if p.grad is not None]
+    if not params_with_grad:
+        # Maintain device consistency for downstream checks while treating the
+        # "no gradients" case as a zero-norm tensor.
+        try:
+            device = next(model.parameters()).device
+        except StopIteration:
+            device = torch.device("cpu")
+        return torch.zeros((), device=device, dtype=torch.float32)
+
+    grad_norms = torch.stack([p.grad.detach().norm(norm_type) for p in params_with_grad])
+    return grad_norms.norm(norm_type)
+
+
 def _run_evaluation(
     *,
     model: nn.Module,
@@ -729,9 +753,12 @@ def run_jaguar_mtl_training(config_path: str | Path) -> MTLTrainResult:
                 accelerator.backward(total_loss)
 
                 if accelerator.sync_gradients:
-                    grad_norm = accelerator.clip_grad_norm_(
-                        model.parameters(), config.gradient_clip
-                    )
+                    if config.gradient_clip > 0.0:
+                        grad_norm = accelerator.clip_grad_norm_(
+                            model.parameters(), config.gradient_clip
+                        )
+                    else:
+                        grad_norm = _compute_grad_norm(model)
                     skip_step = (not torch.isfinite(loss_detached).all()) or (
                         not torch.isfinite(grad_norm.detach()).all()
                     )
@@ -855,66 +882,69 @@ def run_jaguar_mtl_training(config_path: str | Path) -> MTLTrainResult:
                 accelerator.backward(total_loss)
 
                 if accelerator.sync_gradients:
-                    grad_norm = accelerator.clip_grad_norm_(
-                        model.parameters(), config.gradient_clip
-                    )
-                    skip_step = (not torch.isfinite(loss_detached).all()) or (
-                        not torch.isfinite(grad_norm.detach()).all()
-                    )
-                    if skip_step:
-                        skipped_steps += 1
+                    if config.gradient_clip > 0.0:
+                        grad_norm = accelerator.clip_grad_norm_(
+                            model.parameters(), config.gradient_clip
+                        )
                     else:
-                        phase2_optimizer.step()
-                        phase2_scheduler.step()
-                        phase2_steps_completed += 1
-                        global_step += 1
+                        grad_norm = _compute_grad_norm(model)
+                skip_step = (not torch.isfinite(loss_detached).all()) or (
+                    not torch.isfinite(grad_norm.detach()).all()
+                )
+                if skip_step:
+                    skipped_steps += 1
+                else:
+                    phase2_optimizer.step()
+                    phase2_scheduler.step()
+                    phase2_steps_completed += 1
+                    global_step += 1
 
-                        train_loss_sum += float(loss_detached.item())
-                        train_cls_loss_sum += float(cls_loss.detach().item())
-                        train_reg_loss_sum += float(reg_loss.detach().item())
-                        train_loss_count += 1
+                    train_loss_sum += float(loss_detached.item())
+                    train_cls_loss_sum += float(cls_loss.detach().item())
+                    train_reg_loss_sum += float(reg_loss.detach().item())
+                    train_loss_count += 1
 
-                        if global_step % config.log_every == 0:
-                            denom = max(train_loss_count, 1)
-                            logs = {
-                                "train/total_loss": train_loss_sum / denom,
-                                "train/cls_loss": train_cls_loss_sum / denom,
-                                "train/reg_loss": train_reg_loss_sum / denom,
-                                "train/nan_steps": float(nan_steps),
-                                "train/skipped_steps": float(skipped_steps),
-                                "train/lr_backbone": phase2_scheduler.get_last_lr()[0],
-                                "train/lr_heads": phase2_scheduler.get_last_lr()[-1],
-                                "train/phase": 2.0,
-                            }
-                            accelerator.log(logs, step=global_step)
-                            train_loss_sum = train_cls_loss_sum = train_reg_loss_sum = 0.0
-                            train_loss_count = 0
-                            nan_steps = 0
-                            skipped_steps = 0
+                    if global_step % config.log_every == 0:
+                        denom = max(train_loss_count, 1)
+                        logs = {
+                            "train/total_loss": train_loss_sum / denom,
+                            "train/cls_loss": train_cls_loss_sum / denom,
+                            "train/reg_loss": train_reg_loss_sum / denom,
+                            "train/nan_steps": float(nan_steps),
+                            "train/skipped_steps": float(skipped_steps),
+                            "train/lr_backbone": phase2_scheduler.get_last_lr()[0],
+                            "train/lr_heads": phase2_scheduler.get_last_lr()[-1],
+                            "train/phase": 2.0,
+                        }
+                        accelerator.log(logs, step=global_step)
+                        train_loss_sum = train_cls_loss_sum = train_reg_loss_sum = 0.0
+                        train_loss_count = 0
+                        nan_steps = 0
+                        skipped_steps = 0
 
-                        if eval_loader is not None and global_step % config.eval_every == 0:
-                            (
-                                mean_eval_loss,
-                                best_eval_haversine_km,
-                                best_eval_macro_f1,
-                            ) = _run_evaluation(
-                                model=model,
-                                eval_loader=eval_loader,
-                                accelerator=accelerator,
-                                coord_stats=coord_stats,
-                                config=config,
-                                cls_loss_weight=config.cls_loss_weight,
-                                reg_loss_weight=config.reg_loss_weight,
-                                huber_delta=config.huber_delta,
-                                global_step=global_step,
-                                best_eval_haversine_km=best_eval_haversine_km,
-                                best_eval_macro_f1=best_eval_macro_f1,
-                                output_dir=output_dir,
-                            )
-                            logger.info(
-                                "phase2_eval",
-                                extra={"step": global_step, "loss": mean_eval_loss},
-                            )
+                    if eval_loader is not None and global_step % config.eval_every == 0:
+                        (
+                            mean_eval_loss,
+                            best_eval_haversine_km,
+                            best_eval_macro_f1,
+                        ) = _run_evaluation(
+                            model=model,
+                            eval_loader=eval_loader,
+                            accelerator=accelerator,
+                            coord_stats=coord_stats,
+                            config=config,
+                            cls_loss_weight=config.cls_loss_weight,
+                            reg_loss_weight=config.reg_loss_weight,
+                            huber_delta=config.huber_delta,
+                            global_step=global_step,
+                            best_eval_haversine_km=best_eval_haversine_km,
+                            best_eval_macro_f1=best_eval_macro_f1,
+                            output_dir=output_dir,
+                        )
+                        logger.info(
+                            "phase2_eval",
+                            extra={"step": global_step, "loss": mean_eval_loss},
+                        )
 
                         if global_step % config.save_every == 0 and accelerator.is_main_process:
                             _save_json_atomically(

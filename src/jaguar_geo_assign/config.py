@@ -1390,6 +1390,8 @@ def load_foundation_training_config(path: str | Path) -> FoundationTrainingConfi
             raise ValueError("training.per_device_train_batch_size must be positive")
         if per_device_eval_batch_size <= 0:
             raise ValueError("training.per_device_eval_batch_size must be positive")
+        if gradient_clip < 0.0:
+            raise ValueError("training.gradient_clip must be non-negative")
         if pad_token_fallback not in {"eos", "unk", "add_pad"}:
             raise ValueError("training.pad_token_fallback must be one of: eos, unk, add_pad")
 
@@ -1569,6 +1571,8 @@ def load_mtl_finetune_config(path: str | Path) -> MtlFinetuneConfig:
             raise ValueError("training.phase1_steps and training.phase2_steps must be positive")
         if weight_decay < 0:
             raise ValueError("training.weight_decay must be non-negative")
+        if gradient_clip < 0.0:
+            raise ValueError("training.gradient_clip must be non-negative")
 
     except KeyError as exc:
         msg = f"MTL fine-tune config is missing required field: {exc.args[0]}"
