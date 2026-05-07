@@ -1,3 +1,4 @@
+# ruff: noqa: F722  # jaxtyping shape annotations use string-based dimensions
 """Multi-task DNABERT-2 model for downstream jaguar fine-tuning.
 
 This module defines a lightweight PyTorch ``nn.Module`` that wraps a
@@ -19,7 +20,6 @@ while pinning down the shared representation and head wiring.
 
 from __future__ import annotations
 
-# ruff: noqa: F722  # jaxtyping shape annotations use string-based dimensions
 from dataclasses import dataclass
 from typing import Any
 
