@@ -672,8 +672,18 @@ def run_jaguar_mtl_training(config_path: str | Path) -> MTLTrainResult:
         total_steps=config.phase1_steps,
     )
 
-    model, phase1_optimizer, phase1_scheduler = accelerator.prepare(
-        model, phase1_optimizer, phase1_scheduler
+    (
+        model,
+        phase1_optimizer,
+        phase1_scheduler,
+        train_loader,
+        eval_loader,
+    ) = accelerator.prepare(
+        model,
+        phase1_optimizer,
+        phase1_scheduler,
+        train_loader,
+        eval_loader,
     )
 
     global_step = 0
