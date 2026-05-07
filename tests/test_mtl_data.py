@@ -16,12 +16,22 @@ import torch
 
 import jaguar_geo_assign.fine_tune.dataset as mtl_dataset
 from jaguar_geo_assign.config import MtlFinetuneConfig, load_mtl_finetune_config
-from jaguar_geo_assign.fine_tune.dataset import (
-    BIOME_CLASSES,
-    CoordStats,
-    JaguarMTLDataset,
-    build_fold_dataloaders,
-)
+from jaguar_geo_assign.fine_tune.dataset import CoordStats, JaguarMTLDataset, build_fold_dataloaders
+
+
+@pytest.fixture(autouse=True)
+def _limit_biome_classes_to_amazon(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Restrict BIOME_CLASSES to 'Amazon' so tests can use minimal dummy metadata.
+
+    The production dataset enforces that every biome in BIOME_CLASSES has at
+    least ``config.n_folds`` unique individuals before running the
+    cross-validation split. The small CSVs used in these tests only populate
+    the ``Amazon`` biome, so narrowing the vocabulary here keeps the focus on
+    join, weighting, and logging behaviour rather than constructing a full
+    per-biome test dataset.
+    """
+
+    monkeypatch.setattr(mtl_dataset, "BIOME_CLASSES", ("Amazon",), raising=False)
 
 
 class DummyTokenizer:
@@ -108,7 +118,7 @@ def test_jaguar_mtl_dataset_emits_expected_tensors() -> None:
 
     record = {
         "sequence": "ACGT" * 10,
-        "biome_population_label": BIOME_CLASSES[0],
+        "biome_population_label": mtl_dataset.BIOME_CLASSES[0],
         "latitude": "10.0",
         "longitude": "20.0",
     }
