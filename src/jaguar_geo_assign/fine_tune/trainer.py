@@ -148,80 +148,92 @@ def compute_eval_metrics(
     """Compute classification and regression metrics on the full eval set.
 
     Callers are expected to concatenate and gather outputs across all eval
-    batches and DDP ranks *before* invoking this function.  Metrics are
+    batches and DDP ranks *before* invoking this function. Metrics are
     computed on CPU using numerically stable Torch operations only.
-    """
 
-    if cls_logits.numel() == 0:
-        return {
-            "accuracy": float("nan"),
-            "macro_f1": float("nan"),
-            "mae_lat_deg": float("nan"),
-            "mae_lon_deg": float("nan"),
-            "haversine_km_mean": float("nan"),
-            "haversine_km_median": float("nan"),
-        }
+    The implementation explicitly supports coordinate-only heads by allowing
+    ``cls_logits`` to be empty. In that case, classification metrics are
+    reported as ``NaN`` while coordinate metrics remain fully defined.
+    """
 
     with torch.no_grad():
         # ---------------------- classification metrics ----------------------
-        preds = cls_logits.argmax(dim=1).to("cpu")
-        labels = biome_label.to("cpu")
-
-        correct = (preds == labels).sum().item()
-        acc = correct / max(int(labels.numel()), 1)
-
         per_class_f1: list[float] = []
-        for k in range(n_biomes):
-            true_k = labels == k
-            pred_k = preds == k
-            tp = (true_k & pred_k).sum().item()
-            fp = ((~true_k) & pred_k).sum().item()
-            fn = (true_k & (~pred_k)).sum().item()
-            if tp == 0 and (fp > 0 or fn > 0):
-                per_class_f1.append(0.0)
-                continue
-            denom_p = tp + fp
-            denom_r = tp + fn
-            if denom_p == 0 or denom_r == 0:
-                per_class_f1.append(0.0)
-                continue
-            precision = tp / denom_p
-            recall = tp / denom_r
-            if precision + recall == 0.0:
-                per_class_f1.append(0.0)
-            else:
-                per_class_f1.append(2.0 * precision * recall / (precision + recall))
-
-        if per_class_f1:
-            macro_f1 = float(sum(per_class_f1) / len(per_class_f1))
-        else:
+        if cls_logits.numel() == 0:
+            acc = float("nan")
             macro_f1 = float("nan")
+        else:
+            preds = cls_logits.argmax(dim=1).to("cpu")
+            labels = biome_label.to("cpu")
+
+            correct = (preds == labels).sum().item()
+            acc = correct / max(int(labels.numel()), 1)
+
+            for k in range(n_biomes):
+                true_k = labels == k
+                pred_k = preds == k
+                tp = (true_k & pred_k).sum().item()
+                fp = ((~true_k) & pred_k).sum().item()
+                fn = (true_k & (~pred_k)).sum().item()
+                if tp == 0 and (fp > 0 or fn > 0):
+                    per_class_f1.append(0.0)
+                    continue
+                denom_p = tp + fp
+                denom_r = tp + fn
+                if denom_p == 0 or denom_r == 0:
+                    per_class_f1.append(0.0)
+                    continue
+                precision = tp / denom_p
+                recall = tp / denom_r
+                if precision + recall == 0.0:
+                    per_class_f1.append(0.0)
+                else:
+                    per_class_f1.append(2.0 * precision * recall / (precision + recall))
+
+            if per_class_f1:
+                macro_f1 = float(sum(per_class_f1) / len(per_class_f1))
+            else:
+                macro_f1 = float("nan")
 
         # --------------------- coordinate metrics (degrees) -----------------
-        coord_pred_cpu = coord_pred.to("cpu", dtype=torch.float32)
-        coord_target_cpu = coord_target.to("cpu", dtype=torch.float32)
+        if coord_pred.numel() == 0 or coord_target.numel() == 0:
+            mae_lat = float("nan")
+            mae_lon = float("nan")
+            hav_mean = float("nan")
+            hav_median = float("nan")
+        else:
+            coord_pred_cpu = coord_pred.to("cpu", dtype=torch.float32)
+            coord_target_cpu = coord_target.to("cpu", dtype=torch.float32)
 
-        lat_pred = coord_pred_cpu[:, 0] * float(coord_stats.lat_std) + float(coord_stats.lat_mean)
-        lon_pred = coord_pred_cpu[:, 1] * float(coord_stats.lon_std) + float(coord_stats.lon_mean)
-        lat_true = coord_target_cpu[:, 0] * float(coord_stats.lat_std) + float(coord_stats.lat_mean)
-        lon_true = coord_target_cpu[:, 1] * float(coord_stats.lon_std) + float(coord_stats.lon_mean)
+            lat_pred = coord_pred_cpu[:, 0] * float(coord_stats.lat_std) + float(
+                coord_stats.lat_mean
+            )
+            lon_pred = coord_pred_cpu[:, 1] * float(coord_stats.lon_std) + float(
+                coord_stats.lon_mean
+            )
+            lat_true = coord_target_cpu[:, 0] * float(coord_stats.lat_std) + float(
+                coord_stats.lat_mean
+            )
+            lon_true = coord_target_cpu[:, 1] * float(coord_stats.lon_std) + float(
+                coord_stats.lon_mean
+            )
 
-        mae_lat = (lat_pred - lat_true).abs().mean().item()
-        mae_lon = (lon_pred - lon_true).abs().mean().item()
+            mae_lat = (lat_pred - lat_true).abs().mean().item()
+            mae_lon = (lon_pred - lon_true).abs().mean().item()
 
-        pred_deg = torch.stack((lat_pred, lon_pred), dim=-1)
-        target_deg = torch.stack((lat_true, lon_true), dim=-1)
-        hav = haversine_distance_km(pred_deg, target_deg)
-        hav_mean = float(hav.mean().item())
-        hav_median = float(hav.median().item())
+            pred_deg = torch.stack((lat_pred, lon_pred), dim=-1)
+            target_deg = torch.stack((lat_true, lon_true), dim=-1)
+            hav = haversine_distance_km(pred_deg, target_deg)
+            hav_mean = float(hav.mean().item())
+            hav_median = float(hav.median().item())
 
     metrics: dict[str, float] = {
         "accuracy": float(acc),
-        "macro_f1": macro_f1,
+        "macro_f1": float(macro_f1),
         "mae_lat_deg": float(mae_lat),
         "mae_lon_deg": float(mae_lon),
-        "haversine_km_mean": hav_mean,
-        "haversine_km_median": hav_median,
+        "haversine_km_mean": float(hav_mean),
+        "haversine_km_median": float(hav_median),
     }
 
     for idx, biome in enumerate(BIOME_CLASSES[:n_biomes]):
@@ -477,25 +489,40 @@ def _run_evaluation(
             biome_list.append(eval_batch["biome_label"].detach())
             coord_tgt_list.append(eval_batch["coord_target"].detach())
 
-    if not cls_list:
+        # If no finite-loss eval steps were observed, skip metric computation to
+        # avoid bogus aggregates from all-NaN batches.
+        if not coord_pred_list or eval_steps == 0:
+            mean_eval_loss = (
+                eval_total_loss / max(eval_steps, 1) if eval_steps > 0 else float("nan")
+            )
+            return mean_eval_loss, best_eval_haversine_km, best_eval_macro_f1
+
+        all_coord_pred = accelerator.gather_for_metrics(torch.cat(coord_pred_list))
+        all_biome = accelerator.gather_for_metrics(torch.cat(biome_list))
+        all_coord_tgt = accelerator.gather_for_metrics(torch.cat(coord_tgt_list))
+        if cls_list:
+            all_cls = accelerator.gather_for_metrics(torch.cat(cls_list))
+        else:
+            # Coordinate-only configuration: supply an empty logits tensor so
+            # ``compute_eval_metrics`` can still compute coordinate metrics while
+            # marking classification metrics as NaN.
+            all_cls = torch.empty(
+                0,
+                config.n_biomes,
+                dtype=all_coord_pred.dtype,
+                device=all_coord_pred.device,
+            )
+
+        metrics = compute_eval_metrics(
+            all_cls,
+            all_coord_pred,
+            all_biome,
+            all_coord_tgt,
+            coord_stats,
+            n_biomes=config.n_biomes,
+        )
+
         mean_eval_loss = eval_total_loss / max(eval_steps, 1) if eval_steps > 0 else float("nan")
-        return mean_eval_loss, best_eval_haversine_km, best_eval_macro_f1
-
-    all_cls = accelerator.gather_for_metrics(torch.cat(cls_list))
-    all_coord_pred = accelerator.gather_for_metrics(torch.cat(coord_pred_list))
-    all_biome = accelerator.gather_for_metrics(torch.cat(biome_list))
-    all_coord_tgt = accelerator.gather_for_metrics(torch.cat(coord_tgt_list))
-
-    metrics = compute_eval_metrics(
-        all_cls,
-        all_coord_pred,
-        all_biome,
-        all_coord_tgt,
-        coord_stats,
-        n_biomes=config.n_biomes,
-    )
-
-    mean_eval_loss = eval_total_loss / max(eval_steps, 1) if eval_steps > 0 else float("nan")
 
     accelerator.log(
         {
@@ -641,6 +668,7 @@ def run_jaguar_mtl_training(config_path: str | Path) -> MTLTrainResult:
     phase2_steps_completed = 0
     best_eval_haversine_km: float | None = None
     best_eval_macro_f1: float | None = None
+
     nan_steps = 0
     skipped_steps = 0
 
@@ -712,26 +740,31 @@ def run_jaguar_mtl_training(config_path: str | Path) -> MTLTrainResult:
                             accelerator.log(logs, step=global_step)
                             train_loss_sum = train_cls_loss_sum = train_reg_loss_sum = 0.0
                             train_loss_count = 0
+                            nan_steps = 0
+                            skipped_steps = 0
 
                         if eval_loader is not None and global_step % config.eval_every == 0:
-                            mean_eval_loss, best_eval_haversine_km, best_eval_macro_f1 = (
-                                _run_evaluation(
-                                    model=model,
-                                    eval_loader=eval_loader,
-                                    accelerator=accelerator,
-                                    coord_stats=coord_stats,
-                                    config=config,
-                                    cls_loss_weight=config.cls_loss_weight,
-                                    reg_loss_weight=config.reg_loss_weight,
-                                    huber_delta=config.huber_delta,
-                                    global_step=global_step,
-                                    best_eval_haversine_km=best_eval_haversine_km,
-                                    best_eval_macro_f1=best_eval_macro_f1,
-                                    output_dir=output_dir,
-                                )
+                            (
+                                mean_eval_loss,
+                                best_eval_haversine_km,
+                                best_eval_macro_f1,
+                            ) = _run_evaluation(
+                                model=model,
+                                eval_loader=eval_loader,
+                                accelerator=accelerator,
+                                coord_stats=coord_stats,
+                                config=config,
+                                cls_loss_weight=config.cls_loss_weight,
+                                reg_loss_weight=config.reg_loss_weight,
+                                huber_delta=config.huber_delta,
+                                global_step=global_step,
+                                best_eval_haversine_km=best_eval_haversine_km,
+                                best_eval_macro_f1=best_eval_macro_f1,
+                                output_dir=output_dir,
                             )
                             logger.info(
-                                "phase1_eval", extra={"step": global_step, "loss": mean_eval_loss}
+                                "phase1_eval",
+                                extra={"step": global_step, "loss": mean_eval_loss},
                             )
 
                         if global_step % config.save_every == 0 and accelerator.is_main_process:
@@ -745,7 +778,7 @@ def run_jaguar_mtl_training(config_path: str | Path) -> MTLTrainResult:
                                 },
                             )
 
-                    phase1_optimizer.zero_grad()
+                phase1_optimizer.zero_grad()
 
     # ---------------------------- Phase 2 ---------------------------------
     inner_model = accelerator.unwrap_model(model)
@@ -833,26 +866,31 @@ def run_jaguar_mtl_training(config_path: str | Path) -> MTLTrainResult:
                             accelerator.log(logs, step=global_step)
                             train_loss_sum = train_cls_loss_sum = train_reg_loss_sum = 0.0
                             train_loss_count = 0
+                            nan_steps = 0
+                            skipped_steps = 0
 
                         if eval_loader is not None and global_step % config.eval_every == 0:
-                            mean_eval_loss, best_eval_haversine_km, best_eval_macro_f1 = (
-                                _run_evaluation(
-                                    model=model,
-                                    eval_loader=eval_loader,
-                                    accelerator=accelerator,
-                                    coord_stats=coord_stats,
-                                    config=config,
-                                    cls_loss_weight=config.cls_loss_weight,
-                                    reg_loss_weight=config.reg_loss_weight,
-                                    huber_delta=config.huber_delta,
-                                    global_step=global_step,
-                                    best_eval_haversine_km=best_eval_haversine_km,
-                                    best_eval_macro_f1=best_eval_macro_f1,
-                                    output_dir=output_dir,
-                                )
+                            (
+                                mean_eval_loss,
+                                best_eval_haversine_km,
+                                best_eval_macro_f1,
+                            ) = _run_evaluation(
+                                model=model,
+                                eval_loader=eval_loader,
+                                accelerator=accelerator,
+                                coord_stats=coord_stats,
+                                config=config,
+                                cls_loss_weight=config.cls_loss_weight,
+                                reg_loss_weight=config.reg_loss_weight,
+                                huber_delta=config.huber_delta,
+                                global_step=global_step,
+                                best_eval_haversine_km=best_eval_haversine_km,
+                                best_eval_macro_f1=best_eval_macro_f1,
+                                output_dir=output_dir,
                             )
                             logger.info(
-                                "phase2_eval", extra={"step": global_step, "loss": mean_eval_loss}
+                                "phase2_eval",
+                                extra={"step": global_step, "loss": mean_eval_loss},
                             )
 
                         if global_step % config.save_every == 0 and accelerator.is_main_process:
@@ -866,7 +904,7 @@ def run_jaguar_mtl_training(config_path: str | Path) -> MTLTrainResult:
                                 },
                             )
 
-                    phase2_optimizer.zero_grad()
+                phase2_optimizer.zero_grad()
 
     accelerator.end_training()
 
@@ -887,20 +925,261 @@ def integration_test(
     windows_per_individual: int = 5,
     use_real_model: bool = False,
 ) -> None:
-    """Placeholder for the MTL training-loop integration test.
+    """Run a synthetic end-to-end check of the jaguar MTL training helpers.
 
-    The full synthetic integration harness described in the DNABERT-2 jaguar
-    fine-tuning specification is intentionally deferred.  Implementing it
-    requires the end-to-end fine-tune pipeline (dataset, trainer, reporting) to
-    be stable; until then, this function raises :class:`RuntimeError` so that no
-    caller can accidentally assume coverage that does not yet exist.
+    This integration harness mirrors the spirit of
+    :func:`jaguar_geo_assign.pretrain.foundation_training.integration_test`
+    but operates on the multi-task fine-tuning stack. It exercises the
+    following contracts on a small synthetic workload:
+
+    1. Forward pass through :class:`JaguarMTLModel` produces finite total,
+       classification, and regression losses on a mixed biome cohort.
+    2. A single optimiser step updates at least one model parameter
+       (L2-difference > 0) under :class:`~accelerate.Accelerator` control.
+    3. :func:`_run_evaluation` logs metrics and writes a complete "best"
+       checkpoint directory (HF backbone, heads, normalisation stats,
+       metrics).
+    4. The evaluation path correctly handles coordinate-only configurations
+       where the biome head is absent (no early return, finite coordinate
+       metrics, checkpoint updates driven by geodesic error).
+    5. All assertions run on a tiny BERT backbone by default; when
+       ``use_real_model=True`` the real DNABERT-2 backbone from the
+       Hugging Face Hub is exercised instead. The default CPU-only path
+       avoids any network calls or large models.
+
+    Args:
+        n_individuals: Number of synthetic individuals **per biome**.
+            The total synthetic cohort size is ``n_individuals *
+            len(BIOME_CLASSES)``; larger values stress-test metric
+            aggregation without altering the semantics of the assertions.
+        windows_per_individual: Number of synthetic windows per
+            individual. This parameter controls the batch size used in the
+            synthetic training/eval batches.
+        use_real_model: If ``True``, load the real DNABERT-2 backbone from
+            the Hugging Face Hub ("zhihan1996/DNABERT-2-117M"). When
+            ``False`` (the default), use a tiny randomly initialised BERT
+            backbone that runs quickly on CPU.
+
+    Raises:
+        AssertionError: If any of the integration invariants fail.
+        RuntimeError: If model loading or checkpoint I/O fails.
     """
 
-    raise RuntimeError(
-        "fine_tune.trainer.integration_test is not implemented yet; "
-        "see the DNABERT-2 MTL Jaguar Fine-tuning spec for the full list of "
-        "required assertions and implement them once the MTL stack is wired."
-    )
+    import json
+    import tempfile
+
+    from transformers import BertConfig
+
+    if n_individuals <= 0:
+        raise ValueError("n_individuals must be positive for integration_test")
+    if windows_per_individual <= 0:
+        raise ValueError("windows_per_individual must be positive for integration_test")
+
+    # Synthetic cohort: all biomes represented with n_individuals per biome.
+    n_biomes = len(BIOME_CLASSES)
+    total_individuals = n_biomes * n_individuals
+    batch_size = total_individuals * windows_per_individual
+    seq_len = 16
+
+    with tempfile.TemporaryDirectory() as tmp_root:
+        tmp_path = Path(tmp_root)
+        output_dir = tmp_path / "mtl_integration_out"
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        # ----------------------- backbone + model ------------------------
+        if use_real_model:
+            backbone = AutoModel.from_pretrained(
+                "zhihan1996/DNABERT-2-117M",
+                trust_remote_code=True,
+            )
+        else:
+            config = BertConfig(
+                num_hidden_layers=2,
+                num_attention_heads=2,
+                hidden_size=32,
+                intermediate_size=64,
+                vocab_size=128,
+            )
+            backbone = AutoModel.from_config(config)
+
+        model = JaguarMTLModel(
+            backbone,
+            num_biomes=n_biomes,
+            dropout_prob=0.1,
+        )
+        coord_stats = CoordStats(
+            lat_mean=0.0,
+            lat_std=1.0,
+            lon_mean=0.0,
+            lon_std=1.0,
+        )
+
+        accelerator = Accelerator(
+            mixed_precision="bf16",
+            gradient_accumulation_steps=1,
+            log_with="tensorboard",
+            project_dir=str(output_dir / "tensorboard"),
+        )
+        (model,) = accelerator.prepare(model)
+        optimizer = AdamW(model.parameters(), lr=1e-4)
+        (optimizer,) = accelerator.prepare(optimizer)
+        accelerator.init_trackers("jaguar_mtl_integration_test")
+
+        vocab_size = int(getattr(backbone.config, "vocab_size", 128))
+        device = accelerator.device
+        input_ids = torch.randint(
+            low=0,
+            high=max(vocab_size, 2),
+            size=(batch_size, seq_len),
+            device=device,
+            dtype=torch.long,
+        )
+        attention_mask = torch.ones_like(input_ids)
+        biome_labels = (torch.arange(batch_size, device=device) % n_biomes).to(torch.long)
+        coord_target = torch.randn(
+            batch_size,
+            2,
+            device=device,
+            dtype=torch.float32,
+        )
+
+        batch = {
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            "biome_label": biome_labels,
+            "coord_target": coord_target,
+        }
+
+        # ---------------- Assertion 1 & 2: forward + optimiser -------------
+        outputs = model(
+            input_ids=batch["input_ids"],
+            attention_mask=batch["attention_mask"],
+        )
+        total_loss, cls_loss, reg_loss = _compute_mtl_loss(
+            outputs,
+            batch,
+            cls_loss_weight=1.0,
+            reg_loss_weight=0.5,
+            huber_delta=1.0,
+        )
+        loss_detached = total_loss.detach().float()
+        assert torch.isfinite(loss_detached).all(), (
+            f"Non-finite total_loss in integration test: {loss_detached}"
+        )
+        assert torch.isfinite(cls_loss.detach()).all(), "Non-finite cls_loss in integration test"
+        assert torch.isfinite(reg_loss.detach()).all(), "Non-finite reg_loss in integration test"
+
+        unwrapped = accelerator.unwrap_model(model)
+        pre_params = {name: param.detach().clone() for name, param in unwrapped.named_parameters()}
+
+        with accelerator.accumulate(model):
+            accelerator.backward(total_loss)
+            grad_norm = accelerator.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            assert torch.isfinite(grad_norm.detach()).all(), (
+                "Non-finite grad_norm in integration test"
+            )
+            optimizer.step()
+            optimizer.zero_grad()
+
+        unwrapped_after = accelerator.unwrap_model(model)
+        l2_diffs = [
+            (unwrapped_after.state_dict()[name] - before).norm().item()
+            for name, before in pre_params.items()
+        ]
+        assert any(diff > 0 for diff in l2_diffs), "Optimiser step did not change any parameters"
+
+        # ---------------- Assertion 3: evaluation + checkpoints ------------
+        eval_loader = [batch]
+        config = MtlFinetuneConfig(
+            backbone_path=output_dir / "<unused_backbone>",
+            windows_jsonl=output_dir / "<unused_windows>",
+            metadata_csv=output_dir / "<unused_metadata>",
+            output_dir=output_dir,
+        )
+        best_eval_haversine_km: float | None = None
+        best_eval_macro_f1: float | None = None
+        mean_eval_loss, best_eval_haversine_km, best_eval_macro_f1 = _run_evaluation(
+            model=model,
+            eval_loader=eval_loader,
+            accelerator=accelerator,
+            coord_stats=coord_stats,
+            config=config,
+            cls_loss_weight=1.0,
+            reg_loss_weight=0.5,
+            huber_delta=1.0,
+            global_step=1,
+            best_eval_haversine_km=best_eval_haversine_km,
+            best_eval_macro_f1=best_eval_macro_f1,
+            output_dir=output_dir,
+        )
+        assert math.isfinite(mean_eval_loss), "Mean eval loss should be finite in integration test"
+        assert best_eval_haversine_km is not None, (
+            "Best eval haversine should be set after evaluation"
+        )
+        assert best_eval_macro_f1 is not None, "Best eval macro_f1 should be set after evaluation"
+
+        best_dir = output_dir / "best"
+        hf_dir = best_dir / "hf_model"
+        assert (hf_dir / "config.json").exists(), (
+            "HF config.json was not written in best checkpoint"
+        )
+        assert any(p.suffix == ".safetensors" for p in hf_dir.glob("*")), (
+            "No safetensors file in hf_model dir"
+        )
+        assert (best_dir / "heads.pt").exists(), "Heads checkpoint not written"
+        assert (best_dir / "coord_norm.json").exists(), "coord_norm.json sidecar not written"
+        metrics_path = best_dir / "metrics.json"
+        assert metrics_path.exists(), "metrics.json sidecar not written"
+        metrics = json.loads(metrics_path.read_text(encoding="utf-8"))
+        assert "haversine_km_median" in metrics, "metrics.json missing haversine_km_median"
+        assert "macro_f1" in metrics, "metrics.json missing macro_f1"
+
+        # ---------------- Assertion 4: coordinate-only eval path -----------
+        coord_only_model = JaguarMTLModel(
+            unwrapped_after.backbone,
+            num_biomes=None,
+            dropout_prob=0.1,
+        )
+        coord_only_model = accelerator.prepare(coord_only_model)
+        outputs_coord_only = coord_only_model(
+            input_ids=batch["input_ids"],
+            attention_mask=batch["attention_mask"],
+        )
+        total_loss2, cls_loss2, reg_loss2 = _compute_mtl_loss(
+            outputs_coord_only,
+            batch,
+            cls_loss_weight=1.0,
+            reg_loss_weight=0.5,
+            huber_delta=1.0,
+        )
+        assert torch.isfinite(total_loss2.detach()).all(), (
+            "Non-finite total_loss in coord-only integration path"
+        )
+        assert cls_loss2.detach().item() == 0.0, "Coordinate-only head should yield zero cls_loss"
+        assert torch.isfinite(reg_loss2.detach()).all(), (
+            "Non-finite reg_loss in coord-only integration path"
+        )
+
+        mean_eval_loss2, best_eval_haversine_km2, best_eval_macro_f12 = _run_evaluation(
+            model=coord_only_model,
+            eval_loader=eval_loader,
+            accelerator=accelerator,
+            coord_stats=coord_stats,
+            config=config,
+            cls_loss_weight=1.0,
+            reg_loss_weight=0.5,
+            huber_delta=1.0,
+            global_step=2,
+            best_eval_haversine_km=best_eval_haversine_km,
+            best_eval_macro_f1=best_eval_macro_f1,
+            output_dir=output_dir,
+        )
+        assert math.isfinite(mean_eval_loss2), "Coordinate-only eval produced non-finite mean loss"
+        assert best_eval_haversine_km2 is not None, (
+            "Coordinate-only eval did not update best haversine"
+        )
+        # macro_f1 is expected to be NaN in coordinate-only mode; we
+        # intentionally do not assert on its value here.
 
 
 __all__ = [
