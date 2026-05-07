@@ -19,35 +19,72 @@ while pinning down the shared representation and head wiring.
 
 from __future__ import annotations
 
+# ruff: noqa: F722  # jaxtyping shape annotations use string-based dimensions
 from dataclasses import dataclass
 from typing import Any
 
 import torch
 from torch import nn
 
+try:  # pragma: no cover - optional dependency wiring
+    from jaxtyping import Float, Int, jaxtyped
+except Exception:  # pragma: no cover - runtime fallback when jaxtyping is absent
+
+    def jaxtyped(fn: Any) -> Any:
+        """Fallback no-op decorator when :mod:`jaxtyping` is not installed.
+
+        The production configuration pins :mod:`jaxtyping` as a dependency, but
+        this guard keeps the model importable in environments where only a
+        subset of extras is installed (for example, lightweight smoke tests).
+        """
+
+        return fn
+
+    class _ShapeType:
+        """Placeholder type for :class:`jaxtyping.Float` and :class:`Int`.
+
+        The class implements ``__class_getitem__`` so annotations like
+        ``Float[torch.Tensor, "batch seq"]`` remain syntactically valid even
+        when :mod:`jaxtyping` is unavailable. At runtime it behaves as an
+        opaque marker type with no enforcement.
+        """
+
+        def __class_getitem__(cls, item: Any) -> type:  # noqa: D401
+            """Return the placeholder type itself for any subscription."""
+
+            return cls
+
+    Float = _ShapeType
+    Int = _ShapeType
+
 
 class CoordinateRegressionHead(nn.Module):
-    """Linear head that predicts (latitude, longitude) from a pooled embedding.
+    """Two-layer MLP head that predicts (latitude, longitude).
 
-    The head is intentionally small — a single dropout + linear projection — so
-    that most capacity remains in the DNABERT-2 trunk. More elaborate heads
-    (e.g. MLPs) can be added in future tasks if needed without changing the
-    surrounding fine-tuning pipeline interface.
+    The head remains deliberately small relative to the DNABERT-2 trunk but now
+    uses a two-layer MLP with a GELU non-linearity. This matches the
+    fine-tuning specification while keeping most capacity in the shared
+    backbone.
     """
 
     def __init__(self, hidden_size: int, dropout_prob: float = 0.1) -> None:
         super().__init__()
-        self.dropout = nn.Dropout(dropout_prob)
-        self.projection = nn.Linear(hidden_size, 2)
+        self.mlp = nn.Sequential(
+            nn.Dropout(dropout_prob),
+            nn.Linear(hidden_size, hidden_size),
+            nn.GELU(),
+            nn.Dropout(dropout_prob),
+            nn.Linear(hidden_size, 2),
+        )
 
     def forward(self, pooled: torch.Tensor) -> torch.Tensor:  # noqa: D401
         """Return coordinate predictions with shape ``(batch_size, 2)``."""
 
-        return self.projection(self.dropout(pooled))
+        return self.mlp(pooled)
 
 
 class BiomeClassificationHead(nn.Module):
-    """Classification head for biome-population labels.
+    """Two-layer MLP classification head for biome-population labels.
 
     The head emits unnormalised logits so that callers can choose the exact
     loss function (e.g. cross-entropy with class weights) and calibration
@@ -65,13 +102,18 @@ class BiomeClassificationHead(nn.Module):
         if num_biomes < 2:
             raise ValueError("num_biomes must be >= 2 for a meaningful classification head")
         self.num_biomes = num_biomes
-        self.dropout = nn.Dropout(dropout_prob)
-        self.projection = nn.Linear(hidden_size, num_biomes)
+        self.mlp = nn.Sequential(
+            nn.Dropout(dropout_prob),
+            nn.Linear(hidden_size, hidden_size),
+            nn.GELU(),
+            nn.Dropout(dropout_prob),
+            nn.Linear(hidden_size, num_biomes),
+        )
 
     def forward(self, pooled: torch.Tensor) -> torch.Tensor:  # noqa: D401
         """Return logits with shape ``(batch_size, num_biomes)``."""
 
-        return self.projection(self.dropout(pooled))
+        return self.mlp(pooled)
 
 
 @dataclass
@@ -116,6 +158,7 @@ class JaguarMTLModel(nn.Module):
         *,
         num_biomes: int | None = None,
         dropout_prob: float = 0.1,
+        pooling_strategy: str = "cls",
     ) -> None:
         super().__init__()
 
@@ -130,8 +173,12 @@ class JaguarMTLModel(nn.Module):
 
         if num_biomes is not None and num_biomes < 2:
             raise ValueError("num_biomes must be >= 2 when provided")
+        if pooling_strategy not in {"cls", "mean"}:
+            msg = "pooling_strategy must be 'cls' or 'mean'"
+            raise ValueError(msg)
 
         self.backbone = backbone
+        self.pooling_strategy = pooling_strategy
         self.coordinate_head = CoordinateRegressionHead(hidden_size, dropout_prob)
         self.biome_head: BiomeClassificationHead | None
         if num_biomes is None:
@@ -139,26 +186,48 @@ class JaguarMTLModel(nn.Module):
         else:
             self.biome_head = BiomeClassificationHead(hidden_size, num_biomes, dropout_prob)
 
-    @staticmethod
-    def _pool_hidden(model_outputs: Any) -> torch.Tensor:
+    @jaxtyped
+    def _pool(
+        self,
+        last_hidden_state: Float[torch.Tensor, "batch seq hidden"],
+        pooler_output: Float[torch.Tensor, "batch hidden"] | None,
+        attention_mask: Int[torch.Tensor, "batch seq"] | None,
+    ) -> Float[torch.Tensor, "batch hidden"]:
         """Return a single embedding per sequence from backbone outputs.
 
-        Preference is given to ``pooler_output`` when available (common for
-        BERT-style models). If absent, the method falls back to using the
-        first token's hidden state (typically the ``[CLS]`` token) so that
-        non-pooled backbones remain usable.
+        When ``pooling_strategy`` is ``"cls"`` (the default), preference is
+        given to ``pooler_output`` when available (common for BERT-style
+        models). If absent, the method falls back to using the first token's
+        hidden state (typically the ``[CLS]`` token) so that non-pooled
+        backbones remain usable.
+
+        When ``pooling_strategy`` is ``"mean"``, the method computes a masked
+        mean over the sequence dimension using ``attention_mask`` when
+        provided, and falls back to an unmasked mean otherwise. The denominator
+        is clamped to at least one token to avoid division-by-zero NaNs in
+        degenerate all-padding cases.
         """
 
-        pooled = getattr(model_outputs, "pooler_output", None)
-        if pooled is not None:
-            return pooled
-        return model_outputs.last_hidden_state[:, 0]
+        if self.pooling_strategy == "cls":
+            if pooler_output is not None:
+                return pooler_output
+            return last_hidden_state[:, 0]
 
+        # Mean pooling path.
+        if attention_mask is None:
+            return last_hidden_state.mean(dim=1)
+
+        mask = attention_mask.to(dtype=last_hidden_state.dtype)
+        lengths = mask.sum(dim=1, keepdim=True).clamp(min=1.0)
+        masked_sum = (last_hidden_state * mask.unsqueeze(-1)).sum(dim=1)
+        return masked_sum / lengths
+
+    @jaxtyped
     def forward(
         self,
-        input_ids: torch.LongTensor,
-        attention_mask: torch.Tensor | None = None,
-        token_type_ids: torch.Tensor | None = None,
+        input_ids: Int[torch.Tensor, "batch seq"],
+        attention_mask: Int[torch.Tensor, "batch seq"] | None = None,
+        token_type_ids: Int[torch.Tensor, "batch seq"] | None = None,
         **kwargs: Any,
     ) -> JaguarMTLOutput:
         """Run the multi-task model and return coordinate and optional biome outputs.
@@ -182,7 +251,11 @@ class JaguarMTLModel(nn.Module):
             token_type_ids=token_type_ids,
             **kwargs,
         )
-        pooled = self._pool_hidden(outputs)
+        pooled = self._pool(
+            outputs.last_hidden_state,
+            getattr(outputs, "pooler_output", None),
+            attention_mask,
+        )
         coordinate = self.coordinate_head(pooled)
         biome_logits = self.biome_head(pooled) if self.biome_head is not None else None
         return JaguarMTLOutput(coordinate=coordinate, biome_logits=biome_logits)

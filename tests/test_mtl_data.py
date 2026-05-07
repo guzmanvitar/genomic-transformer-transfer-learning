@@ -14,6 +14,7 @@ from pathlib import Path
 import pytest
 import torch
 
+import jaguar_geo_assign.fine_tune.dataset as mtl_dataset
 from jaguar_geo_assign.config import MtlFinetuneConfig, load_mtl_finetune_config
 from jaguar_geo_assign.fine_tune.dataset import (
     BIOME_CLASSES,
@@ -87,6 +88,19 @@ def test_coord_stats_json_round_trip(tmp_path: Path) -> None:
     assert loaded.lat_mean == pytest.approx(1.0)
     assert loaded.lon_mean == pytest.approx(-2.0)
     assert loaded.lat_std >= 1e-6 and loaded.lon_std >= 1e-6
+
+
+def test_coord_stats_logs_when_clamping(caplog: pytest.LogCaptureFixture) -> None:
+    """CoordStats must emit a WARNING log when standard deviations are clamped."""
+
+    logger_name = "jaguar_geo_assign.fine_tune.dataset"
+    caplog.set_level(logging.WARNING, logger=logger_name)
+
+    # Zero standard deviations force both lat_std and lon_std to be clamped.
+    _ = CoordStats(lat_mean=0.0, lat_std=0.0, lon_mean=0.0, lon_std=0.0)
+
+    messages = [record.getMessage() for record in caplog.records if record.name == logger_name]
+    assert any("CoordStats std devs clamped" in message for message in messages)
 
 
 def test_jaguar_mtl_dataset_emits_expected_tensors() -> None:
@@ -188,3 +202,99 @@ def test_build_fold_dataloaders_logs_dropped_windows(
     with pytest.raises(ValueError):
         build_fold_dataloaders(config, DummyTokenizer())
     assert any("Dropped 1 windows" in rec.getMessage() for rec in caplog.records)
+
+
+def test_build_fold_dataloaders_wraps_stratified_group_kfold_errors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """StratifiedGroupKFold errors must be re-raised with an actionable message."""
+
+    windows_path = tmp_path / "windows.jsonl"
+    metadata_path = tmp_path / "metadata.csv"
+
+    windows = [
+        {"sample_id": "s1", "sequence": "A" * 16},
+        {"sample_id": "s2", "sequence": "C" * 16},
+    ]
+    windows_path.write_text(
+        "\n".join(json.dumps(w) for w in windows) + "\n",
+        encoding="utf-8",
+    )
+
+    metadata_path.write_text(
+        "sample_id,individual_id,biome_population_label,latitude,longitude\n"
+        "s1,ind-1,Amazon,0.0,0.0\n"
+        "s2,ind-2,Amazon,10.0,20.0\n",
+        encoding="utf-8",
+    )
+
+    config = MtlFinetuneConfig(
+        backbone_path=tmp_path / "backbone",
+        windows_jsonl=windows_path,
+        metadata_csv=metadata_path,
+        output_dir=tmp_path / "out",
+        n_folds=2,
+        fold_index=0,
+    )
+
+    class FailingStratifiedGroupKFold:
+        """Test double for StratifiedGroupKFold that always raises."""
+
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            """Accept the standard constructor signature but perform no work."""
+
+        def split(self, x, y=None, groups=None) -> None:  # noqa: D401
+            """Mimic the StratifiedGroupKFold API but always fail with ValueError."""
+
+            raise ValueError("synthetic StratifiedGroupKFold failure")
+
+    monkeypatch.setattr(mtl_dataset, "StratifiedGroupKFold", FailingStratifiedGroupKFold)
+
+    with pytest.raises(ValueError) as exc_info:
+        build_fold_dataloaders(config, DummyTokenizer())
+    message = str(exc_info.value)
+    assert "StratifiedGroupKFold failed to split the jaguar fine-tune dataset" in message
+    assert "synthetic StratifiedGroupKFold failure" in message
+
+
+def test_build_fold_dataloaders_sets_pin_memory_when_cuda_available(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """DataLoaders must enable pin_memory when CUDA is reported as available."""
+
+    windows_path = tmp_path / "windows.jsonl"
+    metadata_path = tmp_path / "metadata.csv"
+
+    windows = [
+        {"sample_id": "s1", "sequence": "A" * 16},
+        {"sample_id": "s1", "sequence": "C" * 16},
+        {"sample_id": "s2", "sequence": "G" * 16},
+    ]
+    windows_path.write_text(
+        "\n".join(json.dumps(w) for w in windows) + "\n",
+        encoding="utf-8",
+    )
+
+    metadata_path.write_text(
+        "sample_id,individual_id,biome_population_label,latitude,longitude\n"
+        "s1,ind-1,Amazon,0.0,0.0\n"
+        "s2,ind-2,Amazon,10.0,20.0\n",
+        encoding="utf-8",
+    )
+
+    config = MtlFinetuneConfig(
+        backbone_path=tmp_path / "backbone",
+        windows_jsonl=windows_path,
+        metadata_csv=metadata_path,
+        output_dir=tmp_path / "out",
+        n_folds=2,
+        fold_index=0,
+    )
+
+    # Force CUDA availability regardless of the underlying test hardware so we
+    # can assert on the pin_memory behaviour deterministically.
+    monkeypatch.setattr(mtl_dataset.torch.cuda, "is_available", lambda: True)
+
+    train_loader, eval_loader, _ = build_fold_dataloaders(config, DummyTokenizer())
+    assert train_loader.pin_memory is True
+    assert eval_loader.pin_memory is True

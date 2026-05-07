@@ -1,3 +1,4 @@
+# ruff: noqa: F722  # jaxtyping shape annotations use string-based dimensions
 """Two-phase DNABERT-2 jaguar multi-task fine-tuning with Accelerate.
 
 This module implements the high-level training loop for the jaguar multi-task
@@ -25,6 +26,8 @@ from typing import Any
 import torch
 from accelerate import Accelerator
 from accelerate.utils import set_seed
+from beartype import beartype
+from jaxtyping import Float, Int, jaxtyped
 from torch import nn
 from torch.optim import AdamW
 from transformers import AutoModel, AutoTokenizer, get_cosine_schedule_with_warmup
@@ -33,6 +36,9 @@ from jaguar_geo_assign.config import MtlFinetuneConfig, load_mtl_finetune_config
 from jaguar_geo_assign.fine_tune.dataset import BIOME_CLASSES, CoordStats, build_fold_dataloaders
 from jaguar_geo_assign.fine_tune.model import JaguarMTLModel
 from jaguar_geo_assign.pretrain.foundation_training import _save_json_atomically, atomic_dir_replace
+
+# Alias used only in jaxtyping shape annotations; kept out of runtime logic.
+batch = "batch"  # noqa: F841
 
 logger = logging.getLogger(__name__)
 
@@ -81,13 +87,14 @@ def _load_tokenizer(config: MtlFinetuneConfig, backbone: Any | None = None) -> A
     return tokenizer
 
 
+@jaxtyped(typechecker=beartype)
 def haversine_distance_km(
-    pred_deg: Tensor,
-    target_deg: Tensor,
+    pred_deg: Float[Tensor, "batch 2"],
+    target_deg: Float[Tensor, "batch 2"],
     *,
     radius_km: float = 6371.0,
     epsilon: float = 1e-7,
-) -> Tensor:
+) -> Float[Tensor, batch]:
     """Compute great-circle distance between coordinate pairs in kilometres.
 
     The implementation follows the standard Haversine formula with explicit
@@ -129,11 +136,12 @@ def haversine_distance_km(
     return radius_km * c
 
 
+@jaxtyped(typechecker=beartype)
 def compute_eval_metrics(
-    cls_logits: Tensor,
-    coord_pred: Tensor,
-    biome_label: Tensor,
-    coord_target: Tensor,
+    cls_logits: Float[Tensor, "batch n_biomes"],
+    coord_pred: Float[Tensor, "batch 2"],
+    biome_label: Int[Tensor, batch],
+    coord_target: Float[Tensor, "batch 2"],
     coord_stats: CoordStats,
     n_biomes: int = 5,
 ) -> dict[str, float]:
@@ -737,7 +745,7 @@ def run_jaguar_mtl_training(config_path: str | Path) -> MTLTrainResult:
                                 },
                             )
 
-                phase1_optimizer.zero_grad()
+                    phase1_optimizer.zero_grad()
 
     # ---------------------------- Phase 2 ---------------------------------
     inner_model = accelerator.unwrap_model(model)
@@ -858,7 +866,7 @@ def run_jaguar_mtl_training(config_path: str | Path) -> MTLTrainResult:
                                 },
                             )
 
-                phase2_optimizer.zero_grad()
+                    phase2_optimizer.zero_grad()
 
     accelerator.end_training()
 

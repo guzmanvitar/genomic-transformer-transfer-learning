@@ -66,9 +66,30 @@ class CoordStats:
     lon_std: float
 
     def __post_init__(self) -> None:
+        """Clamp extremely small standard deviations and log when this occurs.
+
+        The clamping guard ensures downstream z-score computations never
+        divide by zero. A WARNING log is emitted when clamping occurs so
+        that degenerate coordinate distributions are visible in experiment
+        logs rather than silently hidden in the normalisation step.
+        """
+
         # Frozen dataclass; use object.__setattr__ for clamping.
-        object.__setattr__(self, "lat_std", max(self.lat_std, 1e-6))
-        object.__setattr__(self, "lon_std", max(self.lon_std, 1e-6))
+        original_lat_std = self.lat_std
+        original_lon_std = self.lon_std
+        lat_std = max(original_lat_std, 1e-6)
+        lon_std = max(original_lon_std, 1e-6)
+        object.__setattr__(self, "lat_std", lat_std)
+        object.__setattr__(self, "lon_std", lon_std)
+        if lat_std != original_lat_std or lon_std != original_lon_std:
+            logger.warning(
+                "CoordStats std devs clamped to minimum 1e-6 "
+                "(lat_std=%g, lon_std=%g; original lat_std=%g, lon_std=%g)",
+                lat_std,
+                lon_std,
+                original_lat_std,
+                original_lon_std,
+            )
 
     def to_json(self, path: Path) -> None:
         """Serialise the stats to *path* as a small JSON object.
@@ -318,10 +339,22 @@ def build_fold_dataloaders(
 
     train_indices: Iterable[int] | None = None
     eval_indices: Iterable[int] | None = None
-    for fold_idx, (train_idx, eval_idx) in enumerate(cv.split(indices, stratify, groups)):
-        if fold_idx == config.fold_index:
-            train_indices, eval_indices = train_idx, eval_idx
-            break
+    try:
+        for fold_idx, (train_idx, eval_idx) in enumerate(cv.split(indices, stratify, groups)):
+            if fold_idx == config.fold_index:
+                train_indices, eval_indices = train_idx, eval_idx
+                break
+    except ValueError as exc:  # pragma: no cover - exercised via dedicated pytest
+        # Surface a more actionable message than the raw scikit-learn error.
+        raise ValueError(
+            "StratifiedGroupKFold failed to split the jaguar fine-tune dataset. "
+            "This usually indicates that, after the inner join and per-biome "
+            "uniqueness checks, the combination of biome_population_label and "
+            "individual_id is too imbalanced for the requested number of folds. "
+            f"Consider reducing training.n_folds (currently {config.n_folds}) or "
+            "dropping extremely rare individuals/biomes. "
+            f"Original error: {exc}"
+        ) from exc
 
     if train_indices is None or eval_indices is None:
         raise ValueError(
@@ -339,13 +372,24 @@ def build_fold_dataloaders(
 
     lat_mean = sum(train_lats) / len(train_lats)
     lon_mean = sum(train_lons) / len(train_lons)
-    lat_var = sum((x - lat_mean) ** 2 for x in train_lats) / len(train_lats)
-    lon_var = sum((x - lon_mean) ** 2 for x in train_lons) / len(train_lons)
+    # Use the unbiased sample variance (N - 1) when there is more than one
+    # training example. For the N == 1 corner case we fall back to zero and
+    # rely on CoordStats clamping to enforce the minimum standard deviation.
+    if len(train_lats) > 1:
+        lat_var = sum((x - lat_mean) ** 2 for x in train_lats) / (len(train_lats) - 1)
+    else:
+        lat_var = 0.0
+    if len(train_lons) > 1:
+        lon_var = sum((x - lon_mean) ** 2 for x in train_lons) / (len(train_lons) - 1)
+    else:
+        lon_var = 0.0
+    lat_std = math.sqrt(max(lat_var, 0.0))
+    lon_std = math.sqrt(max(lon_var, 0.0))
     coord_stats = CoordStats(
         lat_mean=lat_mean,
-        lat_std=math.sqrt(lat_var),
+        lat_std=lat_std,
         lon_mean=lon_mean,
-        lon_std=math.sqrt(lon_var),
+        lon_std=lon_std,
     )
 
     train_records = [joined[i] for i in train_indices]
@@ -372,11 +416,16 @@ def build_fold_dataloaders(
         replacement=True,
     )
 
+    # Enable pinned-memory transfers when CUDA is available to avoid the
+    # CPU-to-GPU copy becoming a hidden bottleneck during fine-tuning.
+    pin_memory = torch.cuda.is_available()
+
     train_loader = DataLoader(
         train_dataset,
         batch_size=config.per_device_train_batch_size,
         sampler=sampler,
         num_workers=config.num_workers,
+        pin_memory=pin_memory,
     )
 
     eval_loader = DataLoader(
@@ -384,6 +433,7 @@ def build_fold_dataloaders(
         batch_size=config.per_device_eval_batch_size,
         shuffle=False,
         num_workers=config.num_workers,
+        pin_memory=pin_memory,
     )
 
     return train_loader, eval_loader, coord_stats
