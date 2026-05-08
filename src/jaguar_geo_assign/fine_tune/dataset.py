@@ -255,6 +255,52 @@ def _load_metadata_csv(path: Path) -> dict[str, dict[str, Any]]:
     return by_sample
 
 
+def _fit_coord_stats(records: Iterable[Mapping[str, Any]]) -> CoordStats:
+    """Fit coordinate normalisation stats with equal per-individual weighting.
+
+    Training uses a sampler that equalises each individual's contribution
+    regardless of how many windows that individual produced. ``CoordStats``
+    must mirror that contract; otherwise individuals with many windows skew the
+    z-score centering/scaling seen by the regression head. To remove that bias,
+    this helper first collapses records to one mean coordinate pair per
+    ``individual_id`` and then computes the usual unbiased sample standard
+    deviation across those per-individual coordinates.
+    """
+
+    latitudes_by_individual: dict[str, list[float]] = {}
+    longitudes_by_individual: dict[str, list[float]] = {}
+    for record in records:
+        individual_id = str(record["individual_id"])
+        latitudes_by_individual.setdefault(individual_id, []).append(float(record["latitude"]))
+        longitudes_by_individual.setdefault(individual_id, []).append(float(record["longitude"]))
+
+    if not latitudes_by_individual or not longitudes_by_individual:
+        raise ValueError("Training split has no records; cannot fit CoordStats")
+
+    train_lats = [sum(values) / len(values) for values in latitudes_by_individual.values()]
+    train_lons = [sum(values) / len(values) for values in longitudes_by_individual.values()]
+
+    lat_mean = sum(train_lats) / len(train_lats)
+    lon_mean = sum(train_lons) / len(train_lons)
+    # Use the unbiased sample variance (N - 1) when there is more than one
+    # training individual. For the N == 1 corner case we fall back to zero and
+    # rely on CoordStats clamping to enforce the minimum standard deviation.
+    if len(train_lats) > 1:
+        lat_var = sum((x - lat_mean) ** 2 for x in train_lats) / (len(train_lats) - 1)
+    else:
+        lat_var = 0.0
+    if len(train_lons) > 1:
+        lon_var = sum((x - lon_mean) ** 2 for x in train_lons) / (len(train_lons) - 1)
+    else:
+        lon_var = 0.0
+    return CoordStats(
+        lat_mean=lat_mean,
+        lat_std=math.sqrt(max(lat_var, 0.0)),
+        lon_mean=lon_mean,
+        lon_std=math.sqrt(max(lon_var, 0.0)),
+    )
+
+
 def build_fold_dataloaders(
     config: MtlFinetuneConfig,
     tokenizer: Any,
@@ -273,7 +319,8 @@ def build_fold_dataloaders(
        individuals; otherwise raise ``ValueError``.
     5. Run :class:`StratifiedGroupKFold` over biome labels (stratification)
        and ``individual_id`` (grouping) and select ``config.fold_index``.
-    6. Fit :class:`CoordStats` on training indices only.
+    6. Fit :class:`CoordStats` on the training split with equal weight per
+       unique individual rather than per emitted window.
     7. Build :class:`JaguarMTLDataset` instances for train/eval.
     8. Construct a :class:`WeightedRandomSampler` that equalises window
        contribution per individual in the training split.
@@ -364,36 +411,12 @@ def build_fold_dataloaders(
     train_indices = list(train_indices)
     eval_indices = list(eval_indices)
 
-    # Fit CoordStats on train split only.
-    train_lats = [float(joined[i]["latitude"]) for i in train_indices]
-    train_lons = [float(joined[i]["longitude"]) for i in train_indices]
-    if not train_lats or not train_lons:
-        raise ValueError("Training split has no records; cannot fit CoordStats")
-
-    lat_mean = sum(train_lats) / len(train_lats)
-    lon_mean = sum(train_lons) / len(train_lons)
-    # Use the unbiased sample variance (N - 1) when there is more than one
-    # training example. For the N == 1 corner case we fall back to zero and
-    # rely on CoordStats clamping to enforce the minimum standard deviation.
-    if len(train_lats) > 1:
-        lat_var = sum((x - lat_mean) ** 2 for x in train_lats) / (len(train_lats) - 1)
-    else:
-        lat_var = 0.0
-    if len(train_lons) > 1:
-        lon_var = sum((x - lon_mean) ** 2 for x in train_lons) / (len(train_lons) - 1)
-    else:
-        lon_var = 0.0
-    lat_std = math.sqrt(max(lat_var, 0.0))
-    lon_std = math.sqrt(max(lon_var, 0.0))
-    coord_stats = CoordStats(
-        lat_mean=lat_mean,
-        lat_std=lat_std,
-        lon_mean=lon_mean,
-        lon_std=lon_std,
-    )
-
     train_records = [joined[i] for i in train_indices]
     eval_records = [joined[i] for i in eval_indices]
+
+    # Fit CoordStats on train split only, matching the sampler's equal weight
+    # per individual rather than per raw window.
+    coord_stats = _fit_coord_stats(train_records)
 
     train_dataset = JaguarMTLDataset(train_records, tokenizer, coord_stats)
     eval_dataset = JaguarMTLDataset(eval_records, tokenizer, coord_stats)

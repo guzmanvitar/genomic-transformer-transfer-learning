@@ -180,6 +180,65 @@ def test_build_fold_dataloaders_join_and_weights(tmp_path: Path) -> None:
     assert sampler_weights == pytest.approx(expected_weights)
 
 
+def test_build_fold_dataloaders_fits_coord_stats_per_individual(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """CoordStats must weight individuals equally, not by raw window count."""
+
+    windows_path = tmp_path / "windows.jsonl"
+    metadata_path = tmp_path / "metadata.csv"
+
+    windows = [
+        {"sample_id": "dense", "sequence": "A" * 16},
+        {"sample_id": "dense", "sequence": "C" * 16},
+        {"sample_id": "dense", "sequence": "G" * 16},
+        {"sample_id": "sparse", "sequence": "T" * 16},
+        {"sample_id": "eval", "sequence": "AC" * 8},
+    ]
+    windows_path.write_text(
+        "\n".join(json.dumps(window) for window in windows) + "\n",
+        encoding="utf-8",
+    )
+
+    metadata_path.write_text(
+        "sample_id,individual_id,biome_population_label,latitude,longitude\n"
+        "dense,ind-dense,Amazon,0.0,0.0\n"
+        "sparse,ind-sparse,Amazon,10.0,20.0\n"
+        "eval,ind-eval,Amazon,50.0,60.0\n",
+        encoding="utf-8",
+    )
+
+    config = MtlFinetuneConfig(
+        backbone_path=tmp_path / "backbone",
+        windows_jsonl=windows_path,
+        metadata_csv=metadata_path,
+        output_dir=tmp_path / "out",
+        n_folds=2,
+        fold_index=0,
+    )
+
+    class FixedStratifiedGroupKFold:
+        """Test double that returns a deterministic split for the bias regression."""
+
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            """Accept the production constructor signature without storing state."""
+
+        def split(self, x, y=None, groups=None):  # noqa: D401
+            """Return a train split with one dense-window individual and one sparse individual."""
+
+            del x, y, groups
+            yield [0, 1, 2, 3], [4]
+
+    monkeypatch.setattr(mtl_dataset, "StratifiedGroupKFold", FixedStratifiedGroupKFold)
+
+    _, _, coord_stats = build_fold_dataloaders(config, DummyTokenizer())
+
+    assert coord_stats.lat_mean == pytest.approx(5.0)
+    assert coord_stats.lon_mean == pytest.approx(10.0)
+    assert coord_stats.lat_std == pytest.approx(50.0**0.5)
+    assert coord_stats.lon_std == pytest.approx(200.0**0.5)
+
+
 def test_build_fold_dataloaders_logs_dropped_windows(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
