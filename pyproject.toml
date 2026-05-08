@@ -6,7 +6,10 @@ readme = "README.md"
 requires-python = ">=3.11,<3.12"
 dependencies = [
     "accelerate>=1.13.0",
+    "beartype>=0.22.9",
+    "jaxtyping>=0.3.9",
     "pyarrow>=16,<20",
+    "scikit-learn>=1.8.0",
     "tensorboard>=2.20.0",
     "torch>=2.11.0",
     "transformers>=5.6,<6",

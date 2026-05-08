@@ -1390,6 +1390,8 @@ def load_foundation_training_config(path: str | Path) -> FoundationTrainingConfi
             raise ValueError("training.per_device_train_batch_size must be positive")
         if per_device_eval_batch_size <= 0:
             raise ValueError("training.per_device_eval_batch_size must be positive")
+        if gradient_clip < 0.0:
+            raise ValueError("training.gradient_clip must be non-negative")
         if pad_token_fallback not in {"eos", "unk", "add_pad"}:
             raise ValueError("training.pad_token_fallback must be one of: eos, unk, add_pad")
 
@@ -1421,4 +1423,190 @@ def load_foundation_training_config(path: str | Path) -> FoundationTrainingConfi
         shuffle_buffer_size=shuffle_buffer_size,
         tensorboard_subdir=tensorboard_subdir,
         pad_token_fallback=pad_token_fallback,
+    )
+
+
+@dataclass(frozen=True)
+class MtlFinetuneConfig:
+    """Immutable, validated configuration for DNABERT-2 jaguar multi-task fine-tuning.
+
+    Mirrors :class:`FoundationTrainingConfig` in structure: a small set of
+    required filesystem paths plus defaulted hyperparameters for a two-phase
+    training run. All fields are validated by
+    :func:`load_mtl_finetune_config` before construction.
+
+    Attributes:
+        backbone_path: Local path to a pretrained DNABERT-2 checkpoint
+            (e.g. ``models/foundation_felid/best/hf_model``).
+        windows_jsonl: JSONL of :class:`~jaguar_geo_assign.data.finetune_windows.FinetuneWindow`
+            records produced by :func:`finetune_windows.write_locus_windows_jsonl`.
+        metadata_csv: CSV containing jaguar-level metadata (sample_id,
+            individual_id, biome label, latitude, longitude).
+        output_dir: Root directory for checkpoints and normalisation artefacts.
+        n_folds: Number of StratifiedGroupKFold splits.
+        fold_index: Zero-based index of the active fold.
+        pooling_strategy: Pooled representation to feed the heads ("cls" or "mean").
+        n_biomes: Number of biome classes (pinned to 5 by contract).
+        phase1_steps: Training steps in the heads-only warm-up phase.
+        phase2_steps: Training steps in the joint backbone+heads phase.
+        unfreeze_layers: Number of final transformer layers to unfreeze in phase 2.
+        lr_heads_phase1: Learning rate for task heads during phase 1.
+        lr_backbone_phase2: Learning rate for the backbone during phase 2.
+        lr_heads_phase2: Learning rate for task heads during phase 2.
+        cls_loss_weight: Weight for the biome classification loss term.
+        reg_loss_weight: Weight for the coordinate regression loss term.
+        huber_delta: Delta parameter for the Huber regression loss.
+        per_device_train_batch_size: Training batch size per device.
+        per_device_eval_batch_size: Evaluation batch size per device.
+        gradient_accumulation_steps: Gradient accumulation steps before an optimiser step.
+        warmup_fraction: Fraction of total steps used for linear LR warmup.
+        gradient_clip: Maximum gradient norm (0 disables clipping).
+        seed: Random seed for reproducibility.
+        num_workers: DataLoader worker processes.
+        weight_decay: AdamW weight-decay coefficient.
+        log_every: Logging frequency in steps.
+        eval_every: Evaluation frequency in steps.
+        save_every: Checkpoint save frequency in steps.
+        tensorboard_subdir: Subdirectory under output_dir for TensorBoard logs.
+        dropout: Dropout probability applied in the MTL heads.
+    """
+
+    backbone_path: Path
+    windows_jsonl: Path
+    metadata_csv: Path
+    output_dir: Path
+    n_folds: int = 5
+    fold_index: int = 0
+    pooling_strategy: str = "cls"
+    n_biomes: int = 5
+    phase1_steps: int = 1000
+    phase2_steps: int = 3000
+    unfreeze_layers: int = 2
+    lr_heads_phase1: float = 1e-4
+    lr_backbone_phase2: float = 1e-5
+    lr_heads_phase2: float = 1e-4
+    cls_loss_weight: float = 1.0
+    reg_loss_weight: float = 0.1
+    huber_delta: float = 1.0
+    per_device_train_batch_size: int = 16
+    per_device_eval_batch_size: int = 32
+    gradient_accumulation_steps: int = 4
+    warmup_fraction: float = 0.1
+    gradient_clip: float = 1.0
+    seed: int = 42
+    num_workers: int = 0
+    weight_decay: float = 0.01
+    log_every: int = 10
+    eval_every: int = 100
+    save_every: int = 500
+    tensorboard_subdir: str = "tensorboard"
+    dropout: float = 0.1
+
+
+def load_mtl_finetune_config(path: str | Path) -> MtlFinetuneConfig:
+    """Load and validate a DNABERT-2 jaguar multi-task fine-tuning TOML config.
+
+    Follows the same loader pattern as :func:`load_foundation_training_config`.
+    Hyperparameters are read from the ``[training]`` section and validated
+    against the fine-tuning contracts defined in :class:`MtlFinetuneConfig`.
+
+    Raises:
+        ValueError: If any contract check fails or a required field is missing.
+    """
+
+    raw = tomllib.loads(Path(path).read_text(encoding="utf-8"))
+    try:
+        training = raw["training"]
+
+        backbone_path = Path(training["backbone_path"])
+        windows_jsonl = Path(training["windows_jsonl"])
+        metadata_csv = Path(training["metadata_csv"])
+        output_dir = Path(training["output_dir"])
+
+        n_folds = int(training.get("n_folds", 5))
+        fold_index = int(training.get("fold_index", 0))
+        pooling_strategy = str(training.get("pooling_strategy", "cls"))
+        n_biomes = int(training.get("n_biomes", 5))
+        phase1_steps = int(training.get("phase1_steps", 1000))
+        phase2_steps = int(training.get("phase2_steps", 3000))
+        unfreeze_layers = int(training.get("unfreeze_layers", 2))
+        lr_heads_phase1 = float(training.get("lr_heads_phase1", 1e-4))
+        lr_backbone_phase2 = float(training.get("lr_backbone_phase2", 1e-5))
+        lr_heads_phase2 = float(training.get("lr_heads_phase2", 1e-4))
+        cls_loss_weight = float(training.get("cls_loss_weight", 1.0))
+        reg_loss_weight = float(training.get("reg_loss_weight", 0.1))
+        huber_delta = float(training.get("huber_delta", 1.0))
+        per_device_train_batch_size = int(training.get("per_device_train_batch_size", 16))
+        per_device_eval_batch_size = int(training.get("per_device_eval_batch_size", 32))
+        gradient_accumulation_steps = int(training.get("gradient_accumulation_steps", 4))
+        warmup_fraction = float(training.get("warmup_fraction", 0.1))
+        gradient_clip = float(training.get("gradient_clip", 1.0))
+        seed = int(training.get("seed", 42))
+        num_workers = int(training.get("num_workers", 0))
+        weight_decay = float(training.get("weight_decay", 0.01))
+        log_every = int(training.get("log_every", 10))
+        eval_every = int(training.get("eval_every", 100))
+        save_every = int(training.get("save_every", 500))
+        tensorboard_subdir = str(training.get("tensorboard_subdir", "tensorboard"))
+        dropout = float(training.get("dropout", 0.1))
+
+        # Loader contract enforcement
+        if pooling_strategy not in {"cls", "mean"}:
+            raise ValueError("training.pooling_strategy must be 'cls' or 'mean'")
+        if n_biomes != 5:
+            raise ValueError("training.n_biomes must be exactly 5 for the current contract")
+        if unfreeze_layers not in {2, 3}:
+            raise ValueError("training.unfreeze_layers must be 2 or 3")
+        if not 0 <= fold_index < n_folds:
+            raise ValueError("training.fold_index must satisfy 0 <= fold_index < n_folds")
+        if not 0.0 < warmup_fraction < 1.0:
+            raise ValueError("training.warmup_fraction must be in the open interval (0, 1)")
+        if cls_loss_weight <= 0:
+            raise ValueError("training.cls_loss_weight must be positive")
+        if reg_loss_weight <= 0:
+            raise ValueError("training.reg_loss_weight must be positive")
+        if huber_delta <= 0:
+            raise ValueError("training.huber_delta must be positive")
+        if phase1_steps <= 0 or phase2_steps <= 0:
+            raise ValueError("training.phase1_steps and training.phase2_steps must be positive")
+        if weight_decay < 0:
+            raise ValueError("training.weight_decay must be non-negative")
+        if gradient_clip < 0.0:
+            raise ValueError("training.gradient_clip must be non-negative")
+
+    except KeyError as exc:
+        msg = f"MTL fine-tune config is missing required field: {exc.args[0]}"
+        raise ValueError(msg) from exc
+
+    return MtlFinetuneConfig(
+        backbone_path=backbone_path,
+        windows_jsonl=windows_jsonl,
+        metadata_csv=metadata_csv,
+        output_dir=output_dir,
+        n_folds=n_folds,
+        fold_index=fold_index,
+        pooling_strategy=pooling_strategy,
+        n_biomes=n_biomes,
+        phase1_steps=phase1_steps,
+        phase2_steps=phase2_steps,
+        unfreeze_layers=unfreeze_layers,
+        lr_heads_phase1=lr_heads_phase1,
+        lr_backbone_phase2=lr_backbone_phase2,
+        lr_heads_phase2=lr_heads_phase2,
+        cls_loss_weight=cls_loss_weight,
+        reg_loss_weight=reg_loss_weight,
+        huber_delta=huber_delta,
+        per_device_train_batch_size=per_device_train_batch_size,
+        per_device_eval_batch_size=per_device_eval_batch_size,
+        gradient_accumulation_steps=gradient_accumulation_steps,
+        warmup_fraction=warmup_fraction,
+        gradient_clip=gradient_clip,
+        seed=seed,
+        num_workers=num_workers,
+        weight_decay=weight_decay,
+        log_every=log_every,
+        eval_every=eval_every,
+        save_every=save_every,
+        tensorboard_subdir=tensorboard_subdir,
+        dropout=dropout,
     )
