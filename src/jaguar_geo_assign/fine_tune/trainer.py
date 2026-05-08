@@ -946,16 +946,16 @@ def run_jaguar_mtl_training(config_path: str | Path) -> MTLTrainResult:
                                 extra={"step": global_step, "loss": mean_eval_loss},
                             )
 
-                            if global_step % config.save_every == 0 and accelerator.is_main_process:
-                                _save_json_atomically(
-                                    train_state_path,
-                                    {
-                                        "step": global_step,
-                                        "phase": 2,
-                                        "best_eval_haversine_km": best_eval_haversine_km,
-                                        "best_eval_macro_f1": best_eval_macro_f1,
-                                    },
-                                )
+                        if global_step % config.save_every == 0 and accelerator.is_main_process:
+                            _save_json_atomically(
+                                train_state_path,
+                                {
+                                    "step": global_step,
+                                    "phase": 2,
+                                    "best_eval_haversine_km": best_eval_haversine_km,
+                                    "best_eval_macro_f1": best_eval_macro_f1,
+                                },
+                            )
 
                 phase2_optimizer.zero_grad()
 
