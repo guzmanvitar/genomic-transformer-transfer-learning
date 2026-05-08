@@ -1,26 +1,15 @@
-"""Feline data acquisition helpers: BioProject discovery and download primitives.
+"""Download helpers for remote genomic assets.
 
-This module implements the discovery and acquisition stages for obtaining
-feline genomic data from NCBI:
-
-1. **Discovery** — :func:`fetch_bioproject_summary` queries the NCBI
-   Entrez E-utilities API to retrieve and validate BioProject metadata for
-   the approved 99 Lives Cat Genome Project.
-2. **Acquisition** — :func:`build_feline_acquisition_manifest` constructs a
-   typed download plan, and :func:`download_with_retry` executes idempotent,
-   resumable, checksum-verified file transfers with exponential back-off.
-
-Consensus-sequence construction (VCF → FASTA) lives in
-:mod:`jaguar_geo_assign.data.consensus`.
+The active code path retains only the resumable, checksum-aware transfer
+primitives used by felid-foundation assembly acquisition.
 """
 
 from __future__ import annotations
 
 import hashlib
-import json
 import logging
 import time
-from collections.abc import Callable, Mapping
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlparse
@@ -28,50 +17,9 @@ from urllib.request import OpenerDirector, Request, build_opener
 
 _LOGGER = logging.getLogger(__name__)
 
-DEFAULT_BIOPROJECT_ACCESSION = "PRJNA308208"
-DEFAULT_REFERENCE_URL = (
-    "https://ftp.ncbi.nlm.nih.gov/genomes/all/GCF/000/181/335/"
-    "GCF_000181335.3_Felis_catus_9.0/GCF_000181335.3_Felis_catus_9.0_genomic.fna.gz"
-)
-BIOPROJECT_SEARCH_URL = (
-    "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/"
-    "esearch.fcgi?db=bioproject&retmode=json&term={accession}"
-)
-BIOPROJECT_SUMMARY_URL = (
-    "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/"
-    "esummary.fcgi?db=bioproject&retmode=json&id={project_id}"
-)
-
 
 class AcquisitionError(RuntimeError):
-    """Base error for all feline data-acquisition failures.
-
-    Serves as the base class for both download/discovery errors raised in
-    this module and consensus-specific subclasses defined in
-    :mod:`jaguar_geo_assign.data.consensus` (reference mismatch, contig
-    mismatch, missing tool, malformed genotype), so callers can catch
-    broad acquisition failures at this level while still distinguishing
-    root causes when needed.
-    """
-
-
-@dataclass(frozen=True)
-class BioProjectSummary:
-    """Immutable snapshot of an NCBI BioProject retrieved via E-utilities.
-
-    Attributes:
-        identifier: NCBI BioProject accession (e.g. ``"PRJNA308208"``).
-        project_id: Numeric NCBI internal project identifier.
-        title: Human-readable project title returned by the API.
-        description: Extended project description (may be empty).
-        submitter: Submitting organisation name (may be empty).
-    """
-
-    identifier: str
-    project_id: str
-    title: str
-    description: str
-    submitter: str
+    """Base error for all download and transfer failures in this module."""
 
 
 @dataclass(frozen=True)
@@ -102,25 +50,6 @@ class DownloadAsset:
 
 
 @dataclass(frozen=True)
-class AcquisitionManifest:
-    """Complete typed download plan for a feline acquisition run.
-
-    Groups the validated BioProject metadata together with the reference
-    genome asset and all per-sample VCF assets into a single immutable
-    manifest that :func:`download_with_retry` can execute.
-
-    Attributes:
-        project: Validated BioProject summary from NCBI.
-        reference: Download descriptor for the reference genome FASTA.
-        sample_vcfs: Ordered tuple of per-sample VCF download descriptors.
-    """
-
-    project: BioProjectSummary
-    reference: DownloadAsset
-    sample_vcfs: tuple[DownloadAsset, ...]
-
-
-@dataclass(frozen=True)
 class DownloadResult:
     """Outcome of a single :func:`download_with_retry` invocation.
 
@@ -139,122 +68,6 @@ class DownloadResult:
     resumed: bool
     skipped_existing: bool
     bytes_written: int
-
-
-def fetch_bioproject_summary(
-    accession: str = DEFAULT_BIOPROJECT_ACCESSION,
-    opener: OpenerDirector | None = None,
-) -> BioProjectSummary:
-    """Query NCBI E-utilities for a BioProject and return a typed summary.
-
-    Performs two sequential HTTP requests: an ``esearch`` lookup to resolve
-    the accession to a numeric project ID, followed by an ``esummary`` call
-    to retrieve the project metadata.
-
-    Args:
-        accession: NCBI BioProject accession string (e.g.
-            ``"PRJNA308208"``).
-        opener: Optional :class:`~urllib.request.OpenerDirector` for
-            dependency injection in tests.  A default opener is built
-            when ``None``.
-
-    Returns:
-        A :class:`BioProjectSummary` populated from the NCBI response.
-
-    Raises:
-        AcquisitionError: If the accession does not resolve to exactly
-            one project.
-    """
-    opener = opener or build_opener()
-    search_payload = _load_json(opener, BIOPROJECT_SEARCH_URL.format(accession=accession))
-    id_list = search_payload["esearchresult"]["idlist"]
-    if len(id_list) != 1:
-        raise AcquisitionError(
-            f"Expected exactly one BioProject for {accession}, found {len(id_list)}"
-        )
-    project_id = id_list[0]
-    summary_payload = _load_json(opener, BIOPROJECT_SUMMARY_URL.format(project_id=project_id))
-    record = summary_payload["result"][project_id]
-    return BioProjectSummary(
-        identifier=record["project_acc"],
-        project_id=project_id,
-        title=record["project_title"],
-        description=record.get("project_description", ""),
-        submitter=record.get("submitter_organization", ""),
-    )
-
-
-def build_feline_acquisition_manifest(
-    output_dir: str | Path,
-    sample_vcf_urls: Mapping[str, str],
-    *,
-    sample_checksums: Mapping[str, str] | None = None,
-    reference_url: str = DEFAULT_REFERENCE_URL,
-    reference_checksum: str | None = None,
-    project_accession: str = DEFAULT_BIOPROJECT_ACCESSION,
-    opener: OpenerDirector | None = None,
-) -> AcquisitionManifest:
-    """Build a validated, typed download plan for feline genomic data.
-
-    Validates the BioProject accession against the NCBI API, confirms the
-    project title contains ``"99 Lives"``, and constructs
-    :class:`DownloadAsset` descriptors for the reference genome and every
-    per-sample VCF.  Sample VCFs are sorted by sample ID for deterministic
-    ordering.
-
-    Args:
-        output_dir: Root directory under which ``reference/`` and ``vcf/``
-            subdirectories will be created.
-        sample_vcf_urls: Mapping of sample ID → VCF download URL.  Must
-            contain at least one entry.
-        sample_checksums: Optional mapping of sample ID → expected hex
-            digest for integrity verification.
-        reference_url: URL of the reference genome FASTA (gzipped).
-        reference_checksum: Optional hex digest for the reference file.
-        project_accession: NCBI BioProject accession to validate.
-        opener: Optional :class:`~urllib.request.OpenerDirector` for
-            dependency injection.
-
-    Returns:
-        An :class:`AcquisitionManifest` ready for download execution.
-
-    Raises:
-        ValueError: If *sample_vcf_urls* is empty.
-        AcquisitionError: If the BioProject title does not match the
-            expected 99 Lives project.
-    """
-    if not sample_vcf_urls:
-        raise ValueError("sample_vcf_urls must contain at least one sample-specific VCF URL")
-    project = fetch_bioproject_summary(project_accession, opener=opener)
-    if "99 Lives" not in project.title:
-        raise AcquisitionError(
-            f"BioProject {project.identifier} does not look like the approved 99 Lives target: "
-            f"{project.title}"
-        )
-
-    output_root = Path(output_dir)
-    reference_name = Path(urlparse(reference_url).path).name
-    sample_checksums = sample_checksums or {}
-    sample_vcfs = tuple(
-        DownloadAsset(
-            url=url,
-            destination=output_root / "vcf" / _sample_destination_name(sample_id, url),
-            checksum=sample_checksums.get(sample_id),
-            sample_id=sample_id,
-            kind="vcf",
-        )
-        for sample_id, url in sorted(sample_vcf_urls.items())
-    )
-    return AcquisitionManifest(
-        project=project,
-        reference=DownloadAsset(
-            url=reference_url,
-            destination=output_root / "reference" / reference_name,
-            checksum=reference_checksum,
-            kind="reference",
-        ),
-        sample_vcfs=sample_vcfs,
-    )
 
 
 def download_with_retry(
@@ -484,20 +297,6 @@ def _checksum_matches(path: Path, checksum: str | None, checksum_name: str) -> b
     if checksum is None:
         return path.exists()
     return _get_digest(path, checksum_name) == checksum
-
-
-def _load_json(opener: OpenerDirector, url: str) -> dict[str, object]:
-    """Fetch a URL and parse the response body as JSON.
-
-    Args:
-        opener: HTTP opener to use for the request.
-        url: URL to fetch.
-
-    Returns:
-        Parsed JSON payload as a dict.
-    """
-    with opener.open(url, timeout=30.0) as response:
-        return json.loads(response.read().decode("utf-8"))
 
 
 def _sample_destination_name(sample_id: str, url: str) -> str:
