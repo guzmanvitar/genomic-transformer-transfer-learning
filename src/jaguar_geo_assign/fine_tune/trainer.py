@@ -828,7 +828,7 @@ def run_jaguar_mtl_training(config_path: str | Path) -> MTLTrainResult:
                                 },
                             )
 
-                phase1_optimizer.zero_grad()
+                    phase1_optimizer.zero_grad()
 
     # Phase 2
     inner_model = accelerator.unwrap_model(model)
@@ -957,7 +957,7 @@ def run_jaguar_mtl_training(config_path: str | Path) -> MTLTrainResult:
                                 },
                             )
 
-                phase2_optimizer.zero_grad()
+                    phase2_optimizer.zero_grad()
 
     accelerator.end_training()
 
