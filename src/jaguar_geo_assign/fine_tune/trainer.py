@@ -157,7 +157,7 @@ def compute_eval_metrics(
     """
 
     with torch.no_grad():
-        # ---------------------- classification metrics ----------------------
+        # classification metrics
         per_class_f1: list[float] = []
         if cls_logits.numel() == 0:
             acc = float("nan")
@@ -195,7 +195,7 @@ def compute_eval_metrics(
             else:
                 macro_f1 = float("nan")
 
-        # --------------------- coordinate metrics (degrees) -----------------
+        # coordinate metrics (degrees)
         if coord_pred.numel() == 0 or coord_target.numel() == 0:
             mae_lat = float("nan")
             mae_lon = float("nan")
@@ -686,7 +686,7 @@ def run_jaguar_mtl_training(config_path: str | Path) -> MTLTrainResult:
 
     accelerator.init_trackers("jaguar_mtl_training")
 
-    # ---------------------------- Phase 1 ---------------------------------
+    # Phase 1
     _freeze_backbone(model)
     phase1_optimizer, phase1_scheduler = _build_phase1_optimizer_and_scheduler(
         model,
@@ -830,7 +830,7 @@ def run_jaguar_mtl_training(config_path: str | Path) -> MTLTrainResult:
 
                 phase1_optimizer.zero_grad()
 
-    # ---------------------------- Phase 2 ---------------------------------
+    # Phase 2
     inner_model = accelerator.unwrap_model(model)
     before_trainable = sum(1 for p in inner_model.parameters() if p.requires_grad)
     _unfreeze_last_n_layers(inner_model, config.unfreeze_layers)
@@ -1039,7 +1039,7 @@ def integration_test(
         output_dir = tmp_path / "mtl_integration_out"
         output_dir.mkdir(parents=True, exist_ok=True)
 
-        # ----------------------- backbone + model ------------------------
+        # backbone + model
         if use_real_model:
             backbone = AutoModel.from_pretrained(
                 "zhihan1996/DNABERT-2-117M",
@@ -1103,7 +1103,7 @@ def integration_test(
             "coord_target": coord_target,
         }
 
-        # ---------------- Assertion 1 & 2: forward + optimiser -------------
+        # Assertion 1 & 2: forward + optimiser
         outputs = model(
             input_ids=batch["input_ids"],
             attention_mask=batch["attention_mask"],
@@ -1141,7 +1141,7 @@ def integration_test(
         ]
         assert any(diff > 0 for diff in l2_diffs), "Optimiser step did not change any parameters"
 
-        # ---------------- Assertion 3: evaluation + checkpoints ------------
+        # Assertion 3: evaluation + checkpoints
         eval_loader = [batch]
         config = MtlFinetuneConfig(
             backbone_path=output_dir / "<unused_backbone>",
@@ -1187,7 +1187,7 @@ def integration_test(
         assert "haversine_km_median" in metrics, "metrics.json missing haversine_km_median"
         assert "macro_f1" in metrics, "metrics.json missing macro_f1"
 
-        # ---------------- Assertion 4: coordinate-only eval path -----------
+        # Assertion 4: coordinate-only eval path
         coord_only_model = JaguarMTLModel(
             unwrapped_after.backbone,
             num_biomes=None,
