@@ -6,12 +6,16 @@ exercise than the synthetic end-to-end integration harness.
 
 from __future__ import annotations
 
+from contextlib import nullcontext
+from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
+from torch import nn
 
-from jaguar_geo_assign.fine_tune.trainer import _compute_mtl_loss
+from jaguar_geo_assign.fine_tune.trainer import _compute_mtl_loss, run_jaguar_mtl_training
 
 
 def test_compute_mtl_loss_uses_true_huber_delta_semantics() -> None:
@@ -44,3 +48,191 @@ def test_compute_mtl_loss_uses_true_huber_delta_semantics() -> None:
     assert cls_loss.item() == pytest.approx(0.0)
     assert reg_loss.item() == pytest.approx(expected_reg_loss.item())
     assert total_loss.item() == pytest.approx(reg_loss_weight * expected_reg_loss.item())
+
+
+class _FakeAccelerator:
+    """Minimal accelerator stub for unit-testing MTL loop control flow.
+
+    The test only needs to observe whether ``backward()`` is invoked for a
+    given loss tensor, so the stub keeps the API surface intentionally narrow.
+    """
+
+    def __init__(self) -> None:
+        """Initialize the stub with CPU defaults and call capture buffers."""
+        self.device = torch.device("cpu")
+        self.sync_gradients = True
+        self.is_main_process = False
+        self.backward_calls: list[torch.Tensor] = []
+        self.logged: list[tuple[dict[str, float], int | None]] = []
+
+    def init_trackers(self, *_args, **_kwargs) -> None:
+        """Match the production API without creating external side effects."""
+
+    def log(self, values: dict[str, float], step: int | None = None) -> None:
+        """Record logged scalars so the test can inspect NaN-step reporting."""
+        self.logged.append((values, step))
+
+    def prepare(self, *args):
+        """Return inputs unchanged because the test runs on a single CPU process."""
+        return args
+
+    def accumulate(self, _model: nn.Module):
+        """Provide a no-op accumulation context for the training loop."""
+        return nullcontext()
+
+    def backward(self, loss: torch.Tensor) -> None:
+        """Capture each backward call instead of building gradients."""
+        self.backward_calls.append(loss)
+
+    def clip_grad_norm_(self, _parameters, _max_norm: float) -> torch.Tensor:
+        """Return a finite norm so only the loss guard controls skipping."""
+        return torch.tensor(1.0)
+
+    def unwrap_model(self, model: nn.Module) -> nn.Module:
+        """Expose the underlying model unchanged in the single-process test."""
+        return model
+
+    def end_training(self) -> None:
+        """Match the production cleanup hook without doing any work."""
+
+
+class _FakeMTLModel(nn.Module):
+    """Tiny stand-in model with explicit frozen/unfrozen parameters.
+
+    Separate parameters make it easy for the test to emulate the phase-1 freeze
+    and phase-2 unfreeze contracts without constructing a full DNABERT stack.
+    """
+
+    def __init__(self) -> None:
+        """Create one initially-trainable parameter and one frozen parameter."""
+        super().__init__()
+        self.phase1_param = nn.Parameter(torch.tensor(1.0), requires_grad=True)
+        self.phase2_param = nn.Parameter(torch.tensor(2.0), requires_grad=False)
+
+    def forward(self, input_ids: torch.Tensor, attention_mask: torch.Tensor | None = None):
+        """Return placeholder outputs; loss computation is patched by the test."""
+        del attention_mask
+        batch_size = input_ids.shape[0]
+        return SimpleNamespace(coordinate=torch.zeros((batch_size, 2), dtype=torch.float32))
+
+
+def test_run_jaguar_mtl_training_skips_backward_on_non_finite_loss(tmp_path: Path) -> None:
+    """Injected NaN losses must not trigger ``accelerator.backward()``.
+
+    This regression test drives both training phases with one NaN micro-batch
+    followed by one finite micro-batch and asserts that backward executes only
+    for the finite losses. That guards the control-flow contract added to avoid
+    contaminating accumulated gradients with non-finite values.
+    """
+
+    config = SimpleNamespace(
+        output_dir=tmp_path / "out",
+        seed=0,
+        backbone_path=tmp_path / "backbone",
+        gradient_accumulation_steps=1,
+        tensorboard_subdir="tb",
+        n_biomes=2,
+        dropout=0.1,
+        lr_heads_phase1=1e-3,
+        weight_decay=0.0,
+        warmup_fraction=0.0,
+        phase1_steps=1,
+        cls_loss_weight=1.0,
+        reg_loss_weight=1.0,
+        huber_delta=1.0,
+        gradient_clip=1.0,
+        log_every=1,
+        eval_every=1,
+        save_every=100,
+        unfreeze_layers=1,
+        lr_backbone_phase2=1e-4,
+        lr_heads_phase2=1e-3,
+        phase2_steps=1,
+        fold_index=0,
+    )
+    train_loader = [
+        {
+            "input_ids": torch.ones((1, 4), dtype=torch.long),
+            "attention_mask": torch.ones((1, 4), dtype=torch.long),
+            "coord_target": torch.zeros((1, 2), dtype=torch.float32),
+            "biome_label": torch.zeros(1, dtype=torch.long),
+        },
+        {
+            "input_ids": torch.ones((1, 4), dtype=torch.long),
+            "attention_mask": torch.ones((1, 4), dtype=torch.long),
+            "coord_target": torch.zeros((1, 2), dtype=torch.float32),
+            "biome_label": torch.zeros(1, dtype=torch.long),
+        },
+    ]
+    coord_stats = SimpleNamespace(lat_mean=0.0, lat_std=1.0, lon_mean=0.0, lon_std=1.0)
+    fake_model = _FakeMTLModel()
+    fake_accelerator = _FakeAccelerator()
+    phase1_optimizer = MagicMock()
+    phase1_scheduler = MagicMock()
+    phase1_scheduler.get_last_lr.return_value = [1e-3]
+    phase2_optimizer = MagicMock()
+    phase2_scheduler = MagicMock()
+    phase2_scheduler.get_last_lr.return_value = [1e-4, 1e-3]
+
+    def _freeze_fake_backbone(model: _FakeMTLModel) -> None:
+        """Emulate phase-1 freezing by disabling all fake parameters."""
+        model.phase1_param.requires_grad = False
+        model.phase2_param.requires_grad = False
+
+    def _unfreeze_fake_backbone(model: _FakeMTLModel, _n_layers: int) -> None:
+        """Emulate phase-2 unfreezing by re-enabling one fake parameter."""
+        model.phase2_param.requires_grad = True
+
+    loss_sequence = [
+        (torch.tensor(float("nan")), torch.tensor(0.0), torch.tensor(0.0)),
+        (torch.tensor(1.0), torch.tensor(0.25), torch.tensor(0.75)),
+        (torch.tensor(float("nan")), torch.tensor(0.0), torch.tensor(0.0)),
+        (torch.tensor(2.0), torch.tensor(0.5), torch.tensor(1.5)),
+    ]
+
+    with (
+        patch("jaguar_geo_assign.fine_tune.trainer.load_mtl_finetune_config", return_value=config),
+        patch(
+            "jaguar_geo_assign.fine_tune.trainer.AutoModel.from_pretrained", return_value=object()
+        ),
+        patch("jaguar_geo_assign.fine_tune.trainer._load_tokenizer", return_value=object()),
+        patch(
+            "jaguar_geo_assign.fine_tune.trainer.build_fold_dataloaders",
+            return_value=(train_loader, None, coord_stats),
+        ),
+        patch("jaguar_geo_assign.fine_tune.trainer.Accelerator", return_value=fake_accelerator),
+        patch("jaguar_geo_assign.fine_tune.trainer.JaguarMTLModel", return_value=fake_model),
+        patch(
+            "jaguar_geo_assign.fine_tune.trainer._compute_baselines",
+            return_value={"macro_f1": 0.0, "haversine_km_median": 0.0, "haversine_km_mean": 0.0},
+        ),
+        patch(
+            "jaguar_geo_assign.fine_tune.trainer._build_phase1_optimizer_and_scheduler",
+            return_value=(phase1_optimizer, phase1_scheduler),
+        ),
+        patch(
+            "jaguar_geo_assign.fine_tune.trainer._build_phase2_optimizer_and_scheduler",
+            return_value=(phase2_optimizer, phase2_scheduler),
+        ),
+        patch(
+            "jaguar_geo_assign.fine_tune.trainer._freeze_backbone",
+            side_effect=_freeze_fake_backbone,
+        ),
+        patch(
+            "jaguar_geo_assign.fine_tune.trainer._unfreeze_last_n_layers",
+            side_effect=_unfreeze_fake_backbone,
+        ),
+        patch("jaguar_geo_assign.fine_tune.trainer._compute_mtl_loss", side_effect=loss_sequence),
+    ):
+        result = run_jaguar_mtl_training(tmp_path / "config.toml")
+
+    assert result.phase1_steps_completed == 1
+    assert result.phase2_steps_completed == 1
+    assert len(fake_accelerator.backward_calls) == 2
+    assert [float(loss.item()) for loss in fake_accelerator.backward_calls] == [1.0, 2.0]
+
+    train_logs = [
+        values for values, _step in fake_accelerator.logged if "train/nan_steps" in values
+    ]
+    assert len(train_logs) == 2
+    assert [logs["train/nan_steps"] for logs in train_logs] == [1.0, 1.0]

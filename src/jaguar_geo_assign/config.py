@@ -909,9 +909,10 @@ def load_foundation_training_config(path: str | Path) -> FoundationTrainingConfi
 
     Enforces that required fields (corpus_metadata_path, model_identifier,
     model_revision, max_steps) are present and valid, and that optional
-    hyperparameters fall within sensible ranges. The model_identifier is
-    pinned to zhihan1996/DNABERT-2-117M by contract; other fields are
-    lightly validated (e.g., learning_rate > 0, batch sizes > 0).
+    hyperparameters fall within sensible ranges. The model_identifier and
+    model_revision are pinned by contract so warm-starts remain reproducible;
+    other fields are lightly validated (e.g., learning_rate > 0, batch sizes
+    > 0).
 
     Args:
         path: Filesystem path to a TOML training config file.
@@ -959,6 +960,10 @@ def load_foundation_training_config(path: str | Path) -> FoundationTrainingConfi
         if model_identifier != "zhihan1996/DNABERT-2-117M":
             raise ValueError(
                 "training.model_identifier must be pinned to zhihan1996/DNABERT-2-117M"
+            )
+        if model_revision != DNABERT2_TOKENIZER_REVISION:
+            raise ValueError(
+                f"training.model_revision must be pinned to {DNABERT2_TOKENIZER_REVISION}"
             )
         if max_steps <= 0:
             raise ValueError("training.max_steps must be positive")

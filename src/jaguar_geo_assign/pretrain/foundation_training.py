@@ -686,9 +686,11 @@ def run_felid_foundation_training(
 
                     # NaN/Inf guard: skip accumulation and count as anomaly
                     loss_f = loss.detach().float()
-                    if torch.isnan(loss_f).any() or torch.isinf(loss_f).any():
+                    if not torch.isfinite(loss_f).all():
                         train_metric.nan_count += 1
                         logger.warning(f"NaN/Inf loss detected at step {step}")
+                        optimizer.zero_grad()
+                        continue
                     else:
                         train_metric.loss_sum += loss_f.mean().item()
                         train_metric.step_count += 1
@@ -709,7 +711,6 @@ def run_felid_foundation_training(
                                     ((preds == labels) & mask).sum().item()
                                 )
                                 train_metric.token_masked += mask.sum().item()
-
                     # Backward pass
                     accelerator.backward(loss)
 

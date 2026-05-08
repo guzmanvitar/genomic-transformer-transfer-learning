@@ -312,6 +312,20 @@ def test_extract_locus_windows_uses_provided_contig_sequences_directly(tmp_path:
     assert windows[0].sequence[UPSTREAM_BASES] == "T"
 
 
+def test_extract_locus_windows_rejects_invalid_in_memory_reference_alphabet(tmp_path: Path):
+    """The in-memory reference path must enforce the same alphabet contract as FASTA loading."""
+    vcf_text = _build_vcf(["chr1\t300\t.\tA\tT\t.\tPASS\t.\tGT\t1/1"])
+    _, vcf = _write_fixture(tmp_path, vcf_text)
+    contig_sequences = {"chr1": f"{'A' * 100}R{'A' * (_CONTIG_LENGTH - 101)}"}
+    with pytest.raises(InvalidAlleleAlphabetError, match="invalid characters.*R"):
+        extract_locus_windows_from_vcf(
+            sample_id="cat_1",
+            sample_vcf=vcf,
+            contig_sequences=contig_sequences,
+            positive_reference_tokens=_TEST_BUILD_TOKENS,
+        )
+
+
 def test_output_jsonl_round_trips_window_records(tmp_path: Path):
     """JSONL output must serialize every dataclass field so the training loader can reconstruct
     windows."""

@@ -11,8 +11,10 @@ Tests cover:
 import json
 import math
 import os
+from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock, Mock, PropertyMock, patch
 
 import pytest
@@ -445,6 +447,163 @@ def test_metric_accumulator_nan_handling() -> None:
     assert accum.nan_count == 0
     assert accum.step_count == 0
     assert accum.loss_sum == 0.0
+
+
+def test_nan_loss_skips_backward_pass_in_training_loop(tmp_path: Path) -> None:
+    """A non-finite train loss must skip ``accelerator.backward()`` entirely.
+
+    This unit test patches config/model setup so it can inject one NaN micro-batch
+    followed by one finite micro-batch and assert the training loop only calls
+    ``backward()`` for the finite loss. That prevents NaN gradients from entering
+    the accumulated optimizer state.
+    """
+
+    class _FakeAccelerator:
+        """Small accelerator stub for verifying train-loop control flow."""
+
+        def __init__(self) -> None:
+            """Initialize a CPU-only stub with call recording."""
+            self.device = torch.device("cpu")
+            self.sync_gradients = True
+            self.is_main_process = False
+            self.num_processes = 1
+            self.backward_calls: list[torch.Tensor] = []
+            self.logged: list[tuple[dict[str, float], int | None]] = []
+
+        def wait_for_everyone(self) -> None:
+            """Mirror the barrier API without synchronizing real processes."""
+
+        def prepare(self, *args):
+            """Return objects unchanged for the single-process test."""
+            return args
+
+        def accumulate(self, _model: torch.nn.Module):
+            """Provide a no-op accumulation context manager."""
+            return nullcontext()
+
+        def init_trackers(self, *_args, **_kwargs) -> None:
+            """Match the production API without creating trackers."""
+
+        def backward(self, loss: torch.Tensor) -> None:
+            """Record every backward call for later assertions."""
+            self.backward_calls.append(loss)
+
+        def clip_grad_norm_(self, _parameters, _max_norm: float) -> torch.Tensor:
+            """Return a finite norm so only the loss guard triggers skipping."""
+            return torch.tensor(1.0)
+
+        def reduce(self, values: torch.Tensor, reduction: str = "sum") -> torch.Tensor:
+            """Behave like an identity reduction in the single-process test."""
+            del reduction
+            return values
+
+        def log(self, values: dict[str, float], step: int | None = None) -> None:
+            """Capture logged scalars so the test can inspect NaN-step counts."""
+            self.logged.append((values, step))
+
+        def end_training(self) -> None:
+            """Match the production cleanup hook without side effects."""
+
+    class _FakeFoundationModel(torch.nn.Module):
+        """Tiny trainable model that emits one NaN loss and then one finite loss."""
+
+        def __init__(self) -> None:
+            """Create one trainable parameter and a deterministic call counter."""
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.tensor(1.0))
+            self._call_count = 0
+
+        def forward(self, **_batch):
+            """Return a NaN loss once, then a finite loss with valid logits."""
+            self._call_count += 1
+            if self._call_count == 1:
+                return SimpleNamespace(
+                    loss=torch.tensor(float("nan")),
+                    logits=torch.full((1, 2, 2), float("nan")),
+                )
+            return SimpleNamespace(
+                loss=torch.tensor(1.25),
+                logits=torch.tensor([[[0.1, 0.9], [0.9, 0.1]]], dtype=torch.float32),
+            )
+
+    class _StaticLoader:
+        """Minimal iterable loader with a dataset attribute for the trainer."""
+
+        def __init__(self) -> None:
+            """Initialize two fixed CPU batches and record_count metadata."""
+            self.dataset = SimpleNamespace(record_count=2)
+            self._batches = [
+                {
+                    "input_ids": torch.tensor([[101, 102]], dtype=torch.long),
+                    "attention_mask": torch.tensor([[1, 1]], dtype=torch.long),
+                    "labels": torch.tensor([[1, 0]], dtype=torch.long),
+                },
+                {
+                    "input_ids": torch.tensor([[101, 102]], dtype=torch.long),
+                    "attention_mask": torch.tensor([[1, 1]], dtype=torch.long),
+                    "labels": torch.tensor([[1, 0]], dtype=torch.long),
+                },
+            ]
+
+        def __iter__(self):
+            """Yield the two fixed batches on every fresh iteration."""
+            yield from self._batches
+
+    config = SimpleNamespace(
+        output_dir=tmp_path / "out",
+        learning_rate=1e-4,
+        weight_decay=0.0,
+        warmup_steps=0,
+        max_steps=1,
+        gradient_accumulation_steps=1,
+        tensorboard_subdir="tb",
+        log_every=1,
+        eval_every=1,
+        eval_max_steps=None,
+        save_every=100,
+        gradient_clip=1.0,
+        per_device_eval_batch_size=1,
+    )
+    fake_accelerator = _FakeAccelerator()
+    fake_model = _FakeFoundationModel()
+    optimizer = MagicMock()
+    scheduler = MagicMock()
+    scheduler.get_last_lr.return_value = [1e-4]
+
+    with (
+        patch("jaguar_geo_assign.config.load_foundation_training_config", return_value=config),
+        patch(
+            "jaguar_geo_assign.pretrain.foundation_training._build_model_and_tokenizer",
+            return_value=(fake_model, FakeTokenizer(), "none", False),
+        ),
+        patch(
+            "jaguar_geo_assign.pretrain.foundation_training._build_optimizer",
+            return_value=optimizer,
+        ),
+        patch(
+            "jaguar_geo_assign.pretrain.foundation_training._build_scheduler",
+            return_value=scheduler,
+        ),
+        patch(
+            "jaguar_geo_assign.pretrain.foundation_training._build_dataloaders",
+            return_value=(_StaticLoader(), None),
+        ),
+        patch(
+            "jaguar_geo_assign.pretrain.foundation_training.Accelerator",
+            return_value=fake_accelerator,
+        ),
+    ):
+        result = run_felid_foundation_training(tmp_path / "config.toml")
+
+    assert result.final_step == 1
+    assert len(fake_accelerator.backward_calls) == 1
+    assert float(fake_accelerator.backward_calls[0].item()) == pytest.approx(1.25)
+
+    train_logs = [
+        values for values, _step in fake_accelerator.logged if "train/nan_steps" in values
+    ]
+    assert len(train_logs) == 1
+    assert train_logs[0]["train/nan_steps"] == 1
 
 
 def test_integration_test_default_smoke() -> None:

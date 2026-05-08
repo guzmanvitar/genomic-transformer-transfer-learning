@@ -16,9 +16,13 @@ from jaguar_geo_assign.config import (
     _validate_felid_species_entries,
     load_experiment_config,
     load_felid_foundation_pipeline_config,
+    load_foundation_training_config,
 )
 from jaguar_geo_assign.data.contracts import JAGUAR_METADATA_FIELDS
-from jaguar_geo_assign.data.pipeline_contract import DNABERT2_TRUST_REMOTE_CODE
+from jaguar_geo_assign.data.pipeline_contract import (
+    DNABERT2_TOKENIZER_REVISION,
+    DNABERT2_TRUST_REMOTE_CODE,
+)
 
 
 def test_load_experiment_config_preserves_metadata_contract() -> None:
@@ -50,7 +54,9 @@ def test_load_experiment_config_rejects_extra_metadata_fields(tmp_path: Path) ->
 
 def test_load_felid_foundation_pipeline_config_preserves_contracts() -> None:
     """The active felid foundation config should round-trip its pinned tokenizer and roster."""
-    config = load_felid_foundation_pipeline_config("configs/examples/felid_foundation_pretrain.toml")
+    config = load_felid_foundation_pipeline_config(
+        "configs/examples/felid_foundation_pretrain.toml"
+    )
 
     assert config.name == "felid_foundation_pretrain_contract"
     assert len(config.species) == 6
@@ -116,6 +122,29 @@ def test_load_felid_foundation_pipeline_config_accepts_real_booleans(
 
     config = load_felid_foundation_pipeline_config(rebuilt)
     assert config.windowing.drop_short_sequences is (bool_literal == "true")
+
+
+def test_load_foundation_training_config_rejects_unpinned_model_revision(
+    tmp_path: Path,
+) -> None:
+    """Foundation training configs must pin the warm-start revision to the approved hash."""
+    config_path = tmp_path / "invalid_foundation_training.toml"
+    config_path.write_text(
+        (
+            "[training]\n"
+            'corpus_metadata_path = "/tmp/corpus/metadata.json"\n'
+            'model_identifier = "zhihan1996/DNABERT-2-117M"\n'
+            'model_revision = "main"\n'
+            "max_steps = 100\n"
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(
+        ValueError,
+        match=rf"training\.model_revision must be pinned to {DNABERT2_TOKENIZER_REVISION}",
+    ):
+        load_foundation_training_config(config_path)
 
 
 def test_validate_felid_species_entries_rejects_legacy_accession_key() -> None:

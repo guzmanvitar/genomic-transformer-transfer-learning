@@ -840,6 +840,8 @@ def run_jaguar_mtl_training(config_path: str | Path) -> MTLTrainResult:
 
                 if not torch.isfinite(loss_detached).all():
                     nan_steps += 1
+                    phase1_optimizer.zero_grad()
+                    continue
 
                 accelerator.backward(total_loss)
 
@@ -971,6 +973,8 @@ def run_jaguar_mtl_training(config_path: str | Path) -> MTLTrainResult:
 
                 if not torch.isfinite(loss_detached).all():
                     nan_steps += 1
+                    phase2_optimizer.zero_grad()
+                    continue
 
                 accelerator.backward(total_loss)
 
