@@ -432,7 +432,10 @@ def _compute_mtl_loss(
         coord_pred_reg = coord_pred
         coord_target_reg = coord_target.to(device=coord_pred.device, dtype=coord_pred.dtype)
 
-    reg_loss_fn = nn.SmoothL1Loss(beta=huber_delta)
+    # Use the true Huber loss so ``huber_delta`` matches the configuration
+    # contract and PyTorch's ``delta`` semantics rather than SmoothL1's scaled
+    # variant for non-unit thresholds.
+    reg_loss_fn = nn.HuberLoss(delta=huber_delta)
     reg_loss = reg_loss_fn(coord_pred_reg, coord_target_reg)
 
     cls_logits = getattr(outputs, "biome_logits", None)
