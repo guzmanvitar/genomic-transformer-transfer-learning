@@ -857,6 +857,8 @@ def run_jaguar_mtl_training(config_path: str | Path) -> MTLTrainResult:
     model.train()
     train_loss_sum = train_cls_loss_sum = train_reg_loss_sum = 0.0
     train_loss_count = 0
+    nan_steps = 0
+    skipped_steps = 0
 
     while phase2_steps_completed < config.phase2_steps:
         for batch in train_loader:
