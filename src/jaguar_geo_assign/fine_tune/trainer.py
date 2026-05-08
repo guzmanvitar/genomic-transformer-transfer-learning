@@ -472,6 +472,80 @@ def _compute_grad_norm(model: nn.Module, norm_type: float = 2.0) -> Tensor:
     return grad_norms.norm(norm_type)
 
 
+def _collect_baseline_targets(source: Any) -> tuple[Tensor, Tensor]:
+    """Collect biome labels and normalized coordinates from a dataset or loader.
+
+    Baseline metrics should reflect the true split contents rather than the
+    stochastic behaviour of the training sampler. When a map-style dataset is
+    available, this helper iterates the dataset directly; otherwise it falls
+    back to consuming the provided iterable of already-collated batches.
+    """
+
+    biome_parts: list[Tensor] = []
+    coord_parts: list[Tensor] = []
+
+    dataset = getattr(source, "dataset", None)
+    if dataset is not None and hasattr(dataset, "__len__") and hasattr(dataset, "__getitem__"):
+        for index in range(len(dataset)):
+            sample = dataset[index]
+            biome_parts.append(torch.as_tensor(sample["biome_label"], dtype=torch.long).reshape(1))
+            coord_parts.append(
+                torch.as_tensor(sample["coord_target"], dtype=torch.float32).reshape(1, 2)
+            )
+    else:
+        for batch in source:
+            biome = torch.as_tensor(batch["biome_label"], dtype=torch.long)
+            coord = torch.as_tensor(batch["coord_target"], dtype=torch.float32)
+            biome_parts.append(biome.reshape(-1).to("cpu"))
+            coord_parts.append(coord.reshape(-1, 2).to("cpu"))
+
+    if not biome_parts or not coord_parts:
+        raise ValueError("Cannot compute baselines from an empty split")
+
+    return torch.cat(biome_parts, dim=0), torch.cat(coord_parts, dim=0)
+
+
+def _compute_baselines(
+    *,
+    train_loader: Any,
+    eval_loader: Any,
+    coord_stats: CoordStats,
+    n_biomes: int,
+) -> dict[str, float]:
+    """Compute simple train-derived baselines on the evaluation split.
+
+    The biome baseline predicts the majority class observed in the training
+    split. The coordinate baseline predicts the training-split mean coordinate,
+    which is the zero vector in normalized space because :class:`CoordStats`
+    stores the mean used to z-score latitude and longitude. Reusing that zero
+    vector avoids reintroducing window-count bias when the training sampler is
+    deliberately balanced by individual.
+    """
+
+    if n_biomes <= 0:
+        raise ValueError("n_biomes must be positive when computing baselines")
+
+    train_biome, _ = _collect_baseline_targets(train_loader)
+    eval_biome, eval_coord = _collect_baseline_targets(eval_loader)
+
+    majority_counts = torch.bincount(train_biome.to(dtype=torch.long), minlength=n_biomes)
+    majority_class = int(majority_counts.argmax().item())
+
+    baseline_logits = torch.zeros((eval_biome.shape[0], n_biomes), dtype=torch.float32)
+    baseline_logits[:, majority_class] = 1.0
+
+    baseline_coord = torch.zeros_like(eval_coord, dtype=torch.float32)
+
+    return compute_eval_metrics(
+        baseline_logits,
+        baseline_coord,
+        eval_biome,
+        eval_coord,
+        coord_stats,
+        n_biomes=n_biomes,
+    )
+
+
 def _run_evaluation(
     *,
     model: nn.Module,
@@ -688,6 +762,20 @@ def run_jaguar_mtl_training(config_path: str | Path) -> MTLTrainResult:
     )
 
     accelerator.init_trackers("jaguar_mtl_training")
+    baseline_metrics = _compute_baselines(
+        train_loader=train_loader,
+        eval_loader=eval_loader,
+        coord_stats=coord_stats,
+        n_biomes=config.n_biomes,
+    )
+    accelerator.log(
+        {
+            "baseline/macro_f1": baseline_metrics["macro_f1"],
+            "baseline/haversine_km_median": baseline_metrics["haversine_km_median"],
+            "baseline/haversine_km_mean": baseline_metrics["haversine_km_mean"],
+        },
+        step=0,
+    )
 
     # Phase 1
     _freeze_backbone(model)
@@ -1004,6 +1092,9 @@ def integration_test(
        ``use_real_model=True`` the real DNABERT-2 backbone from the
        Hugging Face Hub is exercised instead. The default CPU-only path
        avoids any network calls or large models.
+    9. The baseline helper computes finite majority-class and mean-coordinate
+       metrics on the synthetic split so startup TensorBoard logging cannot
+       fail before optimisation begins.
 
     Args:
         n_individuals: Number of synthetic individuals **per biome**.
@@ -1238,6 +1329,23 @@ def integration_test(
         )
         # macro_f1 is expected to be NaN in coordinate-only mode; we
         # intentionally do not assert on its value here.
+
+        # Assertion 9: baseline metrics compute without error.
+        baseline_metrics = _compute_baselines(
+            train_loader=[batch],
+            eval_loader=[batch],
+            coord_stats=coord_stats,
+            n_biomes=n_biomes,
+        )
+        assert math.isfinite(baseline_metrics["macro_f1"]), (
+            "Baseline macro_f1 should be finite in integration test"
+        )
+        assert math.isfinite(baseline_metrics["haversine_km_mean"]), (
+            "Baseline mean haversine should be finite in integration test"
+        )
+        assert math.isfinite(baseline_metrics["haversine_km_median"]), (
+            "Baseline median haversine should be finite in integration test"
+        )
 
 
 __all__ = [
