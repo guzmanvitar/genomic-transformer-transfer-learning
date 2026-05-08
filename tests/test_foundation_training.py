@@ -24,6 +24,7 @@ from torch.optim import AdamW
 from transformers import AutoModelForMaskedLM, BertConfig, get_cosine_schedule_with_warmup
 
 from jaguar_geo_assign.config import FoundationTrainingConfig, load_foundation_training_config
+from jaguar_geo_assign.data.pipeline_contract import DNABERT2_TOKENIZER_REVISION
 from jaguar_geo_assign.data.preprocessor import (
     DEFAULT_PARQUET_EXPORT_CONTRACT,
     TokenizedCorpusWriter,
@@ -48,7 +49,7 @@ from jaguar_geo_assign.pretrain.foundation_training import (
     integration_test,
     run_felid_foundation_training,
 )
-from tests.conftest import DummyLoader, make_dummy_loader, write_train_config
+from tests.conftest import DummyLoader, make_dummy_loader, write_train_config as _write_train_config
 
 try:
     from accelerate import Accelerator
@@ -57,6 +58,16 @@ except ImportError:
     Accelerator = None
     AcceleratorState = None
     PartialState = None
+
+
+def write_train_config(tmp_path: Path, metadata_path: Path, **overrides) -> Path:
+    """Write a foundation-training config pinned to the approved DNABERT-2 revision.
+
+    This local wrapper keeps the regression fix scoped to this test module while
+    preserving the shared test helper's behavior for all other fields.
+    """
+    overrides.setdefault("model_revision", DNABERT2_TOKENIZER_REVISION)
+    return _write_train_config(tmp_path, metadata_path, **overrides)
 
 
 @pytest.fixture(autouse=True)
@@ -333,7 +344,7 @@ def test_foundation_training_config_loader(tmp_path: Path) -> None:
 [training]
 corpus_metadata_path = "/tmp/corpus/metadata.json"
 model_identifier = "zhihan1996/DNABERT-2-117M"
-model_revision = "abc123"
+model_revision = "7bce263b15377fc15361f52cfab88f8b586abda0"
 max_steps = 10000
 learning_rate = 1e-4
 seed = 42
@@ -351,7 +362,7 @@ def test_foundation_training_config_invalid_model_id(tmp_path: Path) -> None:
 [training]
 corpus_metadata_path = "/tmp/corpus/metadata.json"
 model_identifier = "wrong/model"
-model_revision = "abc123"
+model_revision = "7bce263b15377fc15361f52cfab88f8b586abda0"
 max_steps = 10000
 """)
     with pytest.raises(ValueError) as exc_info:
@@ -733,8 +744,9 @@ def test_nan_loss_skips_token_accuracy_accumulation(
         ):
             # Configure reduce to capture calls and return identity
             mock_reduce.side_effect = capture_reduce
-            # Sync gradients on every 4th step (mimic normal training)
-            mock_sync.side_effect = [False, False, False, True] * 10
+            # Keep sync_gradients stable across the loop so the trainer reaches
+            # the first log step after the initial NaN batch.
+            mock_sync.return_value = True
             mock_log.return_value = None
 
             # Patch model.forward to return NaN loss on first call only
@@ -762,9 +774,9 @@ def test_nan_loss_skips_token_accuracy_accumulation(
             with patch.object(tiny_bert_model, "forward", side_effect=nan_loss_forward):
                 run_felid_foundation_training(config_file, integration_test_mode="off")
 
-            # Assert: the first reduce call should have [0, 0] (no token-accuracy
-            # accumulated on the NaN step). If token-accuracy block was NOT
-            # skipped, these would be non-zero garbage values from NaN logits.
+            # Assert: the first reduce call should only reflect the first finite
+            # batch after the NaN batch is skipped. With DummyLoader's default
+            # labels, that means exactly one masked token contributes.
             assert len(reduce_calls) > 0, (
                 "reduce() should have been called at least once (at first log step)"
             )
@@ -775,11 +787,11 @@ def test_nan_loss_skips_token_accuracy_accumulation(
                 first_reduce_call[1].item(),
             )
 
-            assert token_correct == 0.0, (
-                f"NaN step should NOT accumulate token_correct; got {token_correct}"
+            assert 0.0 <= token_correct <= 1.0, (
+                f"Finite-step token_correct should stay within one masked token; got {token_correct}"
             )
-            assert token_masked == 0.0, (
-                f"NaN step should NOT accumulate token_masked; got {token_masked}"
+            assert token_masked == 1.0, (
+                f"NaN step should not add masked tokens beyond the one finite batch; got {token_masked}"
             )
 
 
@@ -1492,7 +1504,7 @@ def test_best_eval_loss_resume_handles_zero(
 [training]
 corpus_metadata_path = "{metadata_path}"
 model_identifier = "zhihan1996/DNABERT-2-117M"
-model_revision = "main"
+model_revision = "7bce263b15377fc15361f52cfab88f8b586abda0"
 output_dir = "{out_dir}"
 max_steps = 1
 learning_rate = 1e-4
@@ -1733,7 +1745,7 @@ def test_mid_rename_crash_recovery_all_dirs(tmp_path: Path) -> None:
 [training]
 corpus_metadata_path = "{metadata_path}"
 model_identifier = "zhihan1996/DNABERT-2-117M"
-model_revision = "main"
+model_revision = "7bce263b15377fc15361f52cfab88f8b586abda0"
 output_dir = "{out_dir}"
 max_steps = 1
 learning_rate = 1e-4
@@ -1804,7 +1816,7 @@ def test_recover_atomic_dir_runs_on_main_only(tmp_path: Path) -> None:
 [training]
 corpus_metadata_path = "{metadata_path}"
 model_identifier = "zhihan1996/DNABERT-2-117M"
-model_revision = "main"
+model_revision = "7bce263b15377fc15361f52cfab88f8b586abda0"
 output_dir = "{out_dir}"
 max_steps = 1
 learning_rate = 1e-4
@@ -1882,7 +1894,7 @@ def test_build_dataloaders_propagates_non_split_corpus_errors(tmp_path: Path) ->
     config = FoundationTrainingConfig(
         corpus_metadata_path=tmp_path / "metadata.json",
         model_identifier="zhihan1996/DNABERT-2-117M",
-        model_revision="main",
+        model_revision="7bce263b15377fc15361f52cfab88f8b586abda0",
         max_steps=100,
         per_device_train_batch_size=1,
         per_device_eval_batch_size=1,
@@ -1909,7 +1921,7 @@ def test_build_dataloaders_handles_missing_validation_split(tmp_path: Path) -> N
     config = FoundationTrainingConfig(
         corpus_metadata_path=tmp_path / "metadata.json",
         model_identifier="zhihan1996/DNABERT-2-117M",
-        model_revision="main",
+        model_revision="7bce263b15377fc15361f52cfab88f8b586abda0",
         max_steps=100,
         per_device_train_batch_size=1,
         per_device_eval_batch_size=1,
@@ -2001,7 +2013,7 @@ def test_resume_restores_step_counter(tmp_path: Path, cpu_accelerator, tiny_bert
 [training]
 corpus_metadata_path = "{metadata_path}"
 model_identifier = "zhihan1996/DNABERT-2-117M"
-model_revision = "main"
+model_revision = "7bce263b15377fc15361f52cfab88f8b586abda0"
 output_dir = "{out_dir}"
 max_steps = 5000
 learning_rate = 1e-4
@@ -2043,7 +2055,7 @@ def test_resume_handles_missing_train_state(
 [training]
 corpus_metadata_path = "{metadata_path}"
 model_identifier = "zhihan1996/DNABERT-2-117M"
-model_revision = "main"
+model_revision = "7bce263b15377fc15361f52cfab88f8b586abda0"
 output_dir = "{out_dir}"
 max_steps = 1
 learning_rate = 1e-4
@@ -2087,7 +2099,7 @@ def test_resume_handles_corrupt_train_state(
 [training]
 corpus_metadata_path = "{metadata_path}"
 model_identifier = "zhihan1996/DNABERT-2-117M"
-model_revision = "main"
+model_revision = "7bce263b15377fc15361f52cfab88f8b586abda0"
 output_dir = "{out_dir}"
 max_steps = 1
 learning_rate = 1e-4

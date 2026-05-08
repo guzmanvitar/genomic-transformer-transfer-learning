@@ -121,8 +121,10 @@ def test_run_jaguar_mtl_training_skips_backward_on_non_finite_loss(tmp_path: Pat
 
     This regression test drives both training phases with one NaN micro-batch
     followed by one finite micro-batch and asserts that backward executes only
-    for the finite losses. That guards the control-flow contract added to avoid
-    contaminating accumulated gradients with non-finite values.
+    for the finite losses. It also verifies each phase clears gradients once for
+    the skipped NaN micro-batch and once after the successful optimizer update.
+    That guards the control-flow contract added to avoid contaminating
+    accumulated gradients with non-finite values.
     """
 
     config = SimpleNamespace(
@@ -230,6 +232,10 @@ def test_run_jaguar_mtl_training_skips_backward_on_non_finite_loss(tmp_path: Pat
     assert result.phase2_steps_completed == 1
     assert len(fake_accelerator.backward_calls) == 2
     assert [float(loss.item()) for loss in fake_accelerator.backward_calls] == [1.0, 2.0]
+    assert phase1_optimizer.step.call_count == 1
+    assert phase2_optimizer.step.call_count == 1
+    assert phase1_optimizer.zero_grad.call_count == phase1_optimizer.step.call_count + 1
+    assert phase2_optimizer.zero_grad.call_count == phase2_optimizer.step.call_count + 1
 
     train_logs = [
         values for values, _step in fake_accelerator.logged if "train/nan_steps" in values

@@ -84,7 +84,9 @@ def test_tokenizer_provenance_requires_boolean_trust_remote_code(
 
 def test_assert_tokenizer_matches_config_rejects_trust_remote_code_mismatch() -> None:
     """Foundation tokenizer provenance must match the config's approved boolean exactly."""
-    config = load_felid_foundation_pipeline_config("configs/examples/felid_foundation_pretrain.toml")
+    config = load_felid_foundation_pipeline_config(
+        "configs/examples/felid_foundation_pretrain.toml"
+    )
 
     with pytest.raises(RuntimeError, match="trust_remote_code"):
         _assert_tokenizer_matches_config(
@@ -100,7 +102,9 @@ def test_assert_tokenizer_matches_config_rejects_trust_remote_code_mismatch() ->
 
 def test_assert_tokenizer_matches_config_rejects_non_boolean_trust_remote_code() -> None:
     """Runtime validation should reject truthy non-bools even when equality would pass."""
-    config = load_felid_foundation_pipeline_config("configs/examples/felid_foundation_pretrain.toml")
+    config = load_felid_foundation_pipeline_config(
+        "configs/examples/felid_foundation_pretrain.toml"
+    )
 
     with pytest.raises(RuntimeError, match="actual boolean") as exc_info:
         _assert_tokenizer_matches_config(
