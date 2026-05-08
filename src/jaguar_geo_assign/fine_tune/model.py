@@ -24,38 +24,8 @@ from dataclasses import dataclass
 from typing import Any
 
 import torch
+from jaxtyping import Float, Int, jaxtyped
 from torch import nn
-
-try:  # pragma: no cover - optional dependency wiring
-    from jaxtyping import Float, Int, jaxtyped
-except Exception:  # pragma: no cover - runtime fallback when jaxtyping is absent
-
-    def jaxtyped(fn: Any) -> Any:
-        """Fallback no-op decorator when :mod:`jaxtyping` is not installed.
-
-        The production configuration pins :mod:`jaxtyping` as a dependency, but
-        this guard keeps the model importable in environments where only a
-        subset of extras is installed (for example, lightweight smoke tests).
-        """
-
-        return fn
-
-    class _ShapeType:
-        """Placeholder type for :class:`jaxtyping.Float` and :class:`Int`.
-
-        The class implements ``__class_getitem__`` so annotations like
-        ``Float[torch.Tensor, "batch seq"]`` remain syntactically valid even
-        when :mod:`jaxtyping` is unavailable. At runtime it behaves as an
-        opaque marker type with no enforcement.
-        """
-
-        def __class_getitem__(cls, item: Any) -> type:  # noqa: D401
-            """Return the placeholder type itself for any subscription."""
-
-            return cls
-
-    Float = _ShapeType
-    Int = _ShapeType
 
 
 class CoordinateRegressionHead(nn.Module):
