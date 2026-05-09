@@ -852,9 +852,7 @@ def run_jaguar_mtl_training(config_path: str | Path) -> MTLTrainResult:
                         )
                     else:
                         grad_norm = _compute_grad_norm(model)
-                    skip_step = (not torch.isfinite(loss_detached).all()) or (
-                        not torch.isfinite(grad_norm.detach()).all()
-                    )
+                    skip_step = not torch.isfinite(grad_norm.detach()).all()
                     if skip_step:
                         skipped_steps += 1
                     else:
@@ -985,9 +983,7 @@ def run_jaguar_mtl_training(config_path: str | Path) -> MTLTrainResult:
                         )
                     else:
                         grad_norm = _compute_grad_norm(model)
-                    skip_step = (not torch.isfinite(loss_detached).all()) or (
-                        not torch.isfinite(grad_norm.detach()).all()
-                    )
+                    skip_step = not torch.isfinite(grad_norm.detach()).all()
                     if skip_step:
                         skipped_steps += 1
                     else:
