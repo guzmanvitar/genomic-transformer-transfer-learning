@@ -378,13 +378,26 @@ Extract 512 bp locus-centered windows from jaguar VCF files. This step requires:
 2. **VCF files:** Per-sample variant calls aligned to the DNA Zoo reference.
 3. **Metadata CSV:** A file with columns: `sample_id`, `individual_id`, `biome_population_label`, `latitude`, `longitude`.
 
-> **Note:** Window extraction does not yet have a dedicated CLI command. It is invoked directly at the module level via `src/jaguar_geo_assign/data/finetune_windows.py`. A CLI entry point will be added in a future iteration.
+```bash
+uv run python -m jaguar_geo_assign.cli extract-finetune-windows \
+  --reference-fasta data/raw/reference/Panthera_onca_HiC.fasta.gz \
+  --vcf data/raw/jaguar/variants.vcf.gz \
+  --metadata-csv data/raw/jaguar/metadata.csv \
+  --output-jsonl data/processed/finetune/windows.jsonl
+```
 
 The window extraction produces a JSONL file of `FinetuneWindow` records. Each record contains the 512 bp sequence, allele annotations, genotype, and genomic coordinates.
 
 ### Step 5: Run Multi-Task Fine-tuning
 
-> **Note:** The `fine-tune` CLI command is currently a scaffold — it accepts a config path but is not yet wired to the end-to-end training loop. The trainer implementation lives in `src/jaguar_geo_assign/fine_tune/trainer.py` and can be invoked directly from Python. A fully integrated CLI command will be added in a future iteration.
+```bash
+uv run python -m jaguar_geo_assign.cli fine-tune \
+  --config configs/mtl_finetune.toml
+
+# Quick smoke test with synthetic data (no pretrained backbone needed)
+uv run python -m jaguar_geo_assign.cli fine-tune \
+  --config configs/mtl_finetune.toml --integration-test
+```
 
 The fine-tuning trainer requires a `MtlFinetuneConfig` TOML with the following fields:
 
