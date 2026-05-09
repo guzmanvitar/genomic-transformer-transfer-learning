@@ -720,7 +720,7 @@ def test_extract_windows_for_samples_rejects_missing_column(tmp_path: Path):
 def test_extract_windows_for_samples_propagates_data_quality_errors(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, error_cls
 ):
-    """Assembly-level errors must propagate rather than being silently skipped."""
+    """Assembly-level errors must propagate and the partial output file must be removed."""
     from jaguar_geo_assign.data import finetune_windows as fw_mod
 
     fasta, vcf = _write_fixture(
@@ -736,12 +736,15 @@ def test_extract_windows_for_samples_propagates_data_quality_errors(
         lambda **_: (_ for _ in ()).throw(error_cls("synthetic error")),
     )
 
+    output = tmp_path / "out.jsonl"
     with pytest.raises(error_cls, match="synthetic error"):
         extract_windows_for_samples(
             reference_fasta=fasta,
             vcf=vcf,
             metadata_csv=csv_path,
-            output_jsonl=tmp_path / "out.jsonl",
+            output_jsonl=output,
             positive_reference_tokens=_TEST_BUILD_TOKENS,
             negative_reference_tokens=[],
         )
+
+    assert not output.exists(), "partial output file must be removed on data-quality error"

@@ -902,35 +902,39 @@ def extract_windows_for_samples(
     samples_processed = 0
     samples_skipped = 0
 
-    with output_path.open("w", encoding="utf-8") as handle:
-        for sample_id in sample_ids:
-            try:
-                for window in iter_locus_windows_from_vcf(
-                    sample_id=sample_id,
-                    sample_vcf=vcf_path,
-                    reference=reference,
-                    positive_reference_tokens=positive_reference_tokens,
-                    negative_reference_tokens=negative_reference_tokens,
+    try:
+        with output_path.open("w", encoding="utf-8") as handle:
+            for sample_id in sample_ids:
+                try:
+                    for window in iter_locus_windows_from_vcf(
+                        sample_id=sample_id,
+                        sample_vcf=vcf_path,
+                        reference=reference,
+                        positive_reference_tokens=positive_reference_tokens,
+                        negative_reference_tokens=negative_reference_tokens,
+                    ):
+                        handle.write(json.dumps(asdict(window)) + "\n")
+                        total_windows += 1
+                    samples_processed += 1
+                except (
+                    ContigMismatchError,
+                    ReferenceMismatchError,
+                    ReferenceBaseMismatchError,
+                    PloidyError,
+                    InvalidAlleleAlphabetError,
+                    MalformedGenotypeError,
                 ):
-                    handle.write(json.dumps(asdict(window)) + "\n")
-                    total_windows += 1
-                samples_processed += 1
-            except (
-                ContigMismatchError,
-                ReferenceMismatchError,
-                ReferenceBaseMismatchError,
-                PloidyError,
-                InvalidAlleleAlphabetError,
-                MalformedGenotypeError,
-            ):
-                raise
-            except AcquisitionError:
-                _LOGGER.warning(
-                    "Skipping sample %r: not found in VCF %s",
-                    sample_id,
-                    vcf_path,
-                )
-                samples_skipped += 1
+                    raise
+                except AcquisitionError:
+                    _LOGGER.warning(
+                        "Skipping sample %r: not found in VCF %s",
+                        sample_id,
+                        vcf_path,
+                    )
+                    samples_skipped += 1
+    except Exception:
+        output_path.unlink(missing_ok=True)
+        raise
 
     if samples_processed == 0:
         _LOGGER.warning(
