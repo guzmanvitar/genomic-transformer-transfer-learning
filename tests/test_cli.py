@@ -37,7 +37,7 @@ def test_describe_experiment_reports_deferred_baseline(
     assert "Deferred baseline: baseline_evaluate -> deferred_legacy_group_model" in captured.out
 
 
-@pytest.mark.parametrize("command", ["fine-tune", "evaluate", "report"])
+@pytest.mark.parametrize("command", ["evaluate", "report"])
 def test_stage_scaffolds_echo_loaded_bootstrap_config(
     command: str,
     capsys: pytest.CaptureFixture[str],
@@ -207,3 +207,135 @@ def test_train_felid_foundation_integration_flag_uses_tiny_mode() -> None:
 
     assert exit_code == 0
     mock_integration.assert_called_once_with(use_real_model=False)
+
+
+def test_fine_tune_dispatches_to_runner(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """``fine-tune`` should call the MTL training entry point with the config path."""
+    calls: list[Path] = []
+    fake_result = SimpleNamespace(
+        fold_index=0,
+        phase1_steps_completed=10,
+        phase2_steps_completed=20,
+        best_eval_haversine_km=42.5,
+        best_eval_macro_f1=0.88,
+        output_dir="/tmp/test_output",
+    )
+
+    def fake_runner(config_path: Path) -> object:
+        calls.append(config_path)
+        return fake_result
+
+    monkeypatch.setattr("jaguar_geo_assign.fine_tune.trainer.run_jaguar_mtl_training", fake_runner)
+
+    exit_code = main(["fine-tune", "--config", "configs/examples/fine_tune.toml"])
+
+    captured = capsys.readouterr()
+    assert exit_code == 0
+    assert calls == [Path("configs/examples/fine_tune.toml")]
+    assert "Jaguar MTL fine-tuning completed" in captured.out
+    assert "Best eval haversine (km): 42.5" in captured.out
+
+
+def test_fine_tune_integration_flag_uses_tiny_mode() -> None:
+    """The integration flag should run the cheap smoke path, not the full trainer."""
+    with patch("jaguar_geo_assign.fine_tune.trainer.integration_test") as mock_integration:
+        with patch("jaguar_geo_assign.fine_tune.trainer.run_jaguar_mtl_training"):
+            exit_code = main(
+                [
+                    "fine-tune",
+                    "--config",
+                    "configs/examples/fine_tune.toml",
+                    "--integration-test",
+                ]
+            )
+
+    assert exit_code == 0
+    mock_integration.assert_called_once_with(use_real_model=False)
+
+
+def test_fine_tune_returns_1_on_error(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """``fine-tune`` should catch RuntimeError and return exit code 1."""
+    monkeypatch.setattr(
+        "jaguar_geo_assign.fine_tune.trainer.run_jaguar_mtl_training",
+        lambda _: (_ for _ in ()).throw(RuntimeError("boom")),
+    )
+
+    exit_code = main(["fine-tune", "--config", "configs/examples/fine_tune.toml"])
+
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    assert "boom" in captured.out
+
+
+def test_fine_tune_without_config_and_without_integration_test_returns_1(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """``fine-tune`` with no --config and no --integration-test must fail with a clear message."""
+    exit_code = main(["fine-tune"])
+
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    assert "--config is required" in captured.out
+
+
+def test_fine_tune_integration_test_without_config_succeeds() -> None:
+    """``fine-tune --integration-test`` must run without requiring --config."""
+    with patch("jaguar_geo_assign.fine_tune.trainer.integration_test") as mock_integration:
+        with patch("jaguar_geo_assign.fine_tune.trainer.run_jaguar_mtl_training"):
+            exit_code = main(["fine-tune", "--integration-test"])
+
+    assert exit_code == 0
+    mock_integration.assert_called_once_with(use_real_model=False)
+
+
+def test_extract_finetune_windows_dispatches(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """``extract-finetune-windows`` should call the orchestrator with correct kwargs."""
+    calls: list[dict] = []
+    fake_result = SimpleNamespace(
+        total_windows=100,
+        samples_processed=5,
+        samples_skipped=1,
+        output_path=Path("/tmp/out.jsonl"),
+    )
+
+    def fake_extract(**kwargs: object) -> object:
+        calls.append(kwargs)
+        return fake_result
+
+    monkeypatch.setattr(
+        "jaguar_geo_assign.data.finetune_windows.extract_windows_for_samples",
+        fake_extract,
+    )
+
+    exit_code = main(
+        [
+            "extract-finetune-windows",
+            "--reference-fasta",
+            "ref.fa",
+            "--vcf",
+            "variants.vcf",
+            "--metadata-csv",
+            "meta.csv",
+            "--output-jsonl",
+            "out.jsonl",
+        ]
+    )
+
+    captured = capsys.readouterr()
+    assert exit_code == 0
+    assert len(calls) == 1
+    assert calls[0]["reference_fasta"] == Path("ref.fa")
+    assert calls[0]["vcf"] == Path("variants.vcf")
+    assert calls[0]["metadata_csv"] == Path("meta.csv")
+    assert calls[0]["output_jsonl"] == Path("out.jsonl")
+    assert "Samples processed: 5" in captured.out
+    assert "Total windows written: 100" in captured.out
