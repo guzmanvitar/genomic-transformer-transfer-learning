@@ -1,7 +1,8 @@
-"""Unit tests for the jaguar multi-task fine-tuning trainer helpers.
+"""Unit tests for trainer NaN/Inf control-flow and MTL helper contracts.
 
-These tests focus on small, deterministic trainer contracts that are cheaper to
-exercise than the synthetic end-to-end integration harness.
+These tests focus on small, deterministic trainer behaviors that are cheaper to
+exercise than the synthetic end-to-end integration harness while still
+protecting the non-finite-loss guards in both training entry points.
 """
 
 from __future__ import annotations
@@ -16,6 +17,7 @@ import torch
 from torch import nn
 
 from jaguar_geo_assign.fine_tune.trainer import _compute_mtl_loss, run_jaguar_mtl_training
+from jaguar_geo_assign.pretrain.foundation_training import run_felid_foundation_training
 
 
 def test_compute_mtl_loss_uses_true_huber_delta_semantics() -> None:
@@ -62,11 +64,15 @@ class _FakeAccelerator:
         self.device = torch.device("cpu")
         self.sync_gradients = True
         self.is_main_process = False
+        self.num_processes = 1
         self.backward_calls: list[torch.Tensor] = []
         self.logged: list[tuple[dict[str, float], int | None]] = []
 
     def init_trackers(self, *_args, **_kwargs) -> None:
         """Match the production API without creating external side effects."""
+
+    def wait_for_everyone(self) -> None:
+        """Mirror the barrier API without synchronizing real processes."""
 
     def log(self, values: dict[str, float], step: int | None = None) -> None:
         """Record logged scalars so the test can inspect NaN-step reporting."""
@@ -87,6 +93,11 @@ class _FakeAccelerator:
     def clip_grad_norm_(self, _parameters, _max_norm: float) -> torch.Tensor:
         """Return a finite norm so only the loss guard controls skipping."""
         return torch.tensor(1.0)
+
+    def reduce(self, values: torch.Tensor, reduction: str = "sum") -> torch.Tensor:
+        """Behave like an identity reduction in the single-process test."""
+        del reduction
+        return values
 
     def unwrap_model(self, model: nn.Module) -> nn.Module:
         """Expose the underlying model unchanged in the single-process test."""
@@ -114,6 +125,53 @@ class _FakeMTLModel(nn.Module):
         del attention_mask
         batch_size = input_ids.shape[0]
         return SimpleNamespace(coordinate=torch.zeros((batch_size, 2), dtype=torch.float32))
+
+
+class _FakeFoundationModel(nn.Module):
+    """Tiny pretraining model that emits one NaN loss and then one finite loss."""
+
+    def __init__(self) -> None:
+        """Create one trainable parameter and a deterministic call counter."""
+        super().__init__()
+        self.weight = nn.Parameter(torch.tensor(1.0))
+        self._call_count = 0
+
+    def forward(self, **_batch):
+        """Return a NaN loss once, then a finite loss with valid logits."""
+        self._call_count += 1
+        if self._call_count == 1:
+            return SimpleNamespace(
+                loss=torch.tensor(float("nan")),
+                logits=torch.full((1, 2, 2), float("nan")),
+            )
+        return SimpleNamespace(
+            loss=torch.tensor(1.25),
+            logits=torch.tensor([[[0.1, 0.9], [0.9, 0.1]]], dtype=torch.float32),
+        )
+
+
+class _StaticFoundationLoader:
+    """Minimal iterable loader with a dataset attribute for foundation training."""
+
+    def __init__(self) -> None:
+        """Initialize two fixed CPU batches and record-count metadata."""
+        self.dataset = SimpleNamespace(record_count=2)
+        self._batches = [
+            {
+                "input_ids": torch.tensor([[101, 102]], dtype=torch.long),
+                "attention_mask": torch.tensor([[1, 1]], dtype=torch.long),
+                "labels": torch.tensor([[1, 0]], dtype=torch.long),
+            },
+            {
+                "input_ids": torch.tensor([[101, 102]], dtype=torch.long),
+                "attention_mask": torch.tensor([[1, 1]], dtype=torch.long),
+                "labels": torch.tensor([[1, 0]], dtype=torch.long),
+            },
+        ]
+
+    def __iter__(self):
+        """Yield the two fixed batches on every fresh iteration."""
+        yield from self._batches
 
 
 def test_run_jaguar_mtl_training_skips_backward_on_non_finite_loss(tmp_path: Path) -> None:
@@ -242,3 +300,71 @@ def test_run_jaguar_mtl_training_skips_backward_on_non_finite_loss(tmp_path: Pat
     ]
     assert len(train_logs) == 2
     assert [logs["train/nan_steps"] for logs in train_logs] == [1.0, 1.0]
+
+
+def test_run_foundation_training_skips_backward_on_non_finite_loss(tmp_path: Path) -> None:
+    """Injected NaN losses must not trigger ``accelerator.backward()`` in pretraining.
+
+    This mirrors the MTL regression test at the foundation-training entry point:
+    the first micro-batch emits a NaN loss and must clear gradients and continue,
+    while the following finite micro-batch is allowed to backpropagate and step.
+    """
+
+    config = SimpleNamespace(
+        output_dir=tmp_path / "out",
+        learning_rate=1e-4,
+        weight_decay=0.0,
+        warmup_steps=0,
+        max_steps=1,
+        gradient_accumulation_steps=1,
+        tensorboard_subdir="tb",
+        log_every=1,
+        eval_every=1,
+        eval_max_steps=None,
+        save_every=100,
+        gradient_clip=1.0,
+        per_device_eval_batch_size=1,
+    )
+    fake_accelerator = _FakeAccelerator()
+    fake_model = _FakeFoundationModel()
+    optimizer = MagicMock()
+    scheduler = MagicMock()
+    scheduler.get_last_lr.return_value = [1e-4]
+
+    with (
+        patch("jaguar_geo_assign.config.load_foundation_training_config", return_value=config),
+        patch(
+            "jaguar_geo_assign.pretrain.foundation_training._build_model_and_tokenizer",
+            return_value=(fake_model, object(), "none", False),
+        ),
+        patch(
+            "jaguar_geo_assign.pretrain.foundation_training._build_optimizer",
+            return_value=optimizer,
+        ),
+        patch(
+            "jaguar_geo_assign.pretrain.foundation_training._build_scheduler",
+            return_value=scheduler,
+        ),
+        patch(
+            "jaguar_geo_assign.pretrain.foundation_training._build_dataloaders",
+            return_value=(_StaticFoundationLoader(), None),
+        ),
+        patch(
+            "jaguar_geo_assign.pretrain.foundation_training.Accelerator",
+            return_value=fake_accelerator,
+        ),
+    ):
+        result = run_felid_foundation_training(tmp_path / "config.toml")
+
+    assert result.final_step == 1
+    assert len(fake_accelerator.backward_calls) == 1
+    assert float(fake_accelerator.backward_calls[0].item()) == pytest.approx(1.25)
+    assert optimizer.step.call_count == 1
+    assert scheduler.step.call_count == 1
+    assert optimizer.zero_grad.call_count == optimizer.step.call_count + 1
+
+    train_logs = [
+        values for values, _step in fake_accelerator.logged if "train/nan_steps" in values
+    ]
+    assert len(train_logs) == 1
+    assert train_logs[0]["train/nan_steps"] == 1
