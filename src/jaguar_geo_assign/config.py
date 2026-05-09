@@ -1068,8 +1068,8 @@ class MtlFinetuneConfig:
     lr_heads_phase1: float = 1e-4
     lr_backbone_phase2: float = 1e-5
     lr_heads_phase2: float = 1e-4
-    cls_loss_weight: float = 1.0
-    reg_loss_weight: float = 0.1
+    cls_loss_weight: float = 0.1
+    reg_loss_weight: float = 1.0
     huber_delta: float = 1.0
     per_device_train_batch_size: int = 16
     per_device_eval_batch_size: int = 32
@@ -1116,8 +1116,8 @@ def load_mtl_finetune_config(path: str | Path) -> MtlFinetuneConfig:
         lr_heads_phase1 = float(training.get("lr_heads_phase1", 1e-4))
         lr_backbone_phase2 = float(training.get("lr_backbone_phase2", 1e-5))
         lr_heads_phase2 = float(training.get("lr_heads_phase2", 1e-4))
-        cls_loss_weight = float(training.get("cls_loss_weight", 1.0))
-        reg_loss_weight = float(training.get("reg_loss_weight", 0.1))
+        cls_loss_weight = float(training.get("cls_loss_weight", 0.1))
+        reg_loss_weight = float(training.get("reg_loss_weight", 1.0))
         huber_delta = float(training.get("huber_delta", 1.0))
         per_device_train_batch_size = int(training.get("per_device_train_batch_size", 16))
         per_device_eval_batch_size = int(training.get("per_device_eval_batch_size", 32))

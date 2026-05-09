@@ -245,10 +245,10 @@ total_loss = cls_loss_weight × CrossEntropy(biome_logits, biome_label)
 
 | Component | Function | Default Weight | Rationale |
 |-----------|----------|----------------|-----------|
-| Classification | Cross-entropy | 1.0 | Standard multi-class loss for biome assignment |
-| Regression | Huber loss (delta=1.0) | 0.1 | More robust than MSE to outlier mispredictions; Huber transitions from L2 to L1 behavior beyond delta, limiting the influence of large geographic errors |
+| Regression | Huber loss (delta=1.0) | 1.0 | The primary task and research contribution; more robust than MSE to outlier mispredictions — Huber transitions from L2 to L1 behavior beyond delta, limiting the influence of large geographic errors |
+| Classification | Cross-entropy | 0.1 | Serves primarily as an auxiliary regularizer that encourages the shared backbone to learn population-structure-aware representations, indirectly benefiting regression |
 
-The default 10:1 weighting prioritizes classification accuracy, reflecting the primary importance of correct biome assignment. Both losses are computed in float32 regardless of mixed-precision settings to ensure numerical stability.
+The 1:10 weighting (regression-dominant) reflects two observations: (1) continuous geographic assignment is the hard task and the novel contribution of this work — it needs the majority of gradient budget from step 1; (2) biome classification saturates early, and a high classification weight would spend gradient budget sharpening already-correct logits rather than reducing geographic error. At 0.1 weight the classification head still converges to high accuracy (the task is easy enough), while the regression head receives first-class optimization throughout training. Both losses are computed in float32 regardless of mixed-precision settings to ensure numerical stability.
 
 **Gradient management:**
 - Gradient accumulation: 4 steps by default (effective batch size = per_device_batch × 4 × world_size).
