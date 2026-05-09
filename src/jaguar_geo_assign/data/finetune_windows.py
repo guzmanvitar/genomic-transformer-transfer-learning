@@ -162,14 +162,17 @@ class ReferenceIndex:
             (without the leading ``>``). Used by the build-token check
             and surfaced in error messages.
         validated_alphabet: Whether the per-contig sequences have been scanned
-            for invalid IUPAC/non-ACGTN characters (always True if constructed
-            via :func:`load_reference_index`).
+            for invalid IUPAC/non-ACGTN characters. Defaults to ``False`` so
+            ad hoc construction cannot claim the alphabet contract without an
+            explicit scan; :func:`load_reference_index` and
+            :func:`extract_locus_windows_from_vcf` set it to ``True`` only
+            after validating their inputs.
     """
 
     fasta_path: Path
     contig_sequences: Mapping[str, str]
     contig_headers: Mapping[str, str]
-    validated_alphabet: bool = True
+    validated_alphabet: bool = False
 
 
 def extract_fasta_window(

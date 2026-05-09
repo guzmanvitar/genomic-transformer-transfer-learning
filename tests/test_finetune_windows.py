@@ -29,6 +29,7 @@ from jaguar_geo_assign.data.finetune_windows import (
     FinetuneWindow,
     InvalidAlleleAlphabetError,
     PloidyError,
+    ReferenceIndex,
     ReferenceBaseMismatchError,
     extract_fasta_window,
     extract_fasta_windows_for_sample,
@@ -324,6 +325,22 @@ def test_extract_locus_windows_rejects_invalid_in_memory_reference_alphabet(tmp_
             contig_sequences=contig_sequences,
             positive_reference_tokens=_TEST_BUILD_TOKENS,
         )
+
+
+def test_reference_index_defaults_to_unvalidated_for_manual_construction():
+    """Manual ``ReferenceIndex`` construction must opt into the validated flag explicitly.
+
+    This prevents callers from accidentally advertising the alphabet-scan
+    contract when they bypass both ``load_reference_index`` and the validated
+    in-memory convenience path.
+    """
+    index = ReferenceIndex(
+        fasta_path=Path("<in-memory>"),
+        contig_sequences={"chr1": "ACGTN"},
+        contig_headers={"chr1": "chr1"},
+    )
+
+    assert index.validated_alphabet is False
 
 
 def test_output_jsonl_round_trips_window_records(tmp_path: Path):
