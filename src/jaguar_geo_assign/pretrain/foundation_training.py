@@ -474,7 +474,7 @@ def _save_json_atomically(
     # Write JSON to temp file with unique PID-based suffix, then atomically rename.
     tmp_path = path.with_name(f"{path.name}.{os.getpid()}.tmp")
     try:
-        tmp_path.write_text(json.dumps(content))
+        tmp_path.write_text(json.dumps(content), encoding="utf-8")
         # Atomically rename temp file to target
         os.replace(str(tmp_path), str(path))
     except Exception:
@@ -666,11 +666,13 @@ def run_felid_foundation_training(
 
     accelerator.init_trackers("felid_foundation_training")
     startup_grad_norms = []
+    has_set_epoch = hasattr(train_loader.dataset, "set_epoch")
 
     try:
         for _epoch in range(1, 1000):  # Iterate until max_steps reached
             # Set epoch on reader for deterministic multi-epoch shuffling
-            train_loader.dataset.set_epoch(_epoch - 1)  # 0-indexed
+            if has_set_epoch:
+                train_loader.dataset.set_epoch(_epoch - 1)  # 0-indexed
             for batch in train_loader:
                 if step >= config.max_steps:
                     break
@@ -684,9 +686,11 @@ def run_felid_foundation_training(
 
                     # NaN/Inf guard: skip accumulation and count as anomaly
                     loss_f = loss.detach().float()
-                    if torch.isnan(loss_f).any() or torch.isinf(loss_f).any():
+                    if not torch.isfinite(loss_f).all():
                         train_metric.nan_count += 1
                         logger.warning(f"NaN/Inf loss detected at step {step}")
+                        optimizer.zero_grad()
+                        continue
                     else:
                         train_metric.loss_sum += loss_f.mean().item()
                         train_metric.step_count += 1
@@ -707,7 +711,6 @@ def run_felid_foundation_training(
                                     ((preds == labels) & mask).sum().item()
                                 )
                                 train_metric.token_masked += mask.sum().item()
-
                     # Backward pass
                     accelerator.backward(loss)
 

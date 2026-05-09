@@ -2,10 +2,9 @@
 
 This module owns the contract-enforcement boundary between raw TOML
 configuration files and the typed, frozen dataclass configs consumed by
-every downstream pipeline stage.  Every loader function (**load_experiment_config**,
-**load_feline_pipeline_config**) must reject configs that violate the
-approved scientific or engineering contracts *before* any pipeline work
-begins.
+every downstream pipeline stage. Active loaders must reject configs that
+violate the approved scientific or engineering contracts *before* any
+pipeline work begins.
 
 Design invariants:
 
@@ -37,18 +36,14 @@ from .baselines import (
 from .data.contracts import JAGUAR_METADATA_FIELDS
 from .data.felid_assemblies import APPROVED_FELID_ASSEMBLIES, FelidAssembly
 from .data.pipeline_contract import (
-    APPROVED_BIOPROJECT_ACCESSION,
     APPROVED_FELID_IDENTIFIERS,
-    APPROVED_REFERENCE_ASSEMBLY,
     DNABERT2_TOKENIZER_ID,
     DNABERT2_TOKENIZER_REVISION,
     DNABERT2_TRUST_REMOTE_CODE,
-    EXPLICIT_CONSENSUS_POLICIES,
     GLOBAL_LOCUS_SPLIT_STRATEGY,
     POST_CONSENSUS_ALLOWED_ALPHABET,
     PRE_WINDOW_ASSIGNMENT_STAGE,
     REFERENCE_BASELINE_POLICY,
-    REQUIRED_EXTERNAL_TOOLS,
     REQUIRED_FELID_FOUNDATION_SPECIES_COUNT,
     assert_external_tools_available,
 )
@@ -96,72 +91,6 @@ class ExperimentConfig:
     baseline_provider: str
     baseline_enabled: bool
     baseline_extension_point: str
-
-
-@dataclass(frozen=True)
-class PipelinePathsConfig:
-    """Filesystem paths required by the feline genome pipeline.
-
-    All paths are stored as :class:`pathlib.Path` instances.  The loader
-    does **not** verify that the paths exist on disk — that responsibility
-    belongs to the stage that first accesses them.
-
-    Attributes:
-        reference_fasta: Reference genome FASTA file.
-        sample_manifest: CSV/TSV manifest mapping sample IDs to metadata.
-        source_vcf: Multi-sample VCF used as the variant source.
-        raw_dir: Root directory for raw (pre-consensus) intermediate files.
-        processed_dir: Root directory for post-consensus processed outputs.
-        baseline_dir: Directory for baseline model artifacts.
-        artifact_dir: General artifact storage (models, checkpoints).
-        report_dir: Directory where final evaluation reports are written.
-    """
-
-    reference_fasta: Path
-    sample_manifest: Path
-    source_vcf: Path
-    raw_dir: Path
-    processed_dir: Path
-    baseline_dir: Path
-    artifact_dir: Path
-    report_dir: Path
-
-
-@dataclass(frozen=True)
-class ConsensusConfig:
-    """VCF-to-consensus-sequence conversion parameters.
-
-    The loader enforces that ``assembly`` matches the approved reference,
-    that both mismatch-guard booleans are ``True``, and that every genotype
-    policy string belongs to :pydata:`pipeline_contract.EXPLICIT_CONSENSUS_POLICIES`.
-
-    Attributes:
-        assembly: Reference assembly identifier (e.g. ``felCat9``).
-        require_assembly_match: Fail-fast guard against assembly
-            mismatches between the VCF and the reference.
-        require_contig_match: Fail-fast guard against contig name
-            mismatches.
-        mask_symbol: Character used for ambiguous or masked positions.
-        homozygous_reference: Consensus policy for 0/0 genotypes.
-        homozygous_alternate: Consensus policy for 1/1 genotypes.
-        heterozygous: Consensus policy for 0/1 genotypes.
-        multiallelic: Consensus policy for multi-allelic sites.
-        filtered: Consensus policy for filtered sites.
-        missing: Consensus policy for missing genotypes (``./.``).
-        indel: Consensus policy for insertion/deletion variants.
-    """
-
-    assembly: str
-    require_assembly_match: bool
-    require_contig_match: bool
-    mask_symbol: str
-    homozygous_reference: str
-    homozygous_alternate: str
-    heterozygous: str
-    multiallelic: str
-    filtered: str
-    missing: str
-    indel: str
 
 
 @dataclass(frozen=True)
@@ -285,39 +214,6 @@ class RuntimeConfig:
     """
 
     external_tools: tuple[str, ...]
-
-
-@dataclass(frozen=True)
-class FelinePipelineConfig:
-    """Top-level validated configuration for the feline genome pipeline.
-
-    Composed of section-specific frozen dataclasses, each independently
-    validated by :func:`load_feline_pipeline_config`.  This object is the
-    single source of truth passed to every pipeline stage.
-
-    Attributes:
-        name: Human-readable pipeline name.
-        description: Free-text description of the pipeline run.
-        project_accession: NCBI BioProject accession.
-        paths: Filesystem paths (:class:`PipelinePathsConfig`).
-        consensus: VCF-to-consensus parameters (:class:`ConsensusConfig`).
-        windowing: Sliding-window parameters (:class:`WindowingConfig`).
-        split: Train/test split strategy (:class:`SplitConfig`).
-        tokenizer: DNABERT-2 tokenizer pinning (:class:`TokenizerConfig`).
-        export: Parquet export settings (:class:`ExportConfig`).
-        runtime: External tool requirements (:class:`RuntimeConfig`).
-    """
-
-    name: str
-    description: str
-    project_accession: str
-    paths: PipelinePathsConfig
-    consensus: ConsensusConfig
-    windowing: WindowingConfig
-    split: SplitConfig
-    tokenizer: TokenizerConfig
-    export: ExportConfig
-    runtime: RuntimeConfig
 
 
 def _require_boolean_field(
@@ -446,253 +342,6 @@ def load_experiment_config(path: str | Path) -> ExperimentConfig:
     )
 
 
-def load_feline_pipeline_config(path: str | Path) -> FelinePipelineConfig:
-    """Load and validate a feline genome pipeline TOML config.
-
-    Performs exhaustive contract enforcement across all eight required
-    sections (``pipeline``, ``paths``, ``consensus``, ``windowing``,
-    ``split``, ``tokenizer``, ``export``, ``runtime``).  Key validations
-    include:
-
-    * BioProject accession and reference assembly pinning.
-    * Consensus mismatch-guard booleans (via :func:`_require_boolean_field`).
-    * Genotype policy strings against the explicit consensus policy set.
-    * Windowing arithmetic (positive window, valid overlap, ambiguity
-      fraction in ``[0, 1]``).
-    * Locus-safe split strategy and block-size >= context-window guard.
-    * DNABERT-2 tokenizer identity, revision, and alphabet pinning.
-    * Parquet export auditability (coordinates preserved, hash algorithm).
-    * External tool manifest matching the required set.
-
-    Args:
-        path: Filesystem path to a TOML pipeline config file.
-
-    Returns:
-        A fully validated, frozen :class:`FelinePipelineConfig`.
-
-    Raises:
-        ValueError: If any contract check fails or a required section /
-            field is missing.
-    """
-    raw = tomllib.loads(Path(path).read_text(encoding="utf-8"))
-    required_sections = (
-        "pipeline",
-        "paths",
-        "consensus",
-        "windowing",
-        "split",
-        "tokenizer",
-        "export",
-        "runtime",
-    )
-    missing_sections = [section for section in required_sections if section not in raw]
-    if missing_sections:
-        raise ValueError(
-            "Feline pipeline config is missing required sections: " + ", ".join(missing_sections)
-        )
-
-    try:
-        pipeline = raw["pipeline"]
-        paths = raw["paths"]
-        consensus = raw["consensus"]
-        windowing = raw["windowing"]
-        split = raw["split"]
-        tokenizer = raw["tokenizer"]
-        export = raw["export"]
-        runtime = raw["runtime"]
-
-        if pipeline["project_accession"] != APPROVED_BIOPROJECT_ACCESSION:
-            raise ValueError(
-                f"pipeline.project_accession must remain {APPROVED_BIOPROJECT_ACCESSION}"
-            )
-        if consensus["assembly"] != APPROVED_REFERENCE_ASSEMBLY:
-            raise ValueError(f"consensus.assembly must remain {APPROVED_REFERENCE_ASSEMBLY}")
-        require_assembly_match = _require_boolean_field(
-            consensus["require_assembly_match"],
-            field_name="consensus.require_assembly_match",
-            contract_description="the approved consensus mismatch-guard contract",
-        )
-        require_contig_match = _require_boolean_field(
-            consensus["require_contig_match"],
-            field_name="consensus.require_contig_match",
-            contract_description="the approved consensus mismatch-guard contract",
-        )
-        if not require_assembly_match or not require_contig_match:
-            raise ValueError("consensus must fail fast on assembly and contig mismatches")
-        if consensus["mask_symbol"] != "N":
-            raise ValueError("consensus.mask_symbol must remain N")
-
-        policy_fields = (
-            consensus["homozygous_reference"],
-            consensus["homozygous_alternate"],
-            consensus["heterozygous"],
-            consensus["multiallelic"],
-            consensus["filtered"],
-            consensus["missing"],
-            consensus["indel"],
-        )
-        if any(policy not in EXPLICIT_CONSENSUS_POLICIES for policy in policy_fields):
-            raise ValueError("consensus policies must use the approved explicit policy values")
-
-        context_window = int(windowing["context_window"])
-        window_overlap = int(windowing["window_overlap"])
-        if context_window <= 0:
-            raise ValueError("windowing.context_window must be positive")
-        if window_overlap < 0 or window_overlap >= context_window:
-            raise ValueError(
-                "windowing.window_overlap must be >= 0 and smaller than context_window"
-            )
-        max_ambiguous_fraction = float(windowing["max_ambiguous_fraction"])
-        if not 0 <= max_ambiguous_fraction <= 1:
-            raise ValueError("windowing.max_ambiguous_fraction must be between 0 and 1")
-
-        locus_key_fields = tuple(split["locus_key_fields"])
-        if split["strategy"] != GLOBAL_LOCUS_SPLIT_STRATEGY:
-            raise ValueError("split.strategy must use the global locus-safe contract")
-        if locus_key_fields != ("contig", "block_id"):
-            raise ValueError("split.locus_key_fields must be ['contig', 'block_id']")
-        locus_block_size = int(split["locus_block_size"])
-        if locus_block_size < context_window:
-            raise ValueError("split.locus_block_size must be >= windowing.context_window")
-        if split["assignment_stage"] != PRE_WINDOW_ASSIGNMENT_STAGE:
-            raise ValueError("split.assignment_stage must assign loci before windowing")
-        if split["baseline_policy"] != REFERENCE_BASELINE_POLICY:
-            raise ValueError(
-                "split.baseline_policy must reuse locus assignments for the baseline corpus"
-            )
-
-        allowed_alphabet = tuple(tokenizer["allowed_alphabet"])
-        if tokenizer["identifier"] != DNABERT2_TOKENIZER_ID:
-            raise ValueError("tokenizer.identifier must pin zhihan1996/DNABERT-2-117M")
-        if tokenizer["revision"] != DNABERT2_TOKENIZER_REVISION:
-            raise ValueError(
-                "tokenizer.revision must pin the approved immutable DNABERT-2 revision"
-            )
-        if allowed_alphabet != POST_CONSENSUS_ALLOWED_ALPHABET:
-            raise ValueError(
-                "tokenizer.allowed_alphabet must exactly match the post-consensus contract"
-            )
-        if tokenizer["unsupported_symbol_policy"] not in {"reject", "normalize_to_n"}:
-            raise ValueError("tokenizer.unsupported_symbol_policy must be reject or normalize_to_n")
-        max_position_embeddings = int(tokenizer["max_position_embeddings"])
-        if max_position_embeddings < context_window:
-            raise ValueError(
-                "tokenizer.max_position_embeddings must be >= windowing.context_window"
-            )
-        trust_remote_code = _require_boolean_field(
-            tokenizer["trust_remote_code"],
-            field_name="tokenizer.trust_remote_code",
-            contract_description="the approved DNABERT-2 contract",
-        )
-        if trust_remote_code is not DNABERT2_TRUST_REMOTE_CODE:
-            raise ValueError(
-                "tokenizer.trust_remote_code must remain "
-                f"{DNABERT2_TRUST_REMOTE_CODE} for the approved DNABERT-2 contract"
-            )
-
-        drop_short_sequences = _require_boolean_field(
-            windowing["drop_short_sequences"],
-            field_name="windowing.drop_short_sequences",
-            contract_description="the feline windowing contract",
-        )
-
-        if export["format"] != "parquet":
-            raise ValueError("export.format must remain parquet for the approved v1 contract")
-        if int(export["row_group_size"]) <= 0:
-            raise ValueError("export.row_group_size must be positive")
-        preserve_coordinates = _require_boolean_field(
-            export["preserve_coordinates"],
-            field_name="export.preserve_coordinates",
-            contract_description="the feline export auditability contract",
-        )
-        preserve_raw_windows = _require_boolean_field(
-            export["preserve_raw_windows"],
-            field_name="export.preserve_raw_windows",
-            contract_description="the feline export preservation contract",
-        )
-        preserve_sequence_hashes = _require_boolean_field(
-            export["preserve_sequence_hashes"],
-            field_name="export.preserve_sequence_hashes",
-            contract_description="the feline export preservation contract",
-        )
-        if not preserve_coordinates:
-            raise ValueError("export.preserve_coordinates must remain enabled for auditability")
-        if not preserve_raw_windows and not preserve_sequence_hashes:
-            raise ValueError("export must preserve raw windows or immutable sequence hashes")
-        if export["sequence_hash_algorithm"] != "sha256":
-            raise ValueError("export.sequence_hash_algorithm must remain sha256")
-
-        external_tools = tuple(runtime["external_tools"])
-        if external_tools != REQUIRED_EXTERNAL_TOOLS:
-            raise ValueError("runtime.external_tools must explicitly require bcftools")
-    except KeyError as exc:
-        raise ValueError(
-            f"Feline pipeline config is missing required field: {exc.args[0]}"
-        ) from exc
-
-    return FelinePipelineConfig(
-        name=pipeline["name"],
-        description=pipeline["description"],
-        project_accession=pipeline["project_accession"],
-        paths=PipelinePathsConfig(
-            reference_fasta=Path(paths["reference_fasta"]),
-            sample_manifest=Path(paths["sample_manifest"]),
-            source_vcf=Path(paths["source_vcf"]),
-            raw_dir=Path(paths["raw_dir"]),
-            processed_dir=Path(paths["processed_dir"]),
-            baseline_dir=Path(paths["baseline_dir"]),
-            artifact_dir=Path(paths["artifact_dir"]),
-            report_dir=Path(paths["report_dir"]),
-        ),
-        consensus=ConsensusConfig(
-            assembly=consensus["assembly"],
-            require_assembly_match=require_assembly_match,
-            require_contig_match=require_contig_match,
-            mask_symbol=consensus["mask_symbol"],
-            homozygous_reference=consensus["homozygous_reference"],
-            homozygous_alternate=consensus["homozygous_alternate"],
-            heterozygous=consensus["heterozygous"],
-            multiallelic=consensus["multiallelic"],
-            filtered=consensus["filtered"],
-            missing=consensus["missing"],
-            indel=consensus["indel"],
-        ),
-        windowing=WindowingConfig(
-            context_window=context_window,
-            window_overlap=window_overlap,
-            max_ambiguous_fraction=max_ambiguous_fraction,
-            drop_short_sequences=drop_short_sequences,
-        ),
-        split=SplitConfig(
-            strategy=split["strategy"],
-            locus_key_fields=locus_key_fields,
-            locus_block_size=locus_block_size,
-            assignment_stage=split["assignment_stage"],
-            evaluation_target=split["evaluation_target"],
-            baseline_policy=split["baseline_policy"],
-        ),
-        tokenizer=TokenizerConfig(
-            identifier=tokenizer["identifier"],
-            revision=tokenizer["revision"],
-            allowed_alphabet=allowed_alphabet,
-            unsupported_symbol_policy=tokenizer["unsupported_symbol_policy"],
-            max_position_embeddings=max_position_embeddings,
-            trust_remote_code=trust_remote_code,
-        ),
-        export=ExportConfig(
-            format=export["format"],
-            access_pattern=export["access_pattern"],
-            row_group_size=int(export["row_group_size"]),
-            deterministic_partition_keys=tuple(export["deterministic_partition_keys"]),
-            preserve_raw_windows=preserve_raw_windows,
-            preserve_sequence_hashes=preserve_sequence_hashes,
-            preserve_coordinates=preserve_coordinates,
-            sequence_hash_algorithm=export["sequence_hash_algorithm"],
-        ),
-        runtime=RuntimeConfig(external_tools=external_tools),
-    )
-
-
 @dataclass(frozen=True)
 class FelidSpeciesEntry:
     """One approved species pinned to its RefSeq identifier and assembly name.
@@ -724,12 +373,11 @@ class FelidSpeciesEntry:
 class FelidFoundationPathsConfig:
     """Filesystem paths required by the felid-foundation pretraining pipeline.
 
-    Unlike :class:`PipelinePathsConfig`, this path block carries *no*
-    ``sample_manifest`` or ``source_vcf`` — the foundation corpus is
-    reference-FASTA-only and never invokes consensus calling. The loader
-    does not verify that paths exist; that responsibility belongs to the
-    stage that first accesses them so we can still validate configs on a
-    machine without the reference directory materialised.
+    The foundation corpus is reference-FASTA-only and never invokes VCF
+    consensus calling. The loader does not verify that paths exist; that
+    responsibility belongs to the stage that first accesses them so we can
+    still validate configs on a machine without the reference directory
+    materialised.
 
     Attributes:
         reference_dir: Directory containing one ``<ACC>_<ASM>.fna.gz`` file
@@ -749,10 +397,9 @@ class FelidFoundationPathsConfig:
 class FelidFoundationPipelineConfig:
     """Top-level validated configuration for the felid-foundation pipeline.
 
-    Distinct from :class:`FelinePipelineConfig` because the foundation path
-    uses a multi-species FASTA-only input (no VCF, no consensus, no
-    BioProject pinning) and shares only the windowing / tokenizer / split /
-    export contract helpers with the legacy path.
+    The foundation path uses a multi-species FASTA-only input (no VCF, no
+    consensus, no BioProject pinning) and shares the windowing / tokenizer /
+    split / export helpers across active training workflows.
 
     Attributes:
         name: Human-readable pipeline name.
@@ -791,30 +438,6 @@ def _slugify_species(latin_binomial: str) -> str:
     return "_".join(latin_binomial.strip().lower().split())
 
 
-def check_feline_pipeline_runtime(path: str | Path) -> FelinePipelineConfig:
-    """Load, validate, and verify runtime dependencies for the feline pipeline.
-
-    This is the preferred entry point when you need both config validation
-    **and** confirmation that all required external tools (e.g. ``bcftools``)
-    are available on ``$PATH``.
-
-    Args:
-        path: Filesystem path to a TOML pipeline config file.
-
-    Returns:
-        A fully validated :class:`FelinePipelineConfig` (same as
-        :func:`load_feline_pipeline_config`).
-
-    Raises:
-        ValueError: If any config contract check fails.
-        RuntimeError: If a required external tool is not found on
-            ``$PATH``.
-    """
-    config = load_feline_pipeline_config(path)
-    assert_external_tools_available(config.runtime.external_tools)
-    return config
-
-
 def describe_experiment(path: str | Path) -> str:
     """Return a human-readable multi-line summary of an experiment config.
 
@@ -844,49 +467,6 @@ def describe_experiment(path: str | Path) -> str:
                 f"({config.baseline_extension_point})"
             ),
             f"Requires private data: {config.requires_private_data}",
-        ]
-    )
-
-
-def describe_feline_pipeline(path: str | Path) -> str:
-    """Return a human-readable multi-line summary of a feline pipeline config.
-
-    Loads and validates the config via :func:`load_feline_pipeline_config`,
-    then formats the key fields — accession, consensus assembly, split
-    contract, tokenizer pin, export settings, and runtime tools — into a
-    newline-separated string suitable for logging or CLI output.
-
-    Args:
-        path: Filesystem path to a TOML pipeline config file.
-
-    Returns:
-        Multi-line string summarising the pipeline configuration.
-    """
-    config = load_feline_pipeline_config(path)
-    return "\n".join(
-        [
-            f"Pipeline: {config.name}",
-            f"Description: {config.description}",
-            f"Project accession: {config.project_accession}",
-            f"Consensus assembly: {config.consensus.assembly}",
-            (
-                "Split contract: "
-                f"{config.split.strategy} via {', '.join(config.split.locus_key_fields)} "
-                f"block_size={config.split.locus_block_size} "
-                f"({config.split.assignment_stage}; baseline={config.split.baseline_policy})"
-            ),
-            (
-                "Tokenizer: "
-                f"{config.tokenizer.identifier}@{config.tokenizer.revision} "
-                f"alphabet={''.join(config.tokenizer.allowed_alphabet)}"
-            ),
-            (
-                "Export: "
-                f"{config.export.format} row_group_size={config.export.row_group_size} "
-                f"raw_windows={config.export.preserve_raw_windows} "
-                f"sequence_hashes={config.export.preserve_sequence_hashes}"
-            ),
-            f"Runtime tools: {', '.join(config.runtime.external_tools)}",
         ]
     )
 
@@ -1193,9 +773,7 @@ def check_felid_foundation_pipeline_runtime(
 
     The foundation contract declares an empty external-tool list, so this
     function reduces to "load + validate + no-op external tool check".
-    Exposing it in parallel with :func:`check_feline_pipeline_runtime`
-    keeps the CLI UX consistent: every pipeline has a
-    ``check-*-runtime`` subcommand that returns a validated config.
+    It remains as the CLI entry point for validating the runtime contract.
 
     Args:
         path: Filesystem path to a TOML pipeline config file.
@@ -1331,9 +909,10 @@ def load_foundation_training_config(path: str | Path) -> FoundationTrainingConfi
 
     Enforces that required fields (corpus_metadata_path, model_identifier,
     model_revision, max_steps) are present and valid, and that optional
-    hyperparameters fall within sensible ranges. The model_identifier is
-    pinned to zhihan1996/DNABERT-2-117M by contract; other fields are
-    lightly validated (e.g., learning_rate > 0, batch sizes > 0).
+    hyperparameters fall within sensible ranges. The model_identifier and
+    model_revision are pinned by contract so warm-starts remain reproducible;
+    other fields are lightly validated (e.g., learning_rate > 0, batch sizes
+    > 0).
 
     Args:
         path: Filesystem path to a TOML training config file.
@@ -1381,6 +960,10 @@ def load_foundation_training_config(path: str | Path) -> FoundationTrainingConfi
         if model_identifier != "zhihan1996/DNABERT-2-117M":
             raise ValueError(
                 "training.model_identifier must be pinned to zhihan1996/DNABERT-2-117M"
+            )
+        if model_revision != DNABERT2_TOKENIZER_REVISION:
+            raise ValueError(
+                f"training.model_revision must be pinned to {DNABERT2_TOKENIZER_REVISION}"
             )
         if max_steps <= 0:
             raise ValueError("training.max_steps must be positive")

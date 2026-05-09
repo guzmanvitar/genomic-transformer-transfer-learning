@@ -162,14 +162,17 @@ class ReferenceIndex:
             (without the leading ``>``). Used by the build-token check
             and surfaced in error messages.
         validated_alphabet: Whether the per-contig sequences have been scanned
-            for invalid IUPAC/non-ACGTN characters (always True if constructed
-            via :func:`load_reference_index`).
+            for invalid IUPAC/non-ACGTN characters. Defaults to ``False`` so
+            ad hoc construction cannot claim the alphabet contract without an
+            explicit scan; :func:`load_reference_index` and
+            :func:`extract_locus_windows_from_vcf` set it to ``True`` only
+            after validating their inputs.
     """
 
     fasta_path: Path
     contig_sequences: Mapping[str, str]
     contig_headers: Mapping[str, str]
-    validated_alphabet: bool = True
+    validated_alphabet: bool = False
 
 
 def extract_fasta_window(
@@ -721,7 +724,9 @@ def extract_locus_windows_from_vcf(
 
     Wraps :func:`iter_locus_windows_from_vcf` for callers that already
     hold a ``contig_sequences`` mapping (e.g. unit tests reusing a
-    cached reference). Production-scale callers should prefer
+    cached reference). The in-memory sequences are alphabet-scanned up
+    front so this convenience path preserves the same invalid-base
+    contract as :func:`load_reference_index`. Production-scale callers should prefer
     :func:`iter_locus_windows_from_vcf` directly so peak memory stays
     bounded by a single window.
 
@@ -738,12 +743,24 @@ def extract_locus_windows_from_vcf(
 
     Returns:
         Windows in VCF record order; heterozygote pairs are consecutive.
+
+    Raises:
+        InvalidAlleleAlphabetError: If any supplied contig sequence contains
+            characters outside :data:`ALLOWED_NUCLEOTIDES`.
     """
     fasta_path = Path(reference_path) if reference_path is not None else Path("<in-memory>")
+    for contig_name, sequence in contig_sequences.items():
+        offending = set(sequence.upper()) - ALLOWED_NUCLEOTIDES
+        if offending:
+            raise InvalidAlleleAlphabetError(
+                f"Contig {contig_name!r} contains invalid characters {sorted(offending)} "
+                f"in reference {fasta_path}. Allowed alphabet is {sorted(ALLOWED_NUCLEOTIDES)}."
+            )
     reference = ReferenceIndex(
         fasta_path=fasta_path,
         contig_sequences=contig_sequences,
         contig_headers={name: name for name in contig_sequences},
+        validated_alphabet=True,
     )
     return list(
         iter_locus_windows_from_vcf(

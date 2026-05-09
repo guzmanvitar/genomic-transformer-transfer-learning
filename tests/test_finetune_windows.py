@@ -29,6 +29,7 @@ from jaguar_geo_assign.data.finetune_windows import (
     FinetuneWindow,
     InvalidAlleleAlphabetError,
     PloidyError,
+    ReferenceIndex,
     ReferenceBaseMismatchError,
     extract_fasta_window,
     extract_fasta_windows_for_sample,
@@ -310,6 +311,36 @@ def test_extract_locus_windows_uses_provided_contig_sequences_directly(tmp_path:
     # Flanks pick up the C-fill we passed in memory.
     assert set(windows[0].sequence[:UPSTREAM_BASES]) == {"C"}
     assert windows[0].sequence[UPSTREAM_BASES] == "T"
+
+
+def test_extract_locus_windows_rejects_invalid_in_memory_reference_alphabet(tmp_path: Path):
+    """The in-memory reference path must enforce the same alphabet contract as FASTA loading."""
+    vcf_text = _build_vcf(["chr1\t300\t.\tA\tT\t.\tPASS\t.\tGT\t1/1"])
+    _, vcf = _write_fixture(tmp_path, vcf_text)
+    contig_sequences = {"chr1": f"{'A' * 100}R{'A' * (_CONTIG_LENGTH - 101)}"}
+    with pytest.raises(InvalidAlleleAlphabetError, match="invalid characters.*R"):
+        extract_locus_windows_from_vcf(
+            sample_id="cat_1",
+            sample_vcf=vcf,
+            contig_sequences=contig_sequences,
+            positive_reference_tokens=_TEST_BUILD_TOKENS,
+        )
+
+
+def test_reference_index_defaults_to_unvalidated_for_manual_construction():
+    """Manual ``ReferenceIndex`` construction must opt into the validated flag explicitly.
+
+    This prevents callers from accidentally advertising the alphabet-scan
+    contract when they bypass both ``load_reference_index`` and the validated
+    in-memory convenience path.
+    """
+    index = ReferenceIndex(
+        fasta_path=Path("<in-memory>"),
+        contig_sequences={"chr1": "ACGTN"},
+        contig_headers={"chr1": "chr1"},
+    )
+
+    assert index.validated_alphabet is False
 
 
 def test_output_jsonl_round_trips_window_records(tmp_path: Path):
