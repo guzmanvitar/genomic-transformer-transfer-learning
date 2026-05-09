@@ -31,8 +31,9 @@ This work addresses a core challenge in conservation genomics: endangered specie
    - [Step 1: Acquire Felid Reference Assemblies](#step-1-acquire-felid-reference-assemblies)
    - [Step 2: Build the Tokenized Corpus](#step-2-build-the-tokenized-corpus)
    - [Step 3: Run Foundation Pre-training](#step-3-run-foundation-pre-training)
-   - [Step 4: Prepare Jaguar Fine-tuning Data](#step-4-prepare-jaguar-fine-tuning-data)
-   - [Step 5: Run Multi-Task Fine-tuning](#step-5-run-multi-task-fine-tuning)
+   - [Step 4: Acquire Jaguar Raw Data](#step-4-acquire-jaguar-raw-data)
+   - [Step 5: Prepare Jaguar Fine-tuning Data](#step-5-prepare-jaguar-fine-tuning-data)
+   - [Step 6: Run Multi-Task Fine-tuning](#step-6-run-multi-task-fine-tuning)
 8. [Repository Layout](#repository-layout)
 9. [Development](#development)
 
@@ -278,7 +279,7 @@ The 1:10 weighting (regression-dominant) reflects two observations: (1) continuo
 The pipeline enforces several reproducibility invariants:
 
 - **Immutable tokenizer pinning:** The DNABERT-2 tokenizer is locked to a specific Git commit hash. Any model trained with this pipeline uses identical tokenization.
-- **Checksum-verified downloads:** All felid reference assemblies are verified with MD5 (RefSeq) or SHA-256 (DNA Zoo) checksums pinned from source repositories. Idempotent — second invocations skip already-verified files.
+- **Checksum-verified downloads:** All reference assemblies and jaguar raw data files are verified with pinned SHA-256 checksums. Idempotent — second invocations skip already-verified files.
 - **Atomic checkpoint writes:** All checkpoints use temporary files with atomic rename to prevent corruption from mid-write crashes. DDP-safe: rank-0 performs writes with failure broadcasting to prevent deadlocks.
 - **Deterministic split assignment:** SHA-256 hashes of locus identifiers produce identical train/validation splits across runs.
 - **Contig collision detection:** The corpus builder aborts if two species share contig names, preventing silent locus-identifier aliasing.
@@ -370,25 +371,35 @@ Training outputs are saved to `models/foundation_felid/`. The best checkpoint (l
 
 Training resumes automatically from the latest checkpoint if one exists.
 
-### Step 4: Prepare Jaguar Fine-tuning Data
+### Step 4: Acquire Jaguar Raw Data
 
-Extract 512 bp locus-centered windows from jaguar VCF files. This step requires:
+Download the jaguar VCF and location CSV. Both files are hosted on HuggingFace as public datasets and can be fetched without credentials:
 
-1. **Reference FASTA:** The DNA Zoo *Panthera onca* HiC assembly.
-2. **VCF files:** Per-sample variant calls aligned to the DNA Zoo reference.
-3. **Metadata CSV:** A file with columns: `sample_id`, `individual_id`, `biome_population_label`, `latitude`, `longitude`.
+```bash
+uv run python -m jaguar_geo_assign.cli acquire-jaguar-raw-data
+```
+
+This downloads to `data/raw/` by default:
+- `jaguar.57samples.allChr.snps.hardFilter.bi.maf.ld.masked.hwe.recode.vcf` (147 MB) — hard-filtered, MAF/LD/HWE-cleaned SNPs for 57 jaguar samples; originally published on DataDryad (doi:10.5061/dryad.4tmpg4fkm, CC0)
+- `jaguar_location.csv` — sample metadata with columns: `sample_id`, `individual_id`, `latitude`, `longitude`, `biome_population_label`
+
+Both files are SHA-256 verified on download. Pass `--output-dir` to change the destination.
+
+### Step 5: Prepare Jaguar Fine-tuning Data
+
+Extract 512 bp locus-centered windows from jaguar VCF files. This step requires both files from Step 4 and the DNA Zoo *Panthera onca* HiC reference FASTA from Step 1:
 
 ```bash
 uv run python -m jaguar_geo_assign.cli extract-finetune-windows \
-  --reference-fasta data/raw/reference/Panthera_onca_HiC.fasta.gz \
-  --vcf data/raw/jaguar/variants.vcf.gz \
-  --metadata-csv data/raw/jaguar/metadata.csv \
+  --reference-fasta data/raw/felid_foundation/reference/DNAZOO_Panthera_onca_HiC.fna.gz \
+  --vcf data/raw/jaguar.57samples.allChr.snps.hardFilter.bi.maf.ld.masked.hwe.recode.vcf \
+  --metadata-csv data/raw/jaguar_location.csv \
   --output-jsonl data/processed/finetune/windows.jsonl
 ```
 
 The window extraction produces a JSONL file of `FinetuneWindow` records. Each record contains the 512 bp sequence, allele annotations, genotype, and genomic coordinates.
 
-### Step 5: Run Multi-Task Fine-tuning
+### Step 6: Run Multi-Task Fine-tuning
 
 ```bash
 uv run python -m jaguar_geo_assign.cli fine-tune \
@@ -426,6 +437,8 @@ src/jaguar_geo_assign/
 ├── data/
 │   ├── felid_assemblies.py         # Approved felid assembly registry (6 species)
 │   ├── felid_acquisition.py        # Assembly download with checksum verification
+│   ├── jaguar_raw_data.py          # Jaguar VCF + location CSV registry with pinned SHA-256
+│   ├── jaguar_raw_acquisition.py   # Jaguar raw data download with checksum verification
 │   ├── finetune_windows.py         # Jaguar VCF → 512 bp locus-centered windows
 │   ├── consensus.py                # VCF parsing helpers shared with fine-tuning
 │   ├── preprocessor.py             # Core preprocessing pipeline

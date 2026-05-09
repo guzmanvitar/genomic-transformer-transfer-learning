@@ -160,6 +160,17 @@ def build_parser() -> argparse.ArgumentParser:
         help="Run integration test mode (no HF Hub access needed for tiny model).",
     )
 
+    jaguar_acquire = subparsers.add_parser(
+        "acquire-jaguar-raw-data",
+        help="Download jaguar VCF and location CSV to data/raw/ (or --output-dir).",
+    )
+    jaguar_acquire.add_argument(
+        "--output-dir",
+        type=Path,
+        default=Path("data/raw"),
+        help="Destination directory for the downloaded files (default: data/raw/).",
+    )
+
     extract_windows = subparsers.add_parser(
         "extract-finetune-windows",
         help="Extract 512 bp locus-centered windows from jaguar VCF files.",
@@ -304,6 +315,19 @@ def main(argv: Sequence[str] | None = None) -> int:
         except (RuntimeError, ValueError) as error:
             print(str(error))
             return 1
+        return 0
+
+    if args.command == "acquire-jaguar-raw-data":
+        from .data.jaguar_raw_acquisition import JaguarRawAcquisitionError, acquire_jaguar_raw_data
+
+        try:
+            summary = acquire_jaguar_raw_data(args.output_dir)
+        except JaguarRawAcquisitionError as error:
+            print(str(error))
+            return 1
+        print("Jaguar raw data acquisition summary:")
+        print(f"  Total bytes written: {summary.total_bytes_written}")
+        print(f"  Skipped (already present): {summary.skipped_count}")
         return 0
 
     if args.command == "extract-finetune-windows":
