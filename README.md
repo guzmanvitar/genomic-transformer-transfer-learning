@@ -109,7 +109,7 @@ The species list is closed and pinned in code. Adding a species requires a code 
 | Max ambiguous fraction | 5% | Windows with more than 5% N bases are discarded; these carry minimal informative signal and introduce noise |
 | Short sequence filter | Enabled | Sequences shorter than 512 bp are dropped to ensure uniform window dimensions |
 
-**Locus block alignment:** Before windowing, each contig is partitioned into 2,048 bp blocks. Windows are then aligned within blocks, ensuring that no window ever spans a block boundary. This is critical for split safety — the train/validation split operates at the block level, so block alignment guarantees that overlapping windows from adjacent genomic positions land in the same split.
+**Locus block alignment:** Before windowing, each contig is partitioned into 50 kb (50,000 bp) blocks. Windows are then aligned within blocks, ensuring that no window ever spans a block boundary. This is critical for split safety — the train/validation split operates at the block level, so block alignment guarantees that overlapping windows from adjacent genomic positions land in the same split. The 50 kb block size is chosen to exceed the autocorrelation length of most local genomic features (GC content, repeat elements, recombination rate), ensuring that windows near the boundary of a training block and windows near the boundary of an adjacent validation block are separated by enough genomic distance to be statistically independent. A smaller block size would create frequent split boundaries where nearly identical genomic contexts appear in both splits, inflating validation performance.
 
 **Tokenization:** Sequences are tokenized using the DNABERT-2 BPE tokenizer (`zhihan1996/DNABERT-2-117M`), pinned to a specific Git revision for exact reproducibility. The BPE scheme reduces redundancy compared to fixed k-mer tokenization, producing more compact representations while naturally handling variable motif lengths. The allowed alphabet is strictly {A, C, G, T, N}; sequences containing out-of-alphabet symbols are rejected.
 
@@ -117,7 +117,7 @@ The species list is closed and pinned in code. Adding a species requires a code 
 
 A locus-block-based splitting strategy prevents data leakage between train and validation sets. Because overlapping windows from nearby genomic positions share most of their sequence content, a naive random split would leak training signal into evaluation.
 
-**Strategy:** Each 2,048 bp genomic block is assigned deterministically to either train (80%) or validation (20%) via a SHA-256 hash of its locus identifier (`contig:block_start-block_end`). All windows within a block inherit its split assignment. This ensures:
+**Strategy:** Each 50 kb genomic block is assigned deterministically to either train (80%) or validation (20%) via a SHA-256 hash of its locus identifier (`contig:block_start-block_end`). All windows within a block inherit its split assignment. This ensures:
 
 - No window in the validation set overlaps with any training window.
 - The split is deterministic across runs (same locus identifiers always hash to the same split).
