@@ -18,6 +18,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
+import jaguar_geo_assign.pretrain.felid_foundation_pipeline as felid_foundation_pipeline
 from jaguar_geo_assign.config import load_felid_foundation_pipeline_config
 from jaguar_geo_assign.data.acquisition import DownloadAsset, DownloadResult
 from jaguar_geo_assign.data.preprocessor import TokenizedWindow
@@ -496,6 +497,63 @@ def test_run_pretrain_streaming_memory_model(tmp_path):
     # The tokenizer should have seen both species, but only one at a time
     assert species_seen_at_once == {"felis_catus", "panthera_leo"}
     assert max_concurrent_species == 1
+
+
+def test_run_pretrain_streams_tokenized_windows_in_chunks(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+):
+    """Single-species writes are chunked so tokenized windows never fully materialize."""
+    monkeypatch.setattr(
+        felid_foundation_pipeline,
+        "_TOKENIZED_WINDOW_CHUNK_SIZE",
+        2,
+    )
+
+    config_path = _build_fixture_config(
+        tmp_path,
+        [("Felis catus", "GCF_000181335.3")],
+    )
+    reference_dir = tmp_path / "reference"
+    reference_dir.mkdir(exist_ok=True)
+    (reference_dir / "GCF_000181335.3.fna.gz").write_bytes(
+        _build_fixture_fasta({"NC_chunked": "A" * 1600})
+    )
+
+    batch_sizes: list[int] = []
+
+    def fake_tokenizer_loader(provenance):
+        def fake_tokenizer(sequence, **kwargs):
+            n = min(max(1, len(sequence) // 6), provenance.max_position_embeddings)
+            return {"input_ids": list(range(n)), "attention_mask": [1] * n}
+
+        return fake_tokenizer, provenance
+
+    def fake_export_writer(*args, **kwargs):
+        writer = MagicMock()
+        writer.__enter__ = MagicMock(return_value=writer)
+        writer.__exit__ = MagicMock(return_value=False)
+
+        def capture_batch(windows):
+            batch_sizes.append(len(tuple(windows)))
+
+        writer.write_batch = capture_batch
+        return writer
+
+    result = run_felid_foundation_pretrain(
+        config_path,
+        tokenizer_loader=fake_tokenizer_loader,
+        export_writer=fake_export_writer,
+    )
+
+    assert len(batch_sizes) >= 2
+    assert max(batch_sizes) == 2
+    assert all(size == 2 for size in batch_sizes[:-1])
+    assert batch_sizes[-1] <= 2
+    felis_stats = next(
+        stats for stats in result.per_species_stats if stats.species_slug == "felis_catus"
+    )
+    assert sum(felis_stats.window_counts_by_split.values()) == sum(batch_sizes)
+    assert felis_stats.peak_window_count_in_memory == 2
 
 
 def test_run_summary_schema_exact_keys(tmp_path):
