@@ -14,6 +14,7 @@ The download is fully idempotent: invoking this function twice in a row
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import time
 from collections.abc import Callable
@@ -97,32 +98,35 @@ def acquire_jaguar_raw_data(
     total_bytes_written = 0
     skipped_count = 0
 
-    for asset_meta, asset in zip(JAGUAR_RAW_ASSETS, manifest, strict=False):
+    for asset_meta, asset in zip(JAGUAR_RAW_ASSETS, manifest, strict=True):
         _log_start(asset_meta)
 
-        if asset.destination.exists() and _checksum_matches(asset.destination, asset):
-            _LOGGER.info(
-                'skip name=%s reason="checksum match" destination=%s',
-                asset_meta.name,
-                asset.destination,
-            )
-            results.append(
-                DownloadResult(
-                    path=asset.destination,
-                    attempts=0,
-                    resumed=False,
-                    skipped_existing=True,
-                    bytes_written=0,
-                )
-            )
-            skipped_count += 1
-            continue
-
         if asset.destination.exists():
+            actual = _compute_checksum(asset.destination, asset.checksum_name)
+            if actual == asset.checksum:
+                _LOGGER.info(
+                    'skip name=%s reason="checksum match" destination=%s',
+                    asset_meta.name,
+                    asset.destination,
+                )
+                results.append(
+                    DownloadResult(
+                        path=asset.destination,
+                        attempts=0,
+                        resumed=False,
+                        skipped_existing=True,
+                        bytes_written=0,
+                    )
+                )
+                skipped_count += 1
+                continue
             _LOGGER.info(
-                "verify_mismatch_redownload name=%s destination=%s",
+                "verify_mismatch_redownload name=%s destination=%s "
+                'reason="checksum mismatch; hash=%s expected=%s"',
                 asset_meta.name,
                 asset.destination,
+                actual,
+                asset.checksum,
             )
             asset.destination.unlink()
 
@@ -166,11 +170,9 @@ def _log_start(asset: JaguarRawAsset) -> None:
     _LOGGER.info("start name=%s url=%s", asset.name, asset.url)
 
 
-def _checksum_matches(path: Path, asset: object) -> bool:
-    import hashlib
-
-    hasher = hashlib.new(asset.checksum_name)
+def _compute_checksum(path: Path, algorithm: str) -> str:
+    hasher = hashlib.new(algorithm)
     with path.open("rb") as fh:
         for chunk in iter(lambda: fh.read(1024 * 1024), b""):
             hasher.update(chunk)
-    return hasher.hexdigest() == asset.checksum
+    return hasher.hexdigest()
