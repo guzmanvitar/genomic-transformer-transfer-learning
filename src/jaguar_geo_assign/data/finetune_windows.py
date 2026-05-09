@@ -17,6 +17,7 @@ accept records the other rejects.
 
 from __future__ import annotations
 
+import csv
 import json
 import logging
 import warnings
@@ -831,3 +832,107 @@ def extract_fasta_windows_for_sample(
     if output_jsonl is not None:
         write_locus_windows_jsonl(windows, output_jsonl)
     return windows
+
+
+@dataclass(frozen=True)
+class WindowExtractionResult:
+    """Summary returned by :func:`extract_windows_for_samples`."""
+
+    total_windows: int
+    samples_processed: int
+    samples_skipped: int
+    output_path: Path
+
+
+def extract_windows_for_samples(
+    *,
+    reference_fasta: str | Path,
+    vcf: str | Path,
+    metadata_csv: str | Path,
+    output_jsonl: str | Path,
+    positive_reference_tokens: Sequence[str] = POSITIVE_REFERENCE_TOKENS,
+    negative_reference_tokens: Sequence[str] = NEGATIVE_REFERENCE_TOKENS,
+) -> WindowExtractionResult:
+    """Orchestrate multi-sample window extraction from a single VCF.
+
+    Loads the reference FASTA exactly once, reads sample IDs from the
+    metadata CSV, and streams windows for every sample into a combined
+    JSONL file.
+
+    Args:
+        reference_fasta: Path to the DNA Zoo Panthera onca HiC reference.
+        vcf: Path to the (possibly multi-sample) VCF.
+        metadata_csv: CSV with at least a ``sample_id`` column.
+        output_jsonl: Destination JSONL path.
+        positive_reference_tokens: Build tokens for the FASTA.
+        negative_reference_tokens: Forbidden build tokens.
+
+    Returns:
+        A :class:`WindowExtractionResult` summarising the run.
+
+    Raises:
+        ValueError: If the metadata CSV is missing a ``sample_id`` column
+            or contains no sample rows.
+    """
+    csv_path = Path(metadata_csv)
+    sample_ids: list[str] = []
+    with csv_path.open("r", encoding="utf-8", newline="") as handle:
+        reader = csv.DictReader(handle)
+        if reader.fieldnames is None or "sample_id" not in reader.fieldnames:
+            raise ValueError(f"Metadata CSV {csv_path} is missing a 'sample_id' column.")
+        for row in reader:
+            sid = row.get("sample_id", "").strip()
+            if sid:
+                sample_ids.append(sid)
+    if not sample_ids:
+        raise ValueError(f"Metadata CSV {csv_path} contains no rows with a non-empty sample_id.")
+
+    reference = load_reference_index(
+        reference_fasta,
+        positive_reference_tokens=positive_reference_tokens,
+        negative_reference_tokens=negative_reference_tokens,
+    )
+
+    vcf_path = Path(vcf)
+    output_path = Path(output_jsonl)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    total_windows = 0
+    samples_processed = 0
+    samples_skipped = 0
+
+    with output_path.open("w", encoding="utf-8") as handle:
+        for sample_id in sample_ids:
+            try:
+                for window in iter_locus_windows_from_vcf(
+                    sample_id=sample_id,
+                    sample_vcf=vcf_path,
+                    reference=reference,
+                    positive_reference_tokens=positive_reference_tokens,
+                    negative_reference_tokens=negative_reference_tokens,
+                ):
+                    handle.write(json.dumps(asdict(window)) + "\n")
+                    total_windows += 1
+                samples_processed += 1
+            except AcquisitionError:
+                _LOGGER.warning(
+                    "Skipping sample %r: not found in VCF %s",
+                    sample_id,
+                    vcf_path,
+                )
+                samples_skipped += 1
+
+    if samples_processed == 0:
+        _LOGGER.warning(
+            "No samples were successfully processed from %s. "
+            "Check that sample IDs in %s match the VCF sample columns.",
+            vcf_path,
+            csv_path,
+        )
+
+    return WindowExtractionResult(
+        total_windows=total_windows,
+        samples_processed=samples_processed,
+        samples_skipped=samples_skipped,
+        output_path=output_path,
+    )
