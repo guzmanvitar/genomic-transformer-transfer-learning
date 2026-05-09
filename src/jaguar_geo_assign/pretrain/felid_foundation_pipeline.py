@@ -813,6 +813,15 @@ def run_felid_foundation_pretrain(
                         stats_by_slug=stats_by_slug,
                     ),
                 )
+            if run_failure is None:
+                completed_total_windows = sum(
+                    sum(stats.window_counts_by_split.values()) for stats in stats_by_slug.values()
+                )
+                if completed_total_windows == 0:
+                    raise RuntimeError(
+                        "Felid foundation pretrain produced zero tokenized windows across all "
+                        "species; check windowing/ambiguity filters and per-species FASTA contents"
+                    )
             if run_failure is not None:
                 _LOGGER.warning(
                     "felid_foundation_interrupted completed_species=%d remaining_species=%d",

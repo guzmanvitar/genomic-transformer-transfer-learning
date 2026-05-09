@@ -622,6 +622,98 @@ def test_run_summary_schema_exact_keys(tmp_path):
     assert set(summary["totals"].keys()) == {"train", "validation"}
 
 
+def test_run_pretrain_resume_skips_checkpointed_species(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A restarted run should skip species already recorded in ``checkpoint.json``.
+
+    This guards the operator-interrupt path: species that finished before the
+    interruption must be checkpointed once, preserved in the resumed summary,
+    and never re-enter ``_run_single_species`` after restart.
+    """
+    config_path = _build_fixture_config(
+        tmp_path,
+        [
+            ("Felis catus", "GCF_000181335.3"),
+            ("Panthera leo", "GCF_018350215.1"),
+        ],
+    )
+    reference_dir = tmp_path / "reference"
+    reference_dir.mkdir(exist_ok=True)
+    (reference_dir / "GCF_000181335.3.fna.gz").write_bytes(
+        _build_fixture_fasta({"NC_felis": "A" * 1000})
+    )
+    (reference_dir / "GCF_018350215.1.fna.gz").write_bytes(
+        _build_fixture_fasta({"NC_leo": "C" * 1000})
+    )
+
+    def fake_tokenizer_loader(provenance):
+        """Return a deterministic local tokenizer stub for the resume test."""
+
+        def fake_tokenizer(sequence, **kwargs):
+            """Emit bounded token IDs so the test stays fast and offline."""
+            n = min(max(1, len(sequence) // 6), provenance.max_position_embeddings)
+            return {"input_ids": list(range(n)), "attention_mask": [1] * n}
+
+        return fake_tokenizer, provenance
+
+    real_run_single_species = felid_foundation_pipeline._run_single_species
+    first_run_calls: list[str] = []
+
+    def interrupting_run_single_species(**kwargs):
+        """Interrupt on the second explicit species after checkpointing the first."""
+        species_slug = kwargs["entry"].species_slug
+        first_run_calls.append(species_slug)
+        if species_slug == "panthera_leo":
+            raise KeyboardInterrupt("simulated interrupt")
+        return real_run_single_species(**kwargs)
+
+    monkeypatch.setattr(
+        felid_foundation_pipeline,
+        "_run_single_species",
+        interrupting_run_single_species,
+    )
+
+    with pytest.raises(KeyboardInterrupt, match="simulated interrupt"):
+        run_felid_foundation_pretrain(config_path, tokenizer_loader=fake_tokenizer_loader)
+
+    checkpoint_path = tmp_path / "artifacts" / "checkpoint.json"
+    interrupted_checkpoint = json.loads(checkpoint_path.read_text(encoding="utf-8"))
+    completed_before_resume = interrupted_checkpoint["completed_species"]
+    assert completed_before_resume
+    assert "panthera_leo" not in completed_before_resume
+    assert first_run_calls[-1] == "panthera_leo"
+
+    resume_calls: list[str] = []
+
+    def tracking_run_single_species(**kwargs):
+        """Record resumed species execution so checkpoint skipping is observable."""
+        resume_calls.append(kwargs["entry"].species_slug)
+        return real_run_single_species(**kwargs)
+
+    monkeypatch.setattr(
+        felid_foundation_pipeline,
+        "_run_single_species",
+        tracking_run_single_species,
+    )
+
+    result = run_felid_foundation_pretrain(config_path, tokenizer_loader=fake_tokenizer_loader)
+
+    resumed_checkpoint = json.loads(checkpoint_path.read_text(encoding="utf-8"))
+    assert set(completed_before_resume).isdisjoint(resume_calls)
+    assert resume_calls[0] == "panthera_leo"
+    assert (
+        resumed_checkpoint["completed_species"][: len(completed_before_resume)]
+        == completed_before_resume
+    )
+    assert len(resumed_checkpoint["completed_species"]) == len(result.per_species_stats)
+    assert set(completed_before_resume).issubset(
+        {stats.species_slug for stats in result.per_species_stats}
+    )
+    assert result.artifacts.summary_path.exists()
+
+
 def test_ambiguity_threshold_boundary_retained(tmp_path):
     """A window whose ambiguity_fraction == max_ambiguity_fraction exactly is retained."""
     config_path = _build_fixture_config(
