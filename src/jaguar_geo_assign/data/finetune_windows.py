@@ -29,6 +29,7 @@ from .acquisition import AcquisitionError
 from .consensus import (
     PASSING_FILTER_VALUES,
     ContigMismatchError,
+    MalformedGenotypeError,
     ReferenceMismatchError,
     _matches_expected_reference_build,
     _normalize_alt_alleles,
@@ -914,6 +915,15 @@ def extract_windows_for_samples(
                     handle.write(json.dumps(asdict(window)) + "\n")
                     total_windows += 1
                 samples_processed += 1
+            except (
+                ContigMismatchError,
+                ReferenceMismatchError,
+                ReferenceBaseMismatchError,
+                PloidyError,
+                InvalidAlleleAlphabetError,
+                MalformedGenotypeError,
+            ):
+                raise
             except AcquisitionError:
                 _LOGGER.warning(
                     "Skipping sample %r: not found in VCF %s",

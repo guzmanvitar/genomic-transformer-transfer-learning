@@ -273,6 +273,27 @@ def test_fine_tune_returns_1_on_error(
     assert "boom" in captured.out
 
 
+def test_fine_tune_without_config_and_without_integration_test_returns_1(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """``fine-tune`` with no --config and no --integration-test must fail with a clear message."""
+    exit_code = main(["fine-tune"])
+
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    assert "--config is required" in captured.out
+
+
+def test_fine_tune_integration_test_without_config_succeeds() -> None:
+    """``fine-tune --integration-test`` must run without requiring --config."""
+    with patch("jaguar_geo_assign.fine_tune.trainer.integration_test") as mock_integration:
+        with patch("jaguar_geo_assign.fine_tune.trainer.run_jaguar_mtl_training"):
+            exit_code = main(["fine-tune", "--integration-test"])
+
+    assert exit_code == 0
+    mock_integration.assert_called_once_with(use_real_model=False)
+
+
 def test_extract_finetune_windows_dispatches(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],

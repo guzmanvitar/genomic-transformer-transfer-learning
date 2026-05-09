@@ -711,3 +711,37 @@ def test_extract_windows_for_samples_rejects_missing_column(tmp_path: Path):
             positive_reference_tokens=_TEST_BUILD_TOKENS,
             negative_reference_tokens=[],
         )
+
+
+@pytest.mark.parametrize(
+    "error_cls",
+    [ContigMismatchError, ReferenceMismatchError, ReferenceBaseMismatchError, PloidyError],
+)
+def test_extract_windows_for_samples_propagates_data_quality_errors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, error_cls
+):
+    """Assembly-level errors must propagate rather than being silently skipped."""
+    from jaguar_geo_assign.data import finetune_windows as fw_mod
+
+    fasta, vcf = _write_fixture(
+        tmp_path,
+        _build_vcf(["chr1\t300\t.\tA\tT\t.\tPASS\t.\tGT\t1/1"]),
+    )
+    csv_path = tmp_path / "metadata.csv"
+    csv_path.write_text("sample_id\ncat_1\n", encoding="utf-8")
+
+    monkeypatch.setattr(
+        fw_mod,
+        "iter_locus_windows_from_vcf",
+        lambda **_: (_ for _ in ()).throw(error_cls("synthetic error")),
+    )
+
+    with pytest.raises(error_cls, match="synthetic error"):
+        extract_windows_for_samples(
+            reference_fasta=fasta,
+            vcf=vcf,
+            metadata_csv=csv_path,
+            output_jsonl=tmp_path / "out.jsonl",
+            positive_reference_tokens=_TEST_BUILD_TOKENS,
+            negative_reference_tokens=[],
+        )

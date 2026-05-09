@@ -87,8 +87,9 @@ def build_parser() -> argparse.ArgumentParser:
     fine_tune.add_argument(
         "--config",
         type=Path,
-        required=True,
-        help="Path to the MTL fine-tuning TOML config.",
+        required=False,
+        default=None,
+        help="Path to the MTL fine-tuning TOML config. Required unless --integration-test is set.",
     )
     fine_tune.add_argument(
         "--integration-test",
@@ -286,6 +287,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0
 
     if args.command == "fine-tune":
+        if not args.integration_test and args.config is None:
+            print("error: --config is required unless --integration-test is set.")
+            return 1
+
         from .fine_tune.trainer import integration_test as mtl_integration_test
         from .fine_tune.trainer import run_jaguar_mtl_training
 
