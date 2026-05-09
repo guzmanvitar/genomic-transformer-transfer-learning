@@ -35,7 +35,7 @@ drop_short_sequences = true
 [split]
 strategy = "global_locus_block"
 locus_key_fields = ["contig", "block_id"]
-locus_block_size = 2048
+locus_block_size = 50000
 assignment_stage = "before_windowing"
 evaluation_target = "unseen_loci"
 baseline_policy = "reuse_locus_assignments"
