@@ -18,9 +18,15 @@ from __future__ import annotations
 
 import json
 import logging
+import multiprocessing
+import os
+import pickle
 import re
 import resource
 import sys
+import time
+import traceback
+from collections import deque
 from collections.abc import Callable, Iterable, Iterator
 from contextlib import AbstractContextManager
 from dataclasses import asdict, dataclass
@@ -55,6 +61,8 @@ _LOGGER = logging.getLogger(__name__)
 _TOKENIZED_WINDOW_CHUNK_SIZE = 10_000
 _CHECKPOINT_SCHEMA_VERSION = "1"
 _PART_FILE_NAME_PATTERN = re.compile(r"^part-(\d+)-\d+\.parquet$")
+_QUEUE_MAXSIZE_FACTOR = 2
+_WORKER_SIGTERM_TIMEOUT_SECONDS = 30.0
 
 
 class MissingFelidReferenceError(RuntimeError):
@@ -233,6 +241,52 @@ class CheckpointState:
             )
 
 
+@dataclass(frozen=True)
+class _ChunkMessage:
+    """One tokenized chunk emitted by a producer worker."""
+
+    species_slug: str
+    chunk: tuple[TokenizedWindow, ...]
+
+
+@dataclass(frozen=True)
+class _DoneMessage:
+    """Final successful completion signal for one species worker."""
+
+    species_slug: str
+    stats: FelidSpeciesPretrainStats
+
+
+@dataclass(frozen=True)
+class _ErrorMessage:
+    """Structured worker failure forwarded to the single consumer."""
+
+    species_slug: str
+    error_type: str
+    error_message: str
+    traceback_str: str
+
+
+class _QueueBatchWriter:
+    """Queue-backed ``write_batch`` adapter used inside worker processes.
+
+    The real ``TokenizedCorpusWriter`` remains owned by the main process; workers
+    only forward already-tokenized batches over IPC so all filesystem writes stay
+    single-consumer.
+    """
+
+    def __init__(self, *, species_slug: str, queue: Any) -> None:
+        self._species_slug = species_slug
+        self._queue = queue
+
+    def write_batch(self, tokenized_windows: Any) -> None:
+        """Emit a non-empty tokenized batch to the consumer queue."""
+        chunk = tuple(tokenized_windows)
+        if not chunk:
+            return
+        self._queue.put(_ChunkMessage(species_slug=self._species_slug, chunk=chunk))
+
+
 def _resolve_fasta_path(reference_dir: Path, entry: FelidSpeciesEntry) -> Path:
     """Derive the canonical ``<identifier>.fna.gz`` path for a species.
 
@@ -257,6 +311,36 @@ def _iter_fasta_contig_names(fasta_path: Path) -> Iterator[str]:
             line = raw_line.strip()
             if line.startswith(">"):
                 yield line[1:].split()[0]
+
+
+def _preflight_contig_check(species_paths: list[tuple[FelidSpeciesEntry, Path]]) -> None:
+    """Reject cross-species contig collisions before any worker is launched."""
+    contig_owner: dict[str, str] = {}
+    for entry, fasta_path in species_paths:
+        for contig_name in _iter_fasta_contig_names(fasta_path):
+            prior = contig_owner.get(contig_name)
+            if prior is not None and prior != entry.species_slug:
+                raise RuntimeError(
+                    "Cross-species contig-name collision detected: "
+                    f"contig {contig_name!r} is declared by both {prior!r} and "
+                    f"{entry.species_slug!r}; aborting before windowing to avoid "
+                    "silent locus_id aliasing"
+                )
+            contig_owner[contig_name] = entry.species_slug
+
+
+def _can_multiprocess_tokenizer_loader(tokenizer_loader: TokenizerLoader) -> bool:
+    """Return whether the loader can cross a ``spawn`` multiprocessing boundary.
+
+    Nested test doubles are intentionally not pickleable. Falling back to the
+    sequential path keeps injection-based tests working while production still
+    uses the parallel producer/consumer implementation.
+    """
+    try:
+        pickle.dumps(tokenizer_loader)
+    except Exception:
+        return False
+    return True
 
 
 def _iter_species_sequence_records(
@@ -384,6 +468,215 @@ def _write_checkpoint(checkpoint_path: Path, checkpoint: CheckpointState) -> Non
         encoding="utf-8",
     )
     temp_path.replace(checkpoint_path)
+
+
+def _terminate_workers(
+    live_processes: dict[str, multiprocessing.process.BaseProcess],
+    *,
+    sigterm_timeout: float = _WORKER_SIGTERM_TIMEOUT_SECONDS,
+) -> None:
+    """Stop all workers, escalating from SIGTERM to SIGKILL if required."""
+    for process in live_processes.values():
+        if process.is_alive():
+            process.terminate()
+    deadline = time.monotonic() + sigterm_timeout
+    for process in live_processes.values():
+        remaining = max(0.0, deadline - time.monotonic())
+        process.join(timeout=remaining)
+        if process.is_alive():
+            process.kill()
+            process.join()
+
+
+def _species_worker(
+    *,
+    entry: FelidSpeciesEntry,
+    fasta_path: Path,
+    preprocessing_config: Any,
+    provenance: TokenizerProvenance,
+    tokenizer_loader: TokenizerLoader,
+    queue: Any,
+    corpus_dir: Path,
+) -> None:
+    """Run one species in a worker and stream tokenized chunks over the queue."""
+    try:
+        tokenizer, loaded_provenance = tokenizer_loader(provenance)
+        if loaded_provenance != provenance:
+            raise RuntimeError(
+                "Worker tokenizer provenance does not match the approved config contract"
+            )
+        stats = _run_single_species(
+            entry=entry,
+            fasta_path=fasta_path,
+            preprocessing_config=preprocessing_config,
+            tokenizer=tokenizer,
+            provenance=loaded_provenance,
+            writer=_QueueBatchWriter(species_slug=entry.species_slug, queue=queue),
+            contig_owner={},
+            corpus_dir=corpus_dir,
+        )
+        queue.put(_DoneMessage(species_slug=entry.species_slug, stats=stats))
+    except BaseException as exc:
+        try:
+            queue.put(
+                _ErrorMessage(
+                    species_slug=entry.species_slug,
+                    error_type=type(exc).__name__,
+                    error_message=str(exc),
+                    traceback_str=traceback.format_exc(),
+                )
+            )
+        except Exception:
+            _LOGGER.exception(
+                "species_worker_error_report_failed species=%s pid=%d",
+                entry.species_slug,
+                os.getpid(),
+            )
+
+
+def _consume_queue(
+    *,
+    queue: Any,
+    writer: _WriterContextManager,
+    expected_species: int,
+    checkpoint_path: Path,
+    config_file: Path,
+    config_name: str,
+    completed_species: list[str],
+    stats_by_slug: dict[str, FelidSpeciesPretrainStats],
+    on_species_done: Callable[[], None],
+) -> list[FelidSpeciesPretrainStats]:
+    """Drain queue messages until every expected species finishes or one errors."""
+    done_count = 0
+    total_windows = 0
+    completed_stats: list[FelidSpeciesPretrainStats] = []
+
+    while done_count < expected_species:
+        message = queue.get()
+        if isinstance(message, _ChunkMessage):
+            writer.write_batch(message.chunk)
+            total_windows += len(message.chunk)
+            continue
+        if isinstance(message, _DoneMessage):
+            stats_by_slug[message.species_slug] = message.stats
+            completed_species.append(message.species_slug)
+            _write_checkpoint(
+                checkpoint_path,
+                _build_checkpoint(
+                    config_file=config_file,
+                    config_name=config_name,
+                    completed_species=completed_species,
+                    stats_by_slug=stats_by_slug,
+                ),
+            )
+            completed_stats.append(message.stats)
+            done_count += 1
+            on_species_done()
+            continue
+        if isinstance(message, _ErrorMessage):
+            raise RuntimeError(
+                f"Worker for {message.species_slug!r} failed "
+                f"({message.error_type}): {message.error_message}\n"
+                f"{message.traceback_str}"
+            )
+        raise RuntimeError(
+            f"Unknown message type from queue: {type(message).__name__!r}. "
+            "This indicates a version mismatch or queue corruption. Aborting."
+        )
+
+    if total_windows == 0:
+        raise RuntimeError(
+            "Felid foundation pretrain produced zero tokenized windows across all "
+            "species; check windowing/ambiguity filters and per-species FASTA contents"
+        )
+
+    return completed_stats
+
+
+def _run_parallel_pipeline(
+    species_paths: list[tuple[FelidSpeciesEntry, Path]],
+    *,
+    preprocessing_config: Any,
+    provenance: TokenizerProvenance,
+    tokenizer_loader: TokenizerLoader,
+    writer: _WriterContextManager,
+    checkpoint_path: Path,
+    config_file: Path,
+    config_name: str,
+    completed_species: list[str],
+    stats_by_slug: dict[str, FelidSpeciesPretrainStats],
+    corpus_dir: Path,
+    num_workers: int,
+    queue_maxsize_factor: int = _QUEUE_MAXSIZE_FACTOR,
+    sigterm_timeout: float = _WORKER_SIGTERM_TIMEOUT_SECONDS,
+) -> list[FelidSpeciesPretrainStats]:
+    """Run spawn-based producer workers and a single main-process consumer."""
+    completed_species_set = set(completed_species)
+    already_completed = [
+        entry.species_slug
+        for entry, _fasta_path in species_paths
+        if entry.species_slug in completed_species_set
+    ]
+    if already_completed:
+        raise ValueError(
+            "Parallel species dispatch received checkpointed species unexpectedly: "
+            + ", ".join(sorted(already_completed))
+        )
+    if not species_paths:
+        return []
+
+    ctx = multiprocessing.get_context("spawn")
+    queue = ctx.Queue(maxsize=max(1, queue_maxsize_factor * num_workers))
+    pending: deque[tuple[FelidSpeciesEntry, Path]] = deque(species_paths[num_workers:])
+    live_processes: dict[str, multiprocessing.process.BaseProcess] = {}
+    shared_kwargs = {
+        "preprocessing_config": preprocessing_config,
+        "provenance": provenance,
+        "tokenizer_loader": tokenizer_loader,
+        "queue": queue,
+        "corpus_dir": corpus_dir,
+    }
+
+    def _start_worker(entry: FelidSpeciesEntry, fasta_path: Path) -> None:
+        """Launch a producer for exactly one species."""
+        process = ctx.Process(
+            target=_species_worker,
+            kwargs={"entry": entry, "fasta_path": fasta_path, **shared_kwargs},
+            daemon=True,
+        )
+        process.start()
+        live_processes[entry.species_slug] = process
+
+    def _dispatch_next() -> None:
+        """Start the next queued species after one finishes."""
+        if pending:
+            _start_worker(*pending.popleft())
+
+    for entry, fasta_path in species_paths[:num_workers]:
+        _start_worker(entry, fasta_path)
+
+    try:
+        completed_stats = _consume_queue(
+            queue=queue,
+            writer=writer,
+            expected_species=len(species_paths),
+            checkpoint_path=checkpoint_path,
+            config_file=config_file,
+            config_name=config_name,
+            completed_species=completed_species,
+            stats_by_slug=stats_by_slug,
+            on_species_done=_dispatch_next,
+        )
+        for process in live_processes.values():
+            process.join(timeout=2)
+            if process.is_alive():
+                process.kill()
+                process.join()
+        return completed_stats
+    except BaseException:
+        queue.cancel_join_thread()
+        _terminate_workers(live_processes, sigterm_timeout=sigterm_timeout)
+        raise
 
 
 def _restore_completed_contig_owners(
@@ -518,10 +811,11 @@ def _run_single_species(
             declared by a different species earlier in the run.
     """
     _LOGGER.info(
-        "species_start species=%s identifier=%s fasta=%s",
+        "species_start species=%s identifier=%s fasta=%s pid=%d",
         entry.species_slug,
         entry.identifier,
         fasta_path,
+        os.getpid(),
     )
 
     contig_count = 0
@@ -633,11 +927,12 @@ def _run_single_species(
 
     peak_rss_bytes = _read_peak_rss_bytes()
     _LOGGER.info(
-        "species_end species=%s identifier=%s windows=%d peak_rss_bytes=%d",
+        "species_end species=%s identifier=%s windows=%d peak_rss_bytes=%d pid=%d",
         entry.species_slug,
         entry.identifier,
         windows_tokenized_count,
         peak_rss_bytes,
+        os.getpid(),
     )
 
     return FelidSpeciesPretrainStats(
@@ -737,9 +1032,6 @@ def run_felid_foundation_pretrain(
 
     preprocessing_config = _build_preprocessing_config(config)
     expected_provenance = _build_tokenizer_provenance(config)
-    tokenizer, provenance = tokenizer_loader(expected_provenance)
-    _assert_tokenizer_matches_config(config, provenance)
-
     export_contract = _build_export_contract(config)
     corpus_dir = processed_dir / "felid_foundation_tokens"
     checkpoint = _load_checkpoint(
@@ -751,11 +1043,6 @@ def run_felid_foundation_pretrain(
     contig_owner: dict[str, str] = {}
     completed_species = list(checkpoint.completed_species)
     stats_by_slug = {stats.species_slug: stats for stats in checkpoint.per_species_stats}
-    _restore_completed_contig_owners(
-        completed_species=completed_species,
-        species_paths=species_paths,
-        contig_owner=contig_owner,
-    )
 
     completed_species_set = set(completed_species)
     remaining_species_paths = [
@@ -771,6 +1058,24 @@ def run_felid_foundation_pretrain(
                 checkpoint_path,
             )
 
+    parallel_worker_count = min(len(remaining_species_paths), max(1, os.cpu_count() or 1))
+    use_parallel_pipeline = (
+        len(remaining_species_paths) > 0
+        and parallel_worker_count > 1
+        and _can_multiprocess_tokenizer_loader(tokenizer_loader)
+    )
+    if use_parallel_pipeline:
+        provenance = expected_provenance
+        _preflight_contig_check(species_paths)
+    else:
+        tokenizer, provenance = tokenizer_loader(expected_provenance)
+        _assert_tokenizer_matches_config(config, provenance)
+        _restore_completed_contig_owners(
+            completed_species=completed_species,
+            species_paths=species_paths,
+            contig_owner=contig_owner,
+        )
+
     run_failure: BaseException | None = None
     run_failure_tb = None
     if remaining_species_paths:
@@ -785,34 +1090,49 @@ def run_felid_foundation_pretrain(
                     corpus_dir=corpus_dir,
                     provenance=provenance,
                 )
-            for entry, fasta_path in remaining_species_paths:
-                try:
-                    stats = _run_single_species(
-                        entry=entry,
-                        fasta_path=fasta_path,
+            try:
+                if use_parallel_pipeline:
+                    _run_parallel_pipeline(
+                        remaining_species_paths,
                         preprocessing_config=preprocessing_config,
-                        tokenizer=tokenizer,
                         provenance=provenance,
+                        tokenizer_loader=tokenizer_loader,
                         writer=writer,
-                        contig_owner=contig_owner,
-                        corpus_dir=corpus_dir,
-                    )
-                except BaseException as exc:
-                    run_failure = exc
-                    run_failure_tb = exc.__traceback__
-                    break
-                stats_by_slug[stats.species_slug] = stats
-                completed_species.append(stats.species_slug)
-                completed_species_set.add(stats.species_slug)
-                _write_checkpoint(
-                    checkpoint_path,
-                    _build_checkpoint(
+                        checkpoint_path=checkpoint_path,
                         config_file=config_file,
                         config_name=config.name,
                         completed_species=completed_species,
                         stats_by_slug=stats_by_slug,
-                    ),
-                )
+                        corpus_dir=corpus_dir,
+                        num_workers=parallel_worker_count,
+                    )
+                else:
+                    for entry, fasta_path in remaining_species_paths:
+                        stats = _run_single_species(
+                            entry=entry,
+                            fasta_path=fasta_path,
+                            preprocessing_config=preprocessing_config,
+                            tokenizer=tokenizer,
+                            provenance=provenance,
+                            writer=writer,
+                            contig_owner=contig_owner,
+                            corpus_dir=corpus_dir,
+                        )
+                        stats_by_slug[stats.species_slug] = stats
+                        completed_species.append(stats.species_slug)
+                        completed_species_set.add(stats.species_slug)
+                        _write_checkpoint(
+                            checkpoint_path,
+                            _build_checkpoint(
+                                config_file=config_file,
+                                config_name=config.name,
+                                completed_species=completed_species,
+                                stats_by_slug=stats_by_slug,
+                            ),
+                        )
+            except BaseException as exc:
+                run_failure = exc
+                run_failure_tb = exc.__traceback__
             if run_failure is None:
                 completed_total_windows = sum(
                     sum(stats.window_counts_by_split.values()) for stats in stats_by_slug.values()

@@ -36,6 +36,30 @@ from tests._felid_fixture import placeholder_fasta_checksum as _placeholder_fast
 from tests._felid_fixture import write_placeholder_fastas as _write_placeholder_fastas
 
 
+def _spawn_safe_fake_tokenizer_loader(provenance):
+    """Return a module-level tokenizer loader usable under ``spawn`` workers."""
+
+    def fake_tokenizer(sequence, **kwargs):
+        """Emit deterministic token IDs without touching external model state."""
+        n = min(max(1, len(sequence) // 6), provenance.max_position_embeddings)
+        return {"input_ids": list(range(n)), "attention_mask": [1] * n}
+
+    return fake_tokenizer, provenance
+
+
+def _spawn_safe_crashing_tokenizer_loader(provenance):
+    """Return a spawn-safe tokenizer loader that crashes on C-rich windows."""
+
+    def fake_tokenizer(sequence, **kwargs):
+        """Raise on synthetic failure markers to exercise worker error plumbing."""
+        if set(sequence) == {"C"}:
+            raise RuntimeError("synthetic tokenizer crash")
+        n = min(max(1, len(sequence) // 6), provenance.max_position_embeddings)
+        return {"input_ids": list(range(n)), "attention_mask": [1] * n}
+
+    return fake_tokenizer, provenance
+
+
 def test_species_slug_derivation():
     """Species Latin binomials slugify correctly."""
     from jaguar_geo_assign.config import _slugify_species
@@ -554,6 +578,94 @@ def test_run_pretrain_streams_tokenized_windows_in_chunks(
     )
     assert sum(felis_stats.window_counts_by_split.values()) == sum(batch_sizes)
     assert felis_stats.peak_window_count_in_memory == 2
+
+
+def test_run_pretrain_parallel_producers_feed_single_consumer(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Spawn-safe tokenizer loaders should drive the multiprocessing producer path."""
+    monkeypatch.setattr(felid_foundation_pipeline.os, "cpu_count", lambda: 2)
+    config_path = _build_fixture_config(
+        tmp_path,
+        [
+            ("Felis catus", "GCF_000181335.3"),
+            ("Panthera leo", "GCF_018350215.1"),
+        ],
+    )
+    reference_dir = tmp_path / "reference"
+    reference_dir.mkdir(exist_ok=True)
+    (reference_dir / "GCF_000181335.3.fna.gz").write_bytes(
+        _build_fixture_fasta({"NC_parallel_a": "A" * 1000})
+    )
+    (reference_dir / "GCF_018350215.1.fna.gz").write_bytes(
+        _build_fixture_fasta({"NC_parallel_b": "G" * 1000})
+    )
+
+    batch_sizes: list[int] = []
+
+    def fake_export_writer(*args, **kwargs):
+        """Capture consumer-side write calls without touching parquet dependencies."""
+        writer = MagicMock()
+        writer.__enter__ = MagicMock(return_value=writer)
+        writer.__exit__ = MagicMock(return_value=False)
+
+        def capture_batch(windows):
+            """Record the chunk size observed by the single consumer writer."""
+            batch_sizes.append(len(tuple(windows)))
+
+        writer.write_batch = capture_batch
+        return writer
+
+    result = run_felid_foundation_pretrain(
+        config_path,
+        tokenizer_loader=_spawn_safe_fake_tokenizer_loader,
+        export_writer=fake_export_writer,
+    )
+
+    assert len(batch_sizes) >= 2
+    assert {stats.species_slug for stats in result.per_species_stats} >= {
+        "felis_catus",
+        "panthera_leo",
+    }
+
+
+def test_run_pretrain_parallel_worker_crash_surfaces_cleanly(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A producer crash should surface as a consumer-side ``RuntimeError``."""
+    monkeypatch.setattr(felid_foundation_pipeline.os, "cpu_count", lambda: 2)
+    config_path = _build_fixture_config(
+        tmp_path,
+        [
+            ("Felis catus", "GCF_000181335.3"),
+            ("Panthera leo", "GCF_018350215.1"),
+        ],
+    )
+    reference_dir = tmp_path / "reference"
+    reference_dir.mkdir(exist_ok=True)
+    (reference_dir / "GCF_000181335.3.fna.gz").write_bytes(
+        _build_fixture_fasta({"NC_ok": "A" * 1000})
+    )
+    (reference_dir / "GCF_018350215.1.fna.gz").write_bytes(
+        _build_fixture_fasta({"NC_crash": "C" * 1000})
+    )
+
+    def fake_export_writer(*args, **kwargs):
+        """Provide a lightweight consumer writer for the crash regression test."""
+        writer = MagicMock()
+        writer.__enter__ = MagicMock(return_value=writer)
+        writer.__exit__ = MagicMock(return_value=False)
+        writer.write_batch = MagicMock()
+        return writer
+
+    with pytest.raises(RuntimeError, match="panthera_leo|synthetic tokenizer crash"):
+        run_felid_foundation_pretrain(
+            config_path,
+            tokenizer_loader=_spawn_safe_crashing_tokenizer_loader,
+            export_writer=fake_export_writer,
+        )
 
 
 def test_run_summary_schema_exact_keys(tmp_path):
