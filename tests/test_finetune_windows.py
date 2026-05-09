@@ -29,11 +29,13 @@ from jaguar_geo_assign.data.finetune_windows import (
     FinetuneWindow,
     InvalidAlleleAlphabetError,
     PloidyError,
-    ReferenceIndex,
     ReferenceBaseMismatchError,
+    ReferenceIndex,
+    WindowExtractionResult,
     extract_fasta_window,
     extract_fasta_windows_for_sample,
     extract_locus_windows_from_vcf,
+    extract_windows_for_samples,
     load_reference_index,
 )
 
@@ -622,4 +624,90 @@ def test_iter_locus_windows_from_vcf_signature_and_rejection(tmp_path: Path):
                 positive_reference_tokens=["Panthera_onca_HiC"],
                 negative_reference_tokens=["NC_083295.1"],
             )
+        )
+
+
+def test_extract_windows_for_samples_orchestrates(tmp_path: Path):
+    """The orchestrator should load reference once and stream windows across multiple samples."""
+    vcf_text = _build_vcf(
+        [
+            "chr1\t300\t.\tA\tT\t.\tPASS\t.\tGT\t1/1\t0/1",
+            "chr1\t400\t.\tA\tG\t.\tPASS\t.\tGT\t0/1\t1/1",
+        ],
+        sample_id="cat_1\tcat_2",
+    )
+    fasta, vcf = _write_fixture(tmp_path, vcf_text)
+
+    csv_path = tmp_path / "metadata.csv"
+    csv_path.write_text("sample_id,biome\ncat_1,forest\ncat_2,savanna\n", encoding="utf-8")
+
+    output = tmp_path / "windows.jsonl"
+    result = extract_windows_for_samples(
+        reference_fasta=fasta,
+        vcf=vcf,
+        metadata_csv=csv_path,
+        output_jsonl=output,
+        positive_reference_tokens=_TEST_BUILD_TOKENS,
+        negative_reference_tokens=[],
+    )
+
+    assert isinstance(result, WindowExtractionResult)
+    assert result.samples_processed == 2
+    assert result.samples_skipped == 0
+    assert result.output_path == output
+
+    lines = output.read_text(encoding="utf-8").splitlines()
+    assert len(lines) == result.total_windows
+    assert result.total_windows > 0
+    for line in lines:
+        record = json.loads(line)
+        assert "sample_id" in record
+        assert "sequence" in record
+        assert len(record["sequence"]) == WINDOW_SIZE
+
+
+def test_extract_windows_for_samples_skips_missing_sample(tmp_path: Path):
+    """Samples absent from the VCF should be skipped without aborting the run."""
+    vcf_text = _build_vcf(
+        ["chr1\t300\t.\tA\tT\t.\tPASS\t.\tGT\t1/1"],
+        sample_id="cat_1",
+    )
+    fasta, vcf = _write_fixture(tmp_path, vcf_text)
+
+    csv_path = tmp_path / "metadata.csv"
+    csv_path.write_text("sample_id\ncat_1\ncat_99\n", encoding="utf-8")
+
+    output = tmp_path / "windows.jsonl"
+    result = extract_windows_for_samples(
+        reference_fasta=fasta,
+        vcf=vcf,
+        metadata_csv=csv_path,
+        output_jsonl=output,
+        positive_reference_tokens=_TEST_BUILD_TOKENS,
+        negative_reference_tokens=[],
+    )
+
+    assert result.samples_processed == 1
+    assert result.samples_skipped == 1
+    assert result.total_windows == 1
+
+
+def test_extract_windows_for_samples_rejects_missing_column(tmp_path: Path):
+    """A metadata CSV without a ``sample_id`` column must raise ValueError."""
+    fasta, vcf = _write_fixture(
+        tmp_path,
+        _build_vcf(["chr1\t300\t.\tA\tT\t.\tPASS\t.\tGT\t1/1"]),
+    )
+
+    csv_path = tmp_path / "metadata.csv"
+    csv_path.write_text("name,biome\ncat_1,forest\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="missing a 'sample_id' column"):
+        extract_windows_for_samples(
+            reference_fasta=fasta,
+            vcf=vcf,
+            metadata_csv=csv_path,
+            output_jsonl=tmp_path / "out.jsonl",
+            positive_reference_tokens=_TEST_BUILD_TOKENS,
+            negative_reference_tokens=[],
         )
