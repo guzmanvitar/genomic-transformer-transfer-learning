@@ -347,8 +347,10 @@ Species are processed sequentially to keep peak memory bounded by the single lar
 Train DNABERT-2 with masked language modeling on the felid corpus:
 
 ```bash
-# Edit configs/examples/felid_foundation_train.toml to set:
-#   corpus_metadata_path = "<absolute path to corpus metadata.json>"
+# Edit configs/examples/felid_foundation_train.toml to set corpus_metadata_path to the
+# metadata.json written by Step 2. Its absolute path follows directly from processed_dir
+# in felid_foundation_pretrain.toml:
+#   corpus_metadata_path = "<repo_root>/data/processed/felid_foundation_pretrain/felid_foundation_tokens/metadata.json"
 
 # Single-GPU training
 uv run python -m jaguar_geo_assign.cli train-felid-foundation \
@@ -376,18 +378,22 @@ Extract 512 bp locus-centered windows from jaguar VCF files. This step requires:
 2. **VCF files:** Per-sample variant calls aligned to the DNA Zoo reference.
 3. **Metadata CSV:** A file with columns: `sample_id`, `individual_id`, `biome_population_label`, `latitude`, `longitude`.
 
-The window extraction is performed by the `finetune_windows` module, which produces a JSONL file of `FinetuneWindow` records. Each record contains the 512 bp sequence, allele annotations, genotype, and genomic coordinates.
+> **Note:** Window extraction does not yet have a dedicated CLI command. It is invoked directly at the module level via `src/jaguar_geo_assign/data/finetune_windows.py`. A CLI entry point will be added in a future iteration.
+
+The window extraction produces a JSONL file of `FinetuneWindow` records. Each record contains the 512 bp sequence, allele annotations, genotype, and genomic coordinates.
 
 ### Step 5: Run Multi-Task Fine-tuning
 
-Configure and run the two-phase fine-tuning:
+> **Note:** The `fine-tune` CLI command is currently a scaffold — it accepts a config path but is not yet wired to the end-to-end training loop. The trainer implementation lives in `src/jaguar_geo_assign/fine_tune/trainer.py` and can be invoked directly from Python. A fully integrated CLI command will be added in a future iteration.
 
-```bash
-# Create a fine-tuning TOML config specifying:
-#   backbone_path = "models/foundation_felid/best/hf_model"
-#   windows_jsonl = "<path to extracted windows JSONL>"
-#   metadata_csv = "<path to jaguar metadata CSV>"
-#   output_dir = "models/finetune"
+The fine-tuning trainer requires a `MtlFinetuneConfig` TOML with the following fields:
+
+```toml
+[training]
+backbone_path = "models/foundation_felid/best/hf_model"
+windows_jsonl  = "<path to extracted windows JSONL>"
+metadata_csv   = "<path to jaguar metadata CSV>"
+output_dir     = "models/finetune"
 ```
 
 The fine-tuning trainer runs two phases:
