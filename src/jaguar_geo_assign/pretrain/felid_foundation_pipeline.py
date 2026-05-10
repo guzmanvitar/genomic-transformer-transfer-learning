@@ -34,6 +34,7 @@ from contextlib import AbstractContextManager
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Protocol
 
 from ..config import FelidSpeciesEntry, load_felid_foundation_pipeline_config
@@ -561,10 +562,10 @@ def _species_worker(
     """Run one species in a worker and stream tokenized chunks over the queue."""
     try:
         tokenizer, loaded_provenance = tokenizer_loader(provenance)
-        if loaded_provenance != provenance:
-            raise RuntimeError(
-                "Worker tokenizer provenance does not match the approved config contract"
-            )
+        _assert_tokenizer_matches_config(
+            SimpleNamespace(tokenizer=provenance),
+            loaded_provenance,
+        )
         stats = _run_single_species(
             entry=entry,
             fasta_path=fasta_path,
