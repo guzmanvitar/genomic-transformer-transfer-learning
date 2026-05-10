@@ -13,11 +13,14 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import threading
 from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
 
+import jaguar_geo_assign.pretrain.felid_foundation_pipeline as felid_foundation_pipeline
 from jaguar_geo_assign.config import load_felid_foundation_pipeline_config
 from jaguar_geo_assign.data.acquisition import DownloadAsset, DownloadResult
 from jaguar_geo_assign.data.preprocessor import TokenizedWindow
@@ -33,6 +36,83 @@ from tests._felid_fixture import load_example_config_dict, render_example_config
 from tests._felid_fixture import pad_species_to_full_roster as _pad_to_six_species
 from tests._felid_fixture import placeholder_fasta_checksum as _placeholder_fasta_checksum
 from tests._felid_fixture import write_placeholder_fastas as _write_placeholder_fastas
+
+
+class _EqualityMaskingTokenizerProvenance:
+    """Forge a truthy non-bool trust policy that still passes loose equality.
+
+    The parallel worker regression used a raw ``!=`` comparison, which treats
+    ``1`` and ``True`` as equal. This stand-in preserves every approved field
+    while swapping ``trust_remote_code`` to ``1`` so the test can verify that
+    the worker now enforces an actual ``bool`` before tokenization begins.
+    """
+
+    def __init__(self, provenance) -> None:
+        self.identifier = provenance.identifier
+        self.revision = provenance.revision
+        self.max_position_embeddings = provenance.max_position_embeddings
+        self.allowed_alphabet = provenance.allowed_alphabet
+        self.unsupported_symbol_policy = provenance.unsupported_symbol_policy
+        self.trust_remote_code = 1
+
+    def __eq__(self, other: object) -> bool:
+        """Mirror value-based equality so ``1 == True`` can mask the violation."""
+        return (
+            getattr(other, "identifier", None) == self.identifier
+            and getattr(other, "revision", None) == self.revision
+            and getattr(other, "max_position_embeddings", None) == self.max_position_embeddings
+            and getattr(other, "allowed_alphabet", None) == self.allowed_alphabet
+            and getattr(other, "unsupported_symbol_policy", None) == self.unsupported_symbol_policy
+            and getattr(other, "trust_remote_code", None) == self.trust_remote_code
+        )
+
+
+def _spawn_safe_fake_tokenizer_loader(provenance):
+    """Return a module-level tokenizer loader usable under ``spawn`` workers."""
+
+    def fake_tokenizer(sequence, **kwargs):
+        """Emit deterministic token IDs without touching external model state."""
+        n = min(max(1, len(sequence) // 6), provenance.max_position_embeddings)
+        return {"input_ids": list(range(n)), "attention_mask": [1] * n}
+
+    return fake_tokenizer, provenance
+
+
+def _spawn_safe_crashing_tokenizer_loader(provenance):
+    """Return a spawn-safe tokenizer loader that crashes on C-rich windows."""
+
+    def fake_tokenizer(sequence, **kwargs):
+        """Raise on synthetic failure markers to exercise worker error plumbing."""
+        if set(sequence) == {"C"}:
+            raise RuntimeError("synthetic tokenizer crash")
+        n = min(max(1, len(sequence) // 6), provenance.max_position_embeddings)
+        return {"input_ids": list(range(n)), "attention_mask": [1] * n}
+
+    return fake_tokenizer, provenance
+
+
+def _spawn_safe_abrupt_exit_tokenizer_loader(provenance):
+    """Return a spawn-safe tokenizer loader that terminates the worker immediately."""
+
+    def fake_tokenizer(sequence, **kwargs):
+        """Bypass Python exception plumbing so the parent must inspect worker exit codes."""
+        if set(sequence) == {"C"}:
+            os._exit(17)
+        n = min(max(1, len(sequence) // 6), provenance.max_position_embeddings)
+        return {"input_ids": list(range(n)), "attention_mask": [1] * n}
+
+    return fake_tokenizer, provenance
+
+
+def _spawn_safe_equality_masking_tokenizer_loader(provenance):
+    """Return a loader whose forged provenance would bypass a loose equality check."""
+
+    def fake_tokenizer(sequence, **kwargs):
+        """Emit deterministic token IDs while the test targets provenance validation only."""
+        n = min(max(1, len(sequence) // 6), provenance.max_position_embeddings)
+        return {"input_ids": list(range(n)), "attention_mask": [1] * n}
+
+    return fake_tokenizer, _EqualityMaskingTokenizerProvenance(provenance)
 
 
 def test_species_slug_derivation():
@@ -498,6 +578,343 @@ def test_run_pretrain_streaming_memory_model(tmp_path):
     assert max_concurrent_species == 1
 
 
+def test_run_pretrain_streams_tokenized_windows_in_chunks(tmp_path: Path) -> None:
+    """Single-species writes are chunked so tokenized windows never fully materialize."""
+    config_path = _build_fixture_config(
+        tmp_path,
+        [("Felis catus", "GCF_000181335.3")],
+        scalar_overrides={"pipeline.chunk_size": 2},
+    )
+    reference_dir = tmp_path / "reference"
+    reference_dir.mkdir(exist_ok=True)
+    (reference_dir / "GCF_000181335.3.fna.gz").write_bytes(
+        _build_fixture_fasta({"NC_chunked": "A" * 1600})
+    )
+
+    batch_sizes: list[int] = []
+
+    def fake_tokenizer_loader(provenance):
+        def fake_tokenizer(sequence, **kwargs):
+            n = min(max(1, len(sequence) // 6), provenance.max_position_embeddings)
+            return {"input_ids": list(range(n)), "attention_mask": [1] * n}
+
+        return fake_tokenizer, provenance
+
+    def fake_export_writer(*args, **kwargs):
+        writer = MagicMock()
+        writer.__enter__ = MagicMock(return_value=writer)
+        writer.__exit__ = MagicMock(return_value=False)
+
+        def capture_batch(windows):
+            batch_sizes.append(len(tuple(windows)))
+
+        writer.write_batch = capture_batch
+        return writer
+
+    result = run_felid_foundation_pretrain(
+        config_path,
+        tokenizer_loader=fake_tokenizer_loader,
+        export_writer=fake_export_writer,
+    )
+
+    assert len(batch_sizes) >= 2
+    assert max(batch_sizes) == 2
+    assert all(size == 2 for size in batch_sizes[:-1])
+    assert batch_sizes[-1] <= 2
+    felis_stats = next(
+        stats for stats in result.per_species_stats if stats.species_slug == "felis_catus"
+    )
+    assert sum(felis_stats.window_counts_by_split.values()) == sum(batch_sizes)
+    assert felis_stats.peak_window_count_in_memory == 2
+
+
+def test_run_pretrain_uses_pipeline_runtime_knobs_in_parallel_dispatch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Parallel dispatch should receive chunking and teardown knobs from the TOML config."""
+    monkeypatch.setattr(felid_foundation_pipeline.os, "cpu_count", lambda: 8)
+    config_path = _build_fixture_config(
+        tmp_path,
+        [
+            ("Felis catus", "GCF_000181335.3"),
+            ("Panthera leo", "GCF_018350215.1"),
+        ],
+        scalar_overrides={
+            "pipeline.chunk_size": 3,
+            "pipeline.num_workers": 2,
+            "pipeline.queue_maxsize_factor": 5,
+            "pipeline.sigterm_timeout": 0.5,
+        },
+    )
+    reference_dir = tmp_path / "reference"
+    reference_dir.mkdir(exist_ok=True)
+    (reference_dir / "GCF_000181335.3.fna.gz").write_bytes(
+        _build_fixture_fasta({"NC_parallel_a": "A" * 1000})
+    )
+    (reference_dir / "GCF_018350215.1.fna.gz").write_bytes(
+        _build_fixture_fasta({"NC_parallel_b": "G" * 1000})
+    )
+
+    captured: dict[str, object] = {}
+
+    def fake_run_parallel_pipeline(species_paths, **kwargs):
+        """Capture call-time execution knobs without launching real workers."""
+        captured["species"] = [entry.species_slug for entry, _ in species_paths]
+        captured["chunk_size"] = kwargs["chunk_size"]
+        captured["num_workers"] = kwargs["num_workers"]
+        captured["queue_maxsize_factor"] = kwargs["queue_maxsize_factor"]
+        captured["sigterm_timeout"] = kwargs["sigterm_timeout"]
+        return [
+            felid_foundation_pipeline.FelidSpeciesPretrainStats(
+                species_slug=entry.species_slug,
+                identifier=entry.identifier,
+                assembly_name=entry.assembly_name,
+                contig_count=1,
+                retained_sequence_count=1,
+                filtered_short_count=0,
+                filtered_high_ambiguity_count=0,
+                window_counts_by_split={"train": 1, "validation": 0},
+                peak_window_count_in_memory=kwargs["chunk_size"],
+                peak_rss_bytes=1,
+                bytes_tokenized=kwargs["chunk_size"],
+                export_path=str(kwargs["corpus_dir"]),
+            )
+            for entry, _ in species_paths
+        ]
+
+    monkeypatch.setattr(
+        felid_foundation_pipeline,
+        "_run_parallel_pipeline",
+        fake_run_parallel_pipeline,
+    )
+
+    def fake_export_writer(*args, **kwargs):
+        """Provide a no-op writer so the orchestration path stays lightweight."""
+        writer = MagicMock()
+        writer.__enter__ = MagicMock(return_value=writer)
+        writer.__exit__ = MagicMock(return_value=False)
+        writer.write_batch = MagicMock()
+        return writer
+
+    result = run_felid_foundation_pretrain(
+        config_path,
+        tokenizer_loader=_spawn_safe_fake_tokenizer_loader,
+        export_writer=fake_export_writer,
+    )
+
+    assert captured["chunk_size"] == 3
+    assert captured["num_workers"] == 2
+    assert captured["queue_maxsize_factor"] == 5
+    assert captured["sigterm_timeout"] == 0.5
+    assert {"felis_catus", "panthera_leo"}.issubset(set(captured["species"]))
+    assert {"felis_catus", "panthera_leo"}.issubset(
+        {stats.species_slug for stats in result.per_species_stats}
+    )
+
+
+def test_run_pretrain_parallel_producers_feed_single_consumer(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Spawn-safe tokenizer loaders should drive the multiprocessing producer path."""
+    monkeypatch.setattr(felid_foundation_pipeline.os, "cpu_count", lambda: 2)
+    config_path = _build_fixture_config(
+        tmp_path,
+        [
+            ("Felis catus", "GCF_000181335.3"),
+            ("Panthera leo", "GCF_018350215.1"),
+        ],
+    )
+    reference_dir = tmp_path / "reference"
+    reference_dir.mkdir(exist_ok=True)
+    (reference_dir / "GCF_000181335.3.fna.gz").write_bytes(
+        _build_fixture_fasta({"NC_parallel_a": "A" * 1000})
+    )
+    (reference_dir / "GCF_018350215.1.fna.gz").write_bytes(
+        _build_fixture_fasta({"NC_parallel_b": "G" * 1000})
+    )
+
+    batch_sizes: list[int] = []
+
+    def fake_export_writer(*args, **kwargs):
+        """Capture consumer-side write calls without touching parquet dependencies."""
+        writer = MagicMock()
+        writer.__enter__ = MagicMock(return_value=writer)
+        writer.__exit__ = MagicMock(return_value=False)
+
+        def capture_batch(windows):
+            """Record the chunk size observed by the single consumer writer."""
+            batch_sizes.append(len(tuple(windows)))
+
+        writer.write_batch = capture_batch
+        return writer
+
+    result = run_felid_foundation_pretrain(
+        config_path,
+        tokenizer_loader=_spawn_safe_fake_tokenizer_loader,
+        export_writer=fake_export_writer,
+    )
+
+    assert len(batch_sizes) >= 2
+    assert {stats.species_slug for stats in result.per_species_stats} >= {
+        "felis_catus",
+        "panthera_leo",
+    }
+
+
+def test_run_pretrain_parallel_worker_crash_surfaces_cleanly(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A producer crash should surface as a consumer-side ``RuntimeError``."""
+    monkeypatch.setattr(felid_foundation_pipeline.os, "cpu_count", lambda: 2)
+    config_path = _build_fixture_config(
+        tmp_path,
+        [
+            ("Felis catus", "GCF_000181335.3"),
+            ("Panthera leo", "GCF_018350215.1"),
+        ],
+    )
+    reference_dir = tmp_path / "reference"
+    reference_dir.mkdir(exist_ok=True)
+    (reference_dir / "GCF_000181335.3.fna.gz").write_bytes(
+        _build_fixture_fasta({"NC_ok": "A" * 1000})
+    )
+    (reference_dir / "GCF_018350215.1.fna.gz").write_bytes(
+        _build_fixture_fasta({"NC_crash": "C" * 1000})
+    )
+
+    def fake_export_writer(*args, **kwargs):
+        """Provide a lightweight consumer writer for the crash regression test."""
+        writer = MagicMock()
+        writer.__enter__ = MagicMock(return_value=writer)
+        writer.__exit__ = MagicMock(return_value=False)
+        writer.write_batch = MagicMock()
+        return writer
+
+    with pytest.raises(RuntimeError, match="panthera_leo|synthetic tokenizer crash"):
+        run_felid_foundation_pretrain(
+            config_path,
+            tokenizer_loader=_spawn_safe_crashing_tokenizer_loader,
+            export_writer=fake_export_writer,
+        )
+
+
+def test_run_pretrain_parallel_abrupt_worker_exit_fails_fast(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An abrupt producer exit must raise instead of blocking forever on ``queue.get``."""
+    monkeypatch.setattr(felid_foundation_pipeline.os, "cpu_count", lambda: 2)
+    config_path = _build_fixture_config(
+        tmp_path,
+        [
+            ("Felis catus", "GCF_000181335.3"),
+            ("Panthera leo", "GCF_018350215.1"),
+        ],
+        scalar_overrides={"pipeline.sigterm_timeout": 0.4},
+    )
+    reference_dir = tmp_path / "reference"
+    reference_dir.mkdir(exist_ok=True)
+    (reference_dir / "GCF_000181335.3.fna.gz").write_bytes(
+        _build_fixture_fasta({"NC_ok": "A" * 1000})
+    )
+    (reference_dir / "GCF_018350215.1.fna.gz").write_bytes(
+        _build_fixture_fasta({"NC_abrupt_exit": "C" * 1000})
+    )
+
+    def fake_export_writer(*args, **kwargs):
+        """Provide a lightweight consumer writer for the abrupt-exit regression test."""
+        writer = MagicMock()
+        writer.__enter__ = MagicMock(return_value=writer)
+        writer.__exit__ = MagicMock(return_value=False)
+        writer.write_batch = MagicMock()
+        return writer
+
+    with pytest.raises(RuntimeError, match="panthera_leo|exit code 17|waiting forever"):
+        run_felid_foundation_pretrain(
+            config_path,
+            tokenizer_loader=_spawn_safe_abrupt_exit_tokenizer_loader,
+            export_writer=fake_export_writer,
+        )
+
+
+def test_run_pretrain_parallel_worker_rejects_truthy_non_bool_trust_remote_code(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Parallel workers must reject provenance that only matches via ``1 == True``."""
+    monkeypatch.setattr(felid_foundation_pipeline.os, "cpu_count", lambda: 2)
+    config_path = _build_fixture_config(
+        tmp_path,
+        [
+            ("Felis catus", "GCF_000181335.3"),
+            ("Panthera leo", "GCF_018350215.1"),
+        ],
+    )
+    reference_dir = tmp_path / "reference"
+    reference_dir.mkdir(exist_ok=True)
+    (reference_dir / "GCF_000181335.3.fna.gz").write_bytes(
+        _build_fixture_fasta({"NC_ok_a": "A" * 1000})
+    )
+    (reference_dir / "GCF_018350215.1.fna.gz").write_bytes(
+        _build_fixture_fasta({"NC_ok_b": "G" * 1000})
+    )
+
+    def fake_export_writer(*args, **kwargs):
+        """Provide a no-op writer because the worker should fail before writing."""
+        writer = MagicMock()
+        writer.__enter__ = MagicMock(return_value=writer)
+        writer.__exit__ = MagicMock(return_value=False)
+        writer.write_batch = MagicMock()
+        return writer
+
+    with pytest.raises(
+        RuntimeError, match="Tokenizer loader trust_remote_code must be an actual boolean"
+    ):
+        run_felid_foundation_pretrain(
+            config_path,
+            tokenizer_loader=_spawn_safe_equality_masking_tokenizer_loader,
+            export_writer=fake_export_writer,
+        )
+
+
+def test_pipeline_parallel_zero_windows_leaves_no_artifacts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Parallel zero-window failures must hit writer exception cleanup before returning."""
+    monkeypatch.setattr(felid_foundation_pipeline.os, "cpu_count", lambda: 2)
+    config_path = _build_fixture_config(
+        tmp_path,
+        [
+            ("Felis catus", "GCF_000181335.3"),
+            ("Panthera leo", "GCF_018350215.1"),
+        ],
+    )
+    reference_dir = tmp_path / "reference"
+    reference_dir.mkdir(exist_ok=True)
+    (reference_dir / "GCF_000181335.3.fna.gz").write_bytes(
+        _build_fixture_fasta({"NC_short_a": "A" * 100})
+    )
+    (reference_dir / "GCF_018350215.1.fna.gz").write_bytes(
+        _build_fixture_fasta({"NC_short_b": "C" * 100})
+    )
+
+    with pytest.raises(RuntimeError, match="zero tokenized windows"):
+        run_felid_foundation_pretrain(
+            config_path,
+            tokenizer_loader=_spawn_safe_fake_tokenizer_loader,
+        )
+
+    corpus_dir = tmp_path / "processed" / "felid_foundation_tokens"
+    assert not corpus_dir.exists(), (
+        "parallel zero-window aborts must leave no corpus directory behind; "
+        f"found {sorted(corpus_dir.rglob('*')) if corpus_dir.exists() else 'n/a'}"
+    )
+
+
 def test_run_summary_schema_exact_keys(tmp_path):
     """Run-summary JSON has exactly the documented key set."""
     config_path = _build_fixture_config(
@@ -562,6 +979,209 @@ def test_run_summary_schema_exact_keys(tmp_path):
 
     # totals keys
     assert set(summary["totals"].keys()) == {"train", "validation"}
+
+
+def test_run_pretrain_resume_skips_checkpointed_species(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A restarted run should skip species already recorded in ``checkpoint.json``.
+
+    This guards the operator-interrupt path: species that finished before the
+    interruption must be checkpointed once, preserved in the resumed summary,
+    and never re-enter ``_run_single_species`` after restart.
+    """
+    config_path = _build_fixture_config(
+        tmp_path,
+        [
+            ("Felis catus", "GCF_000181335.3"),
+            ("Panthera leo", "GCF_018350215.1"),
+        ],
+    )
+    reference_dir = tmp_path / "reference"
+    reference_dir.mkdir(exist_ok=True)
+    (reference_dir / "GCF_000181335.3.fna.gz").write_bytes(
+        _build_fixture_fasta({"NC_felis": "A" * 1000})
+    )
+    (reference_dir / "GCF_018350215.1.fna.gz").write_bytes(
+        _build_fixture_fasta({"NC_leo": "C" * 1000})
+    )
+
+    def fake_tokenizer_loader(provenance):
+        """Return a deterministic local tokenizer stub for the resume test."""
+
+        def fake_tokenizer(sequence, **kwargs):
+            """Emit bounded token IDs so the test stays fast and offline."""
+            n = min(max(1, len(sequence) // 6), provenance.max_position_embeddings)
+            return {"input_ids": list(range(n)), "attention_mask": [1] * n}
+
+        return fake_tokenizer, provenance
+
+    real_run_single_species = felid_foundation_pipeline._run_single_species
+    first_run_calls: list[str] = []
+
+    def interrupting_run_single_species(**kwargs):
+        """Interrupt on the second explicit species after checkpointing the first."""
+        species_slug = kwargs["entry"].species_slug
+        first_run_calls.append(species_slug)
+        if species_slug == "panthera_leo":
+            raise KeyboardInterrupt("simulated interrupt")
+        return real_run_single_species(**kwargs)
+
+    monkeypatch.setattr(
+        felid_foundation_pipeline,
+        "_run_single_species",
+        interrupting_run_single_species,
+    )
+    monkeypatch.setattr(
+        felid_foundation_pipeline,
+        "_can_multiprocess_tokenizer_loader",
+        lambda _loader: False,
+    )
+
+    with pytest.raises(KeyboardInterrupt, match="simulated interrupt"):
+        run_felid_foundation_pretrain(config_path, tokenizer_loader=fake_tokenizer_loader)
+
+    checkpoint_path = tmp_path / "artifacts" / "checkpoint.json"
+    interrupted_checkpoint = json.loads(checkpoint_path.read_text(encoding="utf-8"))
+    completed_before_resume = interrupted_checkpoint["completed_species"]
+    assert completed_before_resume
+    assert "panthera_leo" not in completed_before_resume
+    assert first_run_calls[-1] == "panthera_leo"
+
+    resume_calls: list[str] = []
+
+    def tracking_run_single_species(**kwargs):
+        """Record resumed species execution so checkpoint skipping is observable."""
+        resume_calls.append(kwargs["entry"].species_slug)
+        return real_run_single_species(**kwargs)
+
+    monkeypatch.setattr(
+        felid_foundation_pipeline,
+        "_run_single_species",
+        tracking_run_single_species,
+    )
+
+    result = run_felid_foundation_pretrain(config_path, tokenizer_loader=fake_tokenizer_loader)
+
+    resumed_checkpoint = json.loads(checkpoint_path.read_text(encoding="utf-8"))
+    assert set(completed_before_resume).isdisjoint(resume_calls)
+    assert resume_calls[0] == "panthera_leo"
+    assert (
+        resumed_checkpoint["completed_species"][: len(completed_before_resume)]
+        == completed_before_resume
+    )
+    assert len(resumed_checkpoint["completed_species"]) == len(result.per_species_stats)
+    assert set(completed_before_resume).issubset(
+        {stats.species_slug for stats in result.per_species_stats}
+    )
+    assert result.artifacts.summary_path.exists()
+
+
+def test_run_pretrain_reports_window_bytes_tokenized(tmp_path: Path) -> None:
+    """`bytes_tokenized` should count raw window bytes, not pre-window contig bytes."""
+    config_path = _build_fixture_config(
+        tmp_path,
+        [("Felis catus", "GCF_000181335.3")],
+        scalar_overrides={
+            "windowing.context_window": 510,
+            "windowing.window_overlap": 255,
+            "pipeline.chunk_size": 2,
+        },
+    )
+    reference_dir = tmp_path / "reference"
+    reference_dir.mkdir(exist_ok=True)
+    (reference_dir / "GCF_000181335.3.fna.gz").write_bytes(
+        _build_fixture_fasta({"NC_bytes": "A" * 1020})
+    )
+
+    def fake_tokenizer_loader(provenance):
+        """Return a deterministic tokenizer so byte accounting is isolated from model state."""
+
+        def fake_tokenizer(sequence, **kwargs):
+            """Emit stable IDs whose exact values are irrelevant to the byte metric."""
+            n = min(max(1, len(sequence) // 6), provenance.max_position_embeddings)
+            return {"input_ids": list(range(n)), "attention_mask": [1] * n}
+
+        return fake_tokenizer, provenance
+
+    def fake_export_writer(*args, **kwargs):
+        """Avoid parquet dependencies while preserving run-summary generation."""
+        writer = MagicMock()
+        writer.__enter__ = MagicMock(return_value=writer)
+        writer.__exit__ = MagicMock(return_value=False)
+        writer.write_batch = MagicMock()
+        return writer
+
+    result = run_felid_foundation_pretrain(
+        config_path,
+        tokenizer_loader=fake_tokenizer_loader,
+        export_writer=fake_export_writer,
+    )
+
+    felis_stats = next(
+        stats for stats in result.per_species_stats if stats.species_slug == "felis_catus"
+    )
+    assert felis_stats.bytes_tokenized == 3 * 510
+
+
+def test_write_checkpoint_uses_unique_temp_files_under_contention(tmp_path: Path) -> None:
+    """Concurrent checkpoint writes should leave one valid JSON file and no fixed temp-file race."""
+    checkpoint_path = tmp_path / "artifacts" / "checkpoint.json"
+    config_file = tmp_path / "config.toml"
+    config_file.write_text("[pipeline]\nname='fixture'\ndescription='fixture'\n", encoding="utf-8")
+    barrier = threading.Barrier(8)
+    expected_completed_sets: set[tuple[str, ...]] = set()
+
+    def write_snapshot(index: int) -> tuple[str, ...]:
+        """Write one checkpoint snapshot after synchronizing thread start."""
+        stats = felid_foundation_pipeline.FelidSpeciesPretrainStats(
+            species_slug=f"species_{index}",
+            identifier=f"ID_{index}",
+            assembly_name=f"assembly_{index}",
+            contig_count=1,
+            retained_sequence_count=1,
+            filtered_short_count=0,
+            filtered_high_ambiguity_count=0,
+            window_counts_by_split={"train": 1, "validation": 0},
+            peak_window_count_in_memory=1,
+            peak_rss_bytes=1,
+            bytes_tokenized=1,
+            export_path=str(tmp_path / "processed"),
+        )
+        checkpoint = felid_foundation_pipeline.CheckpointState(
+            schema_version="1",
+            config_path=str(config_file.resolve()),
+            config_name="fixture",
+            updated_at=f"2026-05-10T00:00:0{index}Z",
+            completed_species=(stats.species_slug,),
+            per_species_stats=(stats,),
+        )
+        barrier.wait()
+        felid_foundation_pipeline._write_checkpoint(checkpoint_path, checkpoint)
+        return checkpoint.completed_species
+
+    results: list[tuple[str, ...]] = []
+    errors: list[BaseException] = []
+
+    def run_thread(index: int) -> None:
+        """Capture thread outcomes without hiding exceptions from the assertion phase."""
+        try:
+            results.append(write_snapshot(index))
+        except BaseException as exc:  # pragma: no cover - assertion path below exercises it.
+            errors.append(exc)
+
+    threads = [threading.Thread(target=run_thread, args=(index,)) for index in range(8)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert not errors
+    expected_completed_sets.update(results)
+    payload = json.loads(checkpoint_path.read_text(encoding="utf-8"))
+    assert tuple(payload["completed_species"]) in expected_completed_sets
+    assert not list(checkpoint_path.parent.glob(".checkpoint*.tmp"))
 
 
 def test_ambiguity_threshold_boundary_retained(tmp_path):

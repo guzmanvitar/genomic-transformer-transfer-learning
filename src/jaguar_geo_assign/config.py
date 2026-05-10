@@ -216,6 +216,31 @@ class RuntimeConfig:
     external_tools: tuple[str, ...]
 
 
+@dataclass(frozen=True)
+class FelidFoundationPipelineRuntimeConfig:
+    """Execution controls declared in the felid-foundation ``[pipeline]`` section.
+
+    These knobs tune bounded-memory tokenization and multiprocessing teardown
+    behavior without modifying code. Keeping them on a dedicated dataclass makes
+    the non-schema ``[pipeline]`` fields explicit instead of smuggling them
+    through module-level defaults.
+
+    Attributes:
+        chunk_size: Maximum windows per tokenization sub-batch and queue chunk.
+        num_workers: Upper bound on concurrent producer workers. The runtime
+            still clamps this against ``cpu_count()`` and the number of species.
+        queue_maxsize_factor: Multiplier used to derive queue capacity as
+            ``factor * num_workers``.
+        sigterm_timeout: Seconds to wait after ``SIGTERM`` before escalating to
+            ``SIGKILL`` during worker teardown.
+    """
+
+    chunk_size: int
+    num_workers: int
+    queue_maxsize_factor: int
+    sigterm_timeout: float
+
+
 def _require_boolean_field(
     value: object,
     *,
@@ -411,6 +436,8 @@ class FelidFoundationPipelineConfig:
         split: Train/test split strategy (:class:`SplitConfig`).
         tokenizer: DNABERT-2 tokenizer pinning (:class:`TokenizerConfig`).
         export: Parquet export settings (:class:`ExportConfig`).
+        pipeline: Execution controls from the TOML ``[pipeline]`` section
+            (:class:`FelidFoundationPipelineRuntimeConfig`).
         runtime: External tool requirements (:class:`RuntimeConfig`); the
             approved foundation contract uses an *empty* tool list because
             the path never invokes bcftools.
@@ -424,6 +451,7 @@ class FelidFoundationPipelineConfig:
     split: SplitConfig
     tokenizer: TokenizerConfig
     export: ExportConfig
+    pipeline: FelidFoundationPipelineRuntimeConfig
     runtime: RuntimeConfig
 
 
@@ -621,6 +649,19 @@ def load_felid_foundation_pipeline_config(
                     "the foundation pipeline is reference-FASTA-only"
                 )
 
+        chunk_size = int(pipeline.get("chunk_size", 10_000))
+        if chunk_size <= 0:
+            raise ValueError("pipeline.chunk_size must be positive")
+        num_workers = int(pipeline.get("num_workers", REQUIRED_FELID_FOUNDATION_SPECIES_COUNT))
+        if num_workers <= 0:
+            raise ValueError("pipeline.num_workers must be positive")
+        queue_maxsize_factor = int(pipeline.get("queue_maxsize_factor", 2))
+        if queue_maxsize_factor <= 0:
+            raise ValueError("pipeline.queue_maxsize_factor must be positive")
+        sigterm_timeout = float(pipeline.get("sigterm_timeout", 30.0))
+        if sigterm_timeout <= 0:
+            raise ValueError("pipeline.sigterm_timeout must be positive")
+
         context_window = int(windowing["context_window"])
         window_overlap = int(windowing["window_overlap"])
         if context_window <= 0:
@@ -761,6 +802,12 @@ def load_felid_foundation_pipeline_config(
             preserve_sequence_hashes=preserve_sequence_hashes,
             preserve_coordinates=preserve_coordinates,
             sequence_hash_algorithm=export["sequence_hash_algorithm"],
+        ),
+        pipeline=FelidFoundationPipelineRuntimeConfig(
+            chunk_size=chunk_size,
+            num_workers=num_workers,
+            queue_maxsize_factor=queue_maxsize_factor,
+            sigterm_timeout=sigterm_timeout,
         ),
         runtime=RuntimeConfig(external_tools=external_tools),
     )
