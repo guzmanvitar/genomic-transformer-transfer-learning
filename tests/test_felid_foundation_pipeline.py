@@ -38,6 +38,35 @@ from tests._felid_fixture import placeholder_fasta_checksum as _placeholder_fast
 from tests._felid_fixture import write_placeholder_fastas as _write_placeholder_fastas
 
 
+class _EqualityMaskingTokenizerProvenance:
+    """Forge a truthy non-bool trust policy that still passes loose equality.
+
+    The parallel worker regression used a raw ``!=`` comparison, which treats
+    ``1`` and ``True`` as equal. This stand-in preserves every approved field
+    while swapping ``trust_remote_code`` to ``1`` so the test can verify that
+    the worker now enforces an actual ``bool`` before tokenization begins.
+    """
+
+    def __init__(self, provenance) -> None:
+        self.identifier = provenance.identifier
+        self.revision = provenance.revision
+        self.max_position_embeddings = provenance.max_position_embeddings
+        self.allowed_alphabet = provenance.allowed_alphabet
+        self.unsupported_symbol_policy = provenance.unsupported_symbol_policy
+        self.trust_remote_code = 1
+
+    def __eq__(self, other: object) -> bool:
+        """Mirror value-based equality so ``1 == True`` can mask the violation."""
+        return (
+            getattr(other, "identifier", None) == self.identifier
+            and getattr(other, "revision", None) == self.revision
+            and getattr(other, "max_position_embeddings", None) == self.max_position_embeddings
+            and getattr(other, "allowed_alphabet", None) == self.allowed_alphabet
+            and getattr(other, "unsupported_symbol_policy", None) == self.unsupported_symbol_policy
+            and getattr(other, "trust_remote_code", None) == self.trust_remote_code
+        )
+
+
 def _spawn_safe_fake_tokenizer_loader(provenance):
     """Return a module-level tokenizer loader usable under ``spawn`` workers."""
 
@@ -73,6 +102,17 @@ def _spawn_safe_abrupt_exit_tokenizer_loader(provenance):
         return {"input_ids": list(range(n)), "attention_mask": [1] * n}
 
     return fake_tokenizer, provenance
+
+
+def _spawn_safe_equality_masking_tokenizer_loader(provenance):
+    """Return a loader whose forged provenance would bypass a loose equality check."""
+
+    def fake_tokenizer(sequence, **kwargs):
+        """Emit deterministic token IDs while the test targets provenance validation only."""
+        n = min(max(1, len(sequence) // 6), provenance.max_position_embeddings)
+        return {"input_ids": list(range(n)), "attention_mask": [1] * n}
+
+    return fake_tokenizer, _EqualityMaskingTokenizerProvenance(provenance)
 
 
 def test_species_slug_derivation():
@@ -796,6 +836,46 @@ def test_run_pretrain_parallel_abrupt_worker_exit_fails_fast(
         run_felid_foundation_pretrain(
             config_path,
             tokenizer_loader=_spawn_safe_abrupt_exit_tokenizer_loader,
+            export_writer=fake_export_writer,
+        )
+
+
+def test_run_pretrain_parallel_worker_rejects_truthy_non_bool_trust_remote_code(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Parallel workers must reject provenance that only matches via ``1 == True``."""
+    monkeypatch.setattr(felid_foundation_pipeline.os, "cpu_count", lambda: 2)
+    config_path = _build_fixture_config(
+        tmp_path,
+        [
+            ("Felis catus", "GCF_000181335.3"),
+            ("Panthera leo", "GCF_018350215.1"),
+        ],
+    )
+    reference_dir = tmp_path / "reference"
+    reference_dir.mkdir(exist_ok=True)
+    (reference_dir / "GCF_000181335.3.fna.gz").write_bytes(
+        _build_fixture_fasta({"NC_ok_a": "A" * 1000})
+    )
+    (reference_dir / "GCF_018350215.1.fna.gz").write_bytes(
+        _build_fixture_fasta({"NC_ok_b": "G" * 1000})
+    )
+
+    def fake_export_writer(*args, **kwargs):
+        """Provide a no-op writer because the worker should fail before writing."""
+        writer = MagicMock()
+        writer.__enter__ = MagicMock(return_value=writer)
+        writer.__exit__ = MagicMock(return_value=False)
+        writer.write_batch = MagicMock()
+        return writer
+
+    with pytest.raises(
+        RuntimeError, match="Tokenizer loader trust_remote_code must be an actual boolean"
+    ):
+        run_felid_foundation_pretrain(
+            config_path,
+            tokenizer_loader=_spawn_safe_equality_masking_tokenizer_loader,
             export_writer=fake_export_writer,
         )
 
