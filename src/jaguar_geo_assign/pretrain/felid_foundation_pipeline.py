@@ -21,7 +21,7 @@ import logging
 import multiprocessing
 import os
 import pickle
-import queue
+import queue as queue_module
 import re
 import resource
 import sys
@@ -295,7 +295,7 @@ def _put_queue_message(
         try:
             ipc_queue.put(message, timeout=put_timeout_seconds)
             return True
-        except queue.Full:
+        except queue_module.Full:
             if shutdown_event.is_set():
                 return False
 
@@ -621,8 +621,17 @@ def _consume_queue(
     checkpointed_species: tuple[str, ...],
     checkpointed_stats_by_slug: dict[str, FelidSpeciesPretrainStats],
     on_species_done: Callable[[], None],
+    on_queue_idle: Callable[[], None] | None = None,
+    queue_get_timeout_seconds: float | None = None,
 ) -> list[FelidSpeciesPretrainStats]:
-    """Drain queue messages until every expected species finishes or one errors."""
+    """Drain queue messages until every expected species finishes or one errors.
+
+    The consumer intentionally polls ``queue.get`` with a timeout when the
+    parallel path is active. Catastrophic worker exits (for example ``os._exit``,
+    SIGKILL, or OOM termination) bypass the worker's structured ``_ErrorMessage``
+    path entirely; timed polling lets the parent inspect worker liveness and fail
+    fast instead of hanging forever on an empty queue.
+    """
     done_count = 0
     total_windows = 0
     completed_stats: list[FelidSpeciesPretrainStats] = []
@@ -630,7 +639,15 @@ def _consume_queue(
     stats_by_slug_snapshot = dict(checkpointed_stats_by_slug)
 
     while done_count < expected_species:
-        message = queue.get()
+        try:
+            if queue_get_timeout_seconds is None:
+                message = queue.get()
+            else:
+                message = queue.get(timeout=queue_get_timeout_seconds)
+        except queue_module.Empty:
+            if on_queue_idle is not None:
+                on_queue_idle()
+            continue
         if isinstance(message, _ChunkMessage):
             writer.write_batch(message.chunk)
             total_windows += len(message.chunk)
@@ -736,6 +753,31 @@ def _run_parallel_pipeline(
         if pending:
             _start_worker(*pending.popleft())
 
+    def _raise_if_worker_exit_bypassed_queue() -> None:
+        """Abort if an idle consumer observes workers that can no longer emit messages.
+
+        The worker normally reports failures by enqueueing ``_ErrorMessage``.
+        Abrupt exits such as ``os._exit`` or external termination can prevent that
+        final enqueue, so the consumer must inspect process exit codes whenever the
+        queue stays empty for longer than the polling interval.
+        """
+        for species_slug, process in live_processes.items():
+            exitcode = process.exitcode
+            if exitcode is None or exitcode == 0:
+                continue
+            termination_reason = f"signal {-exitcode}" if exitcode < 0 else f"exit code {exitcode}"
+            raise RuntimeError(
+                f"Worker for {species_slug!r} exited unexpectedly with {termination_reason} "
+                "before reporting completion"
+            )
+        if pending:
+            return
+        if live_processes and all(process.exitcode == 0 for process in live_processes.values()):
+            raise RuntimeError(
+                "All felid-foundation workers exited before the consumer observed every "
+                "completion message; aborting instead of waiting forever on an empty queue"
+            )
+
     for entry, fasta_path in species_paths[:num_workers]:
         _start_worker(entry, fasta_path)
 
@@ -750,6 +792,8 @@ def _run_parallel_pipeline(
             checkpointed_species=checkpointed_species,
             checkpointed_stats_by_slug=checkpointed_stats_by_slug,
             on_species_done=_dispatch_next,
+            on_queue_idle=_raise_if_worker_exit_bypassed_queue,
+            queue_get_timeout_seconds=put_timeout_seconds,
         )
         shutdown_event.set()
         for process in live_processes.values():
@@ -799,6 +843,14 @@ def _resume_writer_from_metadata(
     Resume relies on the previous clean-close metadata sidecar because the writer
     stores both the split file registry and the SQLite-backed locus manifest in
     process-local state rather than discovering them automatically on reopen.
+
+    The direct writes to ``TokenizedCorpusWriter`` private attributes below are
+    intentional and narrowly scoped to resume hydration. The writer exposes no
+    public API for restoring ``metadata.json`` + SQLite sidecar state, but resume
+    must rehydrate exactly these fields so subsequent ``write_batch`` calls append
+    with the original split registry, locus manifest, tokenizer provenance, and
+    batch index. Keeping the private mutation isolated to this helper makes that
+    contract explicit until the writer grows a first-class resume hook.
     """
     metadata_path = corpus_dir / "metadata.json"
     if not metadata_path.exists():
@@ -819,6 +871,8 @@ def _resume_writer_from_metadata(
     for split, split_payload in metadata.get("splits", {}).items():
         relative_files = split_payload.get("files", [])
         absolute_files = [corpus_dir / relative_path for relative_path in relative_files]
+        # NOTE: resume must hydrate the writer's internal registries before any new
+        # batch is appended; there is intentionally no public setter for this state.
         writer._split_paths[split] = absolute_files
         writer._split_record_counts[split] = int(split_payload.get("record_count", 0))
         for path in absolute_files:
@@ -846,6 +900,8 @@ def _resume_writer_from_metadata(
         )
         writer._sqlite_conn.commit()
 
+    # These fields must match the pre-existing corpus so future write_batch calls
+    # continue numbering files monotonically and preserve the validated provenance.
     writer._resolved_provenance = provenance
     writer._batch_index = max_batch_index + 1
 

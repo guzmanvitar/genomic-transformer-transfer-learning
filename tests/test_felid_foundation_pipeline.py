@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import threading
 from pathlib import Path
 from unittest.mock import MagicMock
@@ -55,6 +56,19 @@ def _spawn_safe_crashing_tokenizer_loader(provenance):
         """Raise on synthetic failure markers to exercise worker error plumbing."""
         if set(sequence) == {"C"}:
             raise RuntimeError("synthetic tokenizer crash")
+        n = min(max(1, len(sequence) // 6), provenance.max_position_embeddings)
+        return {"input_ids": list(range(n)), "attention_mask": [1] * n}
+
+    return fake_tokenizer, provenance
+
+
+def _spawn_safe_abrupt_exit_tokenizer_loader(provenance):
+    """Return a spawn-safe tokenizer loader that terminates the worker immediately."""
+
+    def fake_tokenizer(sequence, **kwargs):
+        """Bypass Python exception plumbing so the parent must inspect worker exit codes."""
+        if set(sequence) == {"C"}:
+            os._exit(17)
         n = min(max(1, len(sequence) // 6), provenance.max_position_embeddings)
         return {"input_ids": list(range(n)), "attention_mask": [1] * n}
 
@@ -743,6 +757,45 @@ def test_run_pretrain_parallel_worker_crash_surfaces_cleanly(
         run_felid_foundation_pretrain(
             config_path,
             tokenizer_loader=_spawn_safe_crashing_tokenizer_loader,
+            export_writer=fake_export_writer,
+        )
+
+
+def test_run_pretrain_parallel_abrupt_worker_exit_fails_fast(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An abrupt producer exit must raise instead of blocking forever on ``queue.get``."""
+    monkeypatch.setattr(felid_foundation_pipeline.os, "cpu_count", lambda: 2)
+    config_path = _build_fixture_config(
+        tmp_path,
+        [
+            ("Felis catus", "GCF_000181335.3"),
+            ("Panthera leo", "GCF_018350215.1"),
+        ],
+        scalar_overrides={"pipeline.sigterm_timeout": 0.4},
+    )
+    reference_dir = tmp_path / "reference"
+    reference_dir.mkdir(exist_ok=True)
+    (reference_dir / "GCF_000181335.3.fna.gz").write_bytes(
+        _build_fixture_fasta({"NC_ok": "A" * 1000})
+    )
+    (reference_dir / "GCF_018350215.1.fna.gz").write_bytes(
+        _build_fixture_fasta({"NC_abrupt_exit": "C" * 1000})
+    )
+
+    def fake_export_writer(*args, **kwargs):
+        """Provide a lightweight consumer writer for the abrupt-exit regression test."""
+        writer = MagicMock()
+        writer.__enter__ = MagicMock(return_value=writer)
+        writer.__exit__ = MagicMock(return_value=False)
+        writer.write_batch = MagicMock()
+        return writer
+
+    with pytest.raises(RuntimeError, match="panthera_leo|exit code 17|waiting forever"):
+        run_felid_foundation_pretrain(
+            config_path,
+            tokenizer_loader=_spawn_safe_abrupt_exit_tokenizer_loader,
             export_writer=fake_export_writer,
         )
 
