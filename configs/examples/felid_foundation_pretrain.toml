@@ -1,6 +1,11 @@
 [pipeline]
 name = "felid_foundation_pretrain_contract"
 description = "Architecture contract for the six-species felid foundation pretraining corpus."
+chunk_size = 10000
+# Upper bound for producer workers. Runtime still clamps to min(species, cpu_count()).
+num_workers = 6
+queue_maxsize_factor = 2
+sigterm_timeout = 30.0
 
 [paths]
 reference_dir = "data/raw/felid_foundation/reference"

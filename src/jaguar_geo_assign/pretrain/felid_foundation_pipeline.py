@@ -21,9 +21,11 @@ import logging
 import multiprocessing
 import os
 import pickle
+import queue
 import re
 import resource
 import sys
+import tempfile
 import time
 import traceback
 from collections import deque
@@ -58,11 +60,11 @@ from ._shared import (
 
 _LOGGER = logging.getLogger(__name__)
 
-_TOKENIZED_WINDOW_CHUNK_SIZE = 10_000
+_DEFAULT_TOKENIZED_WINDOW_CHUNK_SIZE = 10_000
 _CHECKPOINT_SCHEMA_VERSION = "1"
 _PART_FILE_NAME_PATTERN = re.compile(r"^part-(\d+)-\d+\.parquet$")
-_QUEUE_MAXSIZE_FACTOR = 2
-_WORKER_SIGTERM_TIMEOUT_SECONDS = 30.0
+_DEFAULT_QUEUE_MAXSIZE_FACTOR = 2
+_DEFAULT_WORKER_SIGTERM_TIMEOUT_SECONDS = 30.0
 
 
 class MissingFelidReferenceError(RuntimeError):
@@ -267,6 +269,37 @@ class _ErrorMessage:
     traceback_str: str
 
 
+class _WorkerShutdownRequestedError(RuntimeError):
+    """Internal signal used to stop workers promptly after consumer failure.
+
+    Workers can spend most of their time blocked in ``queue.put`` when the
+    consumer stops draining. Raising a dedicated internal exception lets the
+    worker unwind without emitting a misleading ``_ErrorMessage`` for a
+    shutdown that was initiated by the parent process.
+    """
+
+
+class _ZeroTokenizedWindowsError(RuntimeError):
+    """Internal marker for the empty-corpus guard that must trip inside writer cleanup."""
+
+
+def _put_queue_message(
+    *,
+    ipc_queue: Any,
+    message: object,
+    shutdown_event: Any,
+    put_timeout_seconds: float,
+) -> bool:
+    """Retry ``queue.put`` until it succeeds or the parent requests shutdown."""
+    while True:
+        try:
+            ipc_queue.put(message, timeout=put_timeout_seconds)
+            return True
+        except queue.Full:
+            if shutdown_event.is_set():
+                return False
+
+
 class _QueueBatchWriter:
     """Queue-backed ``write_batch`` adapter used inside worker processes.
 
@@ -275,16 +308,33 @@ class _QueueBatchWriter:
     single-consumer.
     """
 
-    def __init__(self, *, species_slug: str, queue: Any) -> None:
+    def __init__(
+        self,
+        *,
+        species_slug: str,
+        queue: Any,
+        shutdown_event: Any,
+        put_timeout_seconds: float,
+    ) -> None:
         self._species_slug = species_slug
         self._queue = queue
+        self._shutdown_event = shutdown_event
+        self._put_timeout_seconds = put_timeout_seconds
 
     def write_batch(self, tokenized_windows: Any) -> None:
         """Emit a non-empty tokenized batch to the consumer queue."""
         chunk = tuple(tokenized_windows)
         if not chunk:
             return
-        self._queue.put(_ChunkMessage(species_slug=self._species_slug, chunk=chunk))
+        if not _put_queue_message(
+            ipc_queue=self._queue,
+            message=_ChunkMessage(species_slug=self._species_slug, chunk=chunk),
+            shutdown_event=self._shutdown_event,
+            put_timeout_seconds=self._put_timeout_seconds,
+        ):
+            raise _WorkerShutdownRequestedError(
+                f"Shutdown requested while writing queued chunk for {self._species_slug!r}"
+            )
 
 
 def _resolve_fasta_path(reference_dir: Path, entry: FelidSpeciesEntry) -> Path:
@@ -462,18 +512,25 @@ def _build_checkpoint(
 def _write_checkpoint(checkpoint_path: Path, checkpoint: CheckpointState) -> None:
     """Atomically persist checkpoint state in the artifact directory."""
     checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
-    temp_path = checkpoint_path.parent / f".{checkpoint_path.stem}.tmp"
-    temp_path.write_text(
-        json.dumps(_serialize_checkpoint(checkpoint), indent=2, sort_keys=True),
-        encoding="utf-8",
+    file_descriptor, temp_name = tempfile.mkstemp(
+        prefix=f".{checkpoint_path.stem}.",
+        suffix=".tmp",
+        dir=checkpoint_path.parent,
     )
-    temp_path.replace(checkpoint_path)
+    temp_path = Path(temp_name)
+    try:
+        with os.fdopen(file_descriptor, "w", encoding="utf-8") as handle:
+            handle.write(json.dumps(_serialize_checkpoint(checkpoint), indent=2, sort_keys=True))
+        temp_path.replace(checkpoint_path)
+    except Exception:
+        temp_path.unlink(missing_ok=True)
+        raise
 
 
 def _terminate_workers(
     live_processes: dict[str, multiprocessing.process.BaseProcess],
     *,
-    sigterm_timeout: float = _WORKER_SIGTERM_TIMEOUT_SECONDS,
+    sigterm_timeout: float = _DEFAULT_WORKER_SIGTERM_TIMEOUT_SECONDS,
 ) -> None:
     """Stop all workers, escalating from SIGTERM to SIGKILL if required."""
     for process in live_processes.values():
@@ -497,6 +554,9 @@ def _species_worker(
     tokenizer_loader: TokenizerLoader,
     queue: Any,
     corpus_dir: Path,
+    chunk_size: int,
+    shutdown_event: Any,
+    put_timeout_seconds: float,
 ) -> None:
     """Run one species in a worker and stream tokenized chunks over the queue."""
     try:
@@ -511,20 +571,36 @@ def _species_worker(
             preprocessing_config=preprocessing_config,
             tokenizer=tokenizer,
             provenance=loaded_provenance,
-            writer=_QueueBatchWriter(species_slug=entry.species_slug, queue=queue),
+            writer=_QueueBatchWriter(
+                species_slug=entry.species_slug,
+                queue=queue,
+                shutdown_event=shutdown_event,
+                put_timeout_seconds=put_timeout_seconds,
+            ),
             contig_owner={},
             corpus_dir=corpus_dir,
+            chunk_size=chunk_size,
         )
-        queue.put(_DoneMessage(species_slug=entry.species_slug, stats=stats))
+        _put_queue_message(
+            ipc_queue=queue,
+            message=_DoneMessage(species_slug=entry.species_slug, stats=stats),
+            shutdown_event=shutdown_event,
+            put_timeout_seconds=put_timeout_seconds,
+        )
     except BaseException as exc:
+        if isinstance(exc, _WorkerShutdownRequestedError):
+            return
         try:
-            queue.put(
-                _ErrorMessage(
+            _put_queue_message(
+                ipc_queue=queue,
+                message=_ErrorMessage(
                     species_slug=entry.species_slug,
                     error_type=type(exc).__name__,
                     error_message=str(exc),
                     traceback_str=traceback.format_exc(),
-                )
+                ),
+                shutdown_event=shutdown_event,
+                put_timeout_seconds=put_timeout_seconds,
             )
         except Exception:
             _LOGGER.exception(
@@ -542,14 +618,16 @@ def _consume_queue(
     checkpoint_path: Path,
     config_file: Path,
     config_name: str,
-    completed_species: list[str],
-    stats_by_slug: dict[str, FelidSpeciesPretrainStats],
+    checkpointed_species: tuple[str, ...],
+    checkpointed_stats_by_slug: dict[str, FelidSpeciesPretrainStats],
     on_species_done: Callable[[], None],
 ) -> list[FelidSpeciesPretrainStats]:
     """Drain queue messages until every expected species finishes or one errors."""
     done_count = 0
     total_windows = 0
     completed_stats: list[FelidSpeciesPretrainStats] = []
+    completed_species_snapshot = list(checkpointed_species)
+    stats_by_slug_snapshot = dict(checkpointed_stats_by_slug)
 
     while done_count < expected_species:
         message = queue.get()
@@ -558,15 +636,15 @@ def _consume_queue(
             total_windows += len(message.chunk)
             continue
         if isinstance(message, _DoneMessage):
-            stats_by_slug[message.species_slug] = message.stats
-            completed_species.append(message.species_slug)
+            stats_by_slug_snapshot[message.species_slug] = message.stats
+            completed_species_snapshot.append(message.species_slug)
             _write_checkpoint(
                 checkpoint_path,
                 _build_checkpoint(
                     config_file=config_file,
                     config_name=config_name,
-                    completed_species=completed_species,
-                    stats_by_slug=stats_by_slug,
+                    completed_species=completed_species_snapshot,
+                    stats_by_slug=stats_by_slug_snapshot,
                 ),
             )
             completed_stats.append(message.stats)
@@ -585,7 +663,7 @@ def _consume_queue(
         )
 
     if total_windows == 0:
-        raise RuntimeError(
+        raise _ZeroTokenizedWindowsError(
             "Felid foundation pretrain produced zero tokenized windows across all "
             "species; check windowing/ambiguity filters and per-species FASTA contents"
         )
@@ -603,15 +681,16 @@ def _run_parallel_pipeline(
     checkpoint_path: Path,
     config_file: Path,
     config_name: str,
-    completed_species: list[str],
-    stats_by_slug: dict[str, FelidSpeciesPretrainStats],
+    checkpointed_species: tuple[str, ...],
+    checkpointed_stats_by_slug: dict[str, FelidSpeciesPretrainStats],
     corpus_dir: Path,
     num_workers: int,
-    queue_maxsize_factor: int = _QUEUE_MAXSIZE_FACTOR,
-    sigterm_timeout: float = _WORKER_SIGTERM_TIMEOUT_SECONDS,
+    chunk_size: int,
+    queue_maxsize_factor: int = _DEFAULT_QUEUE_MAXSIZE_FACTOR,
+    sigterm_timeout: float = _DEFAULT_WORKER_SIGTERM_TIMEOUT_SECONDS,
 ) -> list[FelidSpeciesPretrainStats]:
     """Run spawn-based producer workers and a single main-process consumer."""
-    completed_species_set = set(completed_species)
+    completed_species_set = set(checkpointed_species)
     already_completed = [
         entry.species_slug
         for entry, _fasta_path in species_paths
@@ -626,15 +705,20 @@ def _run_parallel_pipeline(
         return []
 
     ctx = multiprocessing.get_context("spawn")
+    shutdown_event = ctx.Event()
     queue = ctx.Queue(maxsize=max(1, queue_maxsize_factor * num_workers))
     pending: deque[tuple[FelidSpeciesEntry, Path]] = deque(species_paths[num_workers:])
     live_processes: dict[str, multiprocessing.process.BaseProcess] = {}
+    put_timeout_seconds = max(0.1, min(1.0, sigterm_timeout / 4.0))
     shared_kwargs = {
         "preprocessing_config": preprocessing_config,
         "provenance": provenance,
         "tokenizer_loader": tokenizer_loader,
         "queue": queue,
         "corpus_dir": corpus_dir,
+        "chunk_size": chunk_size,
+        "shutdown_event": shutdown_event,
+        "put_timeout_seconds": put_timeout_seconds,
     }
 
     def _start_worker(entry: FelidSpeciesEntry, fasta_path: Path) -> None:
@@ -663,10 +747,11 @@ def _run_parallel_pipeline(
             checkpoint_path=checkpoint_path,
             config_file=config_file,
             config_name=config_name,
-            completed_species=completed_species,
-            stats_by_slug=stats_by_slug,
+            checkpointed_species=checkpointed_species,
+            checkpointed_stats_by_slug=checkpointed_stats_by_slug,
             on_species_done=_dispatch_next,
         )
+        shutdown_event.set()
         for process in live_processes.values():
             process.join(timeout=2)
             if process.is_alive():
@@ -674,6 +759,7 @@ def _run_parallel_pipeline(
                 process.join()
         return completed_stats
     except BaseException:
+        shutdown_event.set()
         queue.cancel_join_thread()
         _terminate_workers(live_processes, sigterm_timeout=sigterm_timeout)
         raise
@@ -774,6 +860,7 @@ def _run_single_species(
     writer: TokenizedCorpusWriter,
     contig_owner: dict[str, str],
     corpus_dir: Path,
+    chunk_size: int = _DEFAULT_TOKENIZED_WINDOW_CHUNK_SIZE,
 ) -> FelidSpeciesPretrainStats:
     """Run prepare → window → tokenize → write for one species.
 
@@ -819,16 +906,16 @@ def _run_single_species(
     )
 
     contig_count = 0
-    for record in _iter_species_sequence_records(fasta_path, entry.species_slug):
-        prior = contig_owner.get(record.contig)
+    for contig_name in _iter_fasta_contig_names(fasta_path):
+        prior = contig_owner.get(contig_name)
         if prior is not None and prior != entry.species_slug:
             raise RuntimeError(
                 "Cross-species contig-name collision detected: "
-                f"contig {record.contig!r} is declared by both "
+                f"contig {contig_name!r} is declared by both "
                 f"{prior!r} and {entry.species_slug!r}; aborting "
                 "before windowing to avoid silent locus_id aliasing"
             )
-        contig_owner[record.contig] = entry.species_slug
+        contig_owner[contig_name] = entry.species_slug
         contig_count += 1
     _LOGGER.info(
         "fasta_parsed species=%s identifier=%s contigs=%d",
@@ -873,13 +960,13 @@ def _run_single_species(
             if not report.retained:
                 continue
 
-            bytes_tokenized += sum(len(prepared.sequence) for prepared in report.retained)
             windows = window_sequences(list(report.retained), preprocessing_config)
             windows_generated_count += len(windows)
-            for start in range(0, len(windows), _TOKENIZED_WINDOW_CHUNK_SIZE):
-                chunk_windows = windows[start : start + _TOKENIZED_WINDOW_CHUNK_SIZE]
+            for start in range(0, len(windows), chunk_size):
+                chunk_windows = windows[start : start + chunk_size]
                 if not chunk_windows:
                     continue
+                bytes_tokenized += sum(len(window.sequence) for window in chunk_windows)
                 tokenized_chunk = tokenize_windows(
                     chunk_windows,
                     tokenizer,
@@ -1058,7 +1145,12 @@ def run_felid_foundation_pretrain(
                 checkpoint_path,
             )
 
-    parallel_worker_count = min(len(remaining_species_paths), max(1, os.cpu_count() or 1))
+    available_cpu_count = max(1, os.cpu_count() or 1)
+    parallel_worker_count = min(
+        len(remaining_species_paths),
+        available_cpu_count,
+        config.pipeline.num_workers,
+    )
     use_parallel_pipeline = (
         len(remaining_species_paths) > 0
         and parallel_worker_count > 1
@@ -1092,7 +1184,7 @@ def run_felid_foundation_pretrain(
                 )
             try:
                 if use_parallel_pipeline:
-                    _run_parallel_pipeline(
+                    completed_parallel_stats = _run_parallel_pipeline(
                         remaining_species_paths,
                         preprocessing_config=preprocessing_config,
                         provenance=provenance,
@@ -1101,11 +1193,18 @@ def run_felid_foundation_pretrain(
                         checkpoint_path=checkpoint_path,
                         config_file=config_file,
                         config_name=config.name,
-                        completed_species=completed_species,
-                        stats_by_slug=stats_by_slug,
+                        checkpointed_species=tuple(completed_species),
+                        checkpointed_stats_by_slug=dict(stats_by_slug),
                         corpus_dir=corpus_dir,
                         num_workers=parallel_worker_count,
+                        chunk_size=config.pipeline.chunk_size,
+                        queue_maxsize_factor=config.pipeline.queue_maxsize_factor,
+                        sigterm_timeout=config.pipeline.sigterm_timeout,
                     )
+                    for stats in completed_parallel_stats:
+                        stats_by_slug[stats.species_slug] = stats
+                        completed_species.append(stats.species_slug)
+                        completed_species_set.add(stats.species_slug)
                 else:
                     for entry, fasta_path in remaining_species_paths:
                         stats = _run_single_species(
@@ -1117,6 +1216,7 @@ def run_felid_foundation_pretrain(
                             writer=writer,
                             contig_owner=contig_owner,
                             corpus_dir=corpus_dir,
+                            chunk_size=config.pipeline.chunk_size,
                         )
                         stats_by_slug[stats.species_slug] = stats
                         completed_species.append(stats.species_slug)
@@ -1131,6 +1231,8 @@ def run_felid_foundation_pretrain(
                             ),
                         )
             except BaseException as exc:
+                if isinstance(exc, _ZeroTokenizedWindowsError):
+                    raise RuntimeError(str(exc)) from exc
                 run_failure = exc
                 run_failure_tb = exc.__traceback__
             if run_failure is None:

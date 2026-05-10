@@ -64,7 +64,44 @@ def test_load_felid_foundation_pipeline_config_preserves_contracts() -> None:
     assert config.split.locus_key_fields == ("contig", "block_id")
     assert config.tokenizer.revision == "7bce263b15377fc15361f52cfab88f8b586abda0"
     assert config.tokenizer.trust_remote_code is DNABERT2_TRUST_REMOTE_CODE
+    assert config.pipeline.chunk_size == 10_000
+    assert config.pipeline.num_workers == 6
+    assert config.pipeline.queue_maxsize_factor == 2
+    assert config.pipeline.sigterm_timeout == pytest.approx(30.0)
     assert config.runtime.external_tools == ()
+
+
+@pytest.mark.parametrize(
+    ("field_line", "replacement", "field_name"),
+    [
+        ("chunk_size = 10000", "chunk_size = 0", "pipeline.chunk_size"),
+        ("num_workers = 6", "num_workers = 0", "pipeline.num_workers"),
+        (
+            "queue_maxsize_factor = 2",
+            "queue_maxsize_factor = 0",
+            "pipeline.queue_maxsize_factor",
+        ),
+        ("sigterm_timeout = 30.0", "sigterm_timeout = 0.0", "pipeline.sigterm_timeout"),
+    ],
+)
+def test_load_felid_foundation_pipeline_config_rejects_non_positive_runtime_knobs(
+    tmp_path: Path,
+    field_line: str,
+    replacement: str,
+    field_name: str,
+) -> None:
+    """Execution knobs in ``[pipeline]`` must reject zero or negative sentinel values."""
+    key = field_line.split(" = ", maxsplit=1)[0]
+    invalid_config = tmp_path / f"invalid_{key}.toml"
+    invalid_config.write_text(
+        Path("configs/examples/felid_foundation_pretrain.toml")
+        .read_text(encoding="utf-8")
+        .replace(field_line, replacement, 1),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match=rf"{re.escape(field_name)} must be positive"):
+        load_felid_foundation_pipeline_config(invalid_config)
 
 
 @pytest.mark.parametrize(
