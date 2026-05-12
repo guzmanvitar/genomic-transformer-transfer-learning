@@ -194,7 +194,16 @@ def test_find_project_root_walks_up(tmp_path: Path) -> None:
 
 
 def test_find_project_root_raises_when_not_found(tmp_path: Path) -> None:
-    """_find_project_root raises ValueError when no pyproject.toml exists."""
+    """_find_project_root raises ValueError when no pyproject.toml exists anywhere above start."""
+    # Guard: if pytest has placed tmp_path inside the repo tree (non-default but valid
+    # via --basetemp), the walk would find the real pyproject.toml and no error would
+    # be raised, making this a false positive. Skip rather than silently misbehave.
+    current = tmp_path.resolve()
+    while current != current.parent:
+        if (current / "pyproject.toml").is_file():
+            pytest.skip("tmp_path sits inside a project tree; test would be a false positive")
+        current = current.parent
+
     with pytest.raises(ValueError, match="pyproject.toml"):
         _find_project_root(tmp_path)
 
