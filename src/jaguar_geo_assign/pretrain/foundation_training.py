@@ -220,6 +220,7 @@ def _build_model_and_tokenizer(
             "pytorch_model.bin",
             revision=config.model_revision,
         )
+        # weights_only=True is safe: DNABERT-2's .bin is a standard state dict.
         state_dict = torch.load(weight_path, map_location="cpu", weights_only=True)
 
     load_result = model.load_state_dict(state_dict, strict=False)
@@ -1094,10 +1095,14 @@ def integration_test(
 
         # Load or create model
         if use_real_model:
-            model = AutoModelForMaskedLM.from_pretrained(
-                "zhihan1996/DNABERT-2-117M",
-                trust_remote_code=True,
+            # Use from_config + manual weight loading, same as production path,
+            # to avoid transformers v5.x meta-device RuntimeError.
+            real_cfg = AutoConfig.from_pretrained(
+                "zhihan1996/DNABERT-2-117M", trust_remote_code=True
             )
+            model = AutoModelForMaskedLM.from_config(real_cfg, trust_remote_code=True)
+            _weight_path = hf_hub_download("zhihan1996/DNABERT-2-117M", "model.safetensors")
+            model.load_state_dict(safetensors_load_file(_weight_path, device="cpu"), strict=False)
             _tokenizer, _ = load_dnabert2_tokenizer()
         else:
             # Tiny model for fast testing
@@ -1156,10 +1161,14 @@ def integration_test(
         )
         logger.info("✓ Assertion 3: save_pretrained writes config.json + safetensors")
 
-        # Assertion 4: from_pretrained reload yields identical state_dict keys
-        reloaded = AutoModelForMaskedLM.from_pretrained(
-            str(model_dir), trust_remote_code=use_real_model
-        )
+        # Assertion 4: reload yields identical state_dict keys.
+        # Use from_config + safetensors to avoid the same meta-device issue.
+        reload_cfg = AutoConfig.from_pretrained(str(model_dir), trust_remote_code=use_real_model)
+        reloaded = AutoModelForMaskedLM.from_config(reload_cfg, trust_remote_code=use_real_model)
+        st_files = list(model_dir.glob("*.safetensors"))
+        assert st_files, "No safetensors file written by save_pretrained"
+        reload_sd = safetensors_load_file(str(st_files[0]), device="cpu")
+        reloaded.load_state_dict(reload_sd, strict=False)
         orig_keys = set(model.state_dict().keys())
         reload_keys = set(reloaded.state_dict().keys())
         assert orig_keys == reload_keys, f"State dict keys differ: {orig_keys ^ reload_keys}"
