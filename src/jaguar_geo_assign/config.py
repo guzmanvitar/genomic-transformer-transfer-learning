@@ -51,6 +51,19 @@ from .data.pipeline_contract import (
 REQUIRED_STAGES = ("evaluate", BASELINE_EVALUATION_STAGE, "report")
 
 
+def _find_project_root(start: Path) -> Path:
+    current = start.resolve()
+    while True:
+        if (current / "pyproject.toml").is_file():
+            return current
+        parent = current.parent
+        if parent == current:
+            raise ValueError(
+                f"Cannot resolve relative path: no pyproject.toml found in any parent of {start}"
+            )
+        current = parent
+
+
 @dataclass(frozen=True)
 class ExperimentConfig:
     """Immutable, validated snapshot of a bootstrap experiment TOML.
@@ -975,6 +988,9 @@ def load_foundation_training_config(path: str | Path) -> FoundationTrainingConfi
     try:
         training = raw["training"]
         corpus_metadata_path = Path(training["corpus_metadata_path"])
+        if not corpus_metadata_path.is_absolute():
+            project_root = _find_project_root(Path(path).resolve().parent)
+            corpus_metadata_path = (project_root / corpus_metadata_path).resolve()
         model_identifier = training["model_identifier"]
         model_revision = training["model_revision"]
         max_steps = int(training["max_steps"])
@@ -1002,8 +1018,6 @@ def load_foundation_training_config(path: str | Path) -> FoundationTrainingConfi
         pad_token_fallback = training.get("pad_token_fallback", "eos")
 
         # Validation
-        if not corpus_metadata_path.is_absolute():
-            raise ValueError("training.corpus_metadata_path must be an absolute path")
         if model_identifier != "zhihan1996/DNABERT-2-117M":
             raise ValueError(
                 "training.model_identifier must be pinned to zhihan1996/DNABERT-2-117M"

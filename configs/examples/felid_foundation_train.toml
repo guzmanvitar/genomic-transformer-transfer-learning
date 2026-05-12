@@ -14,17 +14,18 @@
 # REQUIRED FIELDS — No defaults
 # ============================================================================
 
-# Absolute path to metadata.json produced by TokenizedCorpusWriter.
-# Before running training, ensure the corpus is built:
+# Path to metadata.json produced by TokenizedCorpusWriter (relative to
+# project root, or absolute). Before running training, ensure the corpus
+# is built:
 #   uv run jaguar-geo-assign felid-foundation-pretrain <corpus-config.toml>
-corpus_metadata_path = "/path/to/felid/foundation/corpus/metadata.json"
+corpus_metadata_path = "data/processed/felid_foundation_pretrain/felid_foundation_tokens/metadata.json"
 
 # HuggingFace model identifier (pinned to DNABERT-2-117M per contract).
 model_identifier = "zhihan1996/DNABERT-2-117M"
 
 # Git commit hash for exact model reproducibility.
 # Pinning the revision ensures deterministic warm-start and auditability.
-model_revision = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+model_revision = "7bce263b15377fc15361f52cfab88f8b586abda0"
 
 # Total training steps. Use record_count from corpus metadata to estimate:
 #   max_steps = (record_count / (per_device_train_batch_size * world_size)) * num_epochs
