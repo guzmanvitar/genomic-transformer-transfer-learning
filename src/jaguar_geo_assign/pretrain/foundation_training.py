@@ -203,6 +203,7 @@ def _build_model_and_tokenizer(
         trust_remote_code=True,
         output_loading_info=True,
         low_cpu_mem_usage=False,
+        device_map=None,
     )
 
     # Sync model.config with tokenizer
