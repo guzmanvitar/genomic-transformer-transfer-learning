@@ -190,7 +190,7 @@ def _build_model_and_tokenizer(
     )
     if not hasattr(model_config, "is_decoder"):
         model_config.is_decoder = False
-    if model_config.pad_token_id is None:
+    if not hasattr(model_config, "pad_token_id") or model_config.pad_token_id is None:
         model_config.pad_token_id = tokenizer.pad_token_id
     if not hasattr(model_config, "use_return_dict"):
         model_config.use_return_dict = True
