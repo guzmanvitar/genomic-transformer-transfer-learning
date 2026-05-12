@@ -35,6 +35,7 @@ from accelerate import Accelerator
 from torch.optim import AdamW
 from torch.utils.data import DataLoader
 from transformers import (
+    AutoConfig,
     AutoModelForMaskedLM,
     DataCollatorForLanguageModeling,
     get_cosine_schedule_with_warmup,
@@ -180,9 +181,20 @@ def _build_model_and_tokenizer(
             },
         )
 
+    # Load config first and patch is_decoder for DNABERT-2 compatibility
+    # (its custom bert_layers.py expects this attribute, removed in transformers v5+)
+    model_config = AutoConfig.from_pretrained(
+        config.model_identifier,
+        revision=config.model_revision,
+        trust_remote_code=True,
+    )
+    if not hasattr(model_config, "is_decoder"):
+        model_config.is_decoder = False
+
     # Load model with output_loading_info to inspect missing keys
     model, loading_info = AutoModelForMaskedLM.from_pretrained(
         config.model_identifier,
+        config=model_config,
         revision=config.model_revision,
         trust_remote_code=True,
         output_loading_info=True,
