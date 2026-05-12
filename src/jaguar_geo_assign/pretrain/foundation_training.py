@@ -206,6 +206,26 @@ def _build_model_and_tokenizer(
         device_map=None,
     )
 
+    # DNABERT-2's custom code registers buffers (position_ids, token_type_ids)
+    # that end up on meta device under transformers v5.x.  Materialize them on
+    # CPU so accelerator.prepare() can move the model to GPU later.
+    for _name, module in model.named_modules():
+        for buf_name in list(module._buffers):
+            buf = module._buffers[buf_name]
+            if buf is not None and buf.device.type == "meta":
+                if "position_ids" in buf_name:
+                    seq_len = buf.shape[-1]
+                    module._buffers[buf_name] = torch.arange(seq_len).unsqueeze(0)
+                else:
+                    module._buffers[buf_name] = torch.zeros(buf.shape, dtype=buf.dtype)
+        for param_name in list(module._parameters):
+            p = module._parameters[param_name]
+            if p is not None and p.device.type == "meta":
+                module._parameters[param_name] = torch.nn.Parameter(
+                    torch.zeros(p.shape, dtype=p.dtype),
+                    requires_grad=p.requires_grad,
+                )
+
     # Sync model.config with tokenizer
     model.config.pad_token_id = tokenizer.pad_token_id
 
