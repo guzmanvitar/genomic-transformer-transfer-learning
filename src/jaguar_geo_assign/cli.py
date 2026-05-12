@@ -15,6 +15,7 @@ branch's error contract.
 from __future__ import annotations
 
 import argparse
+import traceback
 from collections.abc import Sequence
 from pathlib import Path
 
@@ -293,8 +294,6 @@ def main(argv: Sequence[str] | None = None) -> int:
             else:
                 run_felid_foundation_training(args.config)
         except (RuntimeError, ValueError):
-            import traceback
-
             traceback.print_exc()
             return 1
         return 0

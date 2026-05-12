@@ -32,6 +32,9 @@ from typing import Any, Literal
 
 import torch
 from accelerate import Accelerator
+from huggingface_hub import hf_hub_download
+from huggingface_hub.errors import EntryNotFoundError
+from safetensors.torch import load_file as safetensors_load_file
 from torch.optim import AdamW
 from torch.utils.data import DataLoader
 from transformers import (
@@ -195,12 +198,10 @@ def _build_model_and_tokenizer(
     if not hasattr(model_config, "return_dict"):
         model_config.return_dict = True
 
-    # Bypass from_pretrained's meta-device initialization (transformers v5.x
-    # creates tensors on torch.device("meta") internally, which crashes with
-    # DNABERT-2's v4.x custom code).  Instead: create model on CPU from config,
-    # then load the pretrained state dict manually.
-    from huggingface_hub import hf_hub_download
-
+    # Bypass from_pretrained's meta-device initialization: transformers v5.x
+    # creates tensors on torch.device("meta") internally, which raises
+    # RuntimeError with DNABERT-2's v4.x custom code.  Create on CPU from
+    # config, then load the pretrained state dict manually.
     model = AutoModelForMaskedLM.from_config(
         model_config,
         trust_remote_code=True,
@@ -212,10 +213,8 @@ def _build_model_and_tokenizer(
             "model.safetensors",
             revision=config.model_revision,
         )
-        from safetensors.torch import load_file
-
-        state_dict = load_file(weight_path, device="cpu")
-    except Exception:
+        state_dict = safetensors_load_file(weight_path, device="cpu")
+    except (EntryNotFoundError, FileNotFoundError):
         weight_path = hf_hub_download(
             config.model_identifier,
             "pytorch_model.bin",
