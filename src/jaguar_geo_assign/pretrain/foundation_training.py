@@ -192,8 +192,8 @@ def _build_model_and_tokenizer(
         model_config.is_decoder = False
     if not hasattr(model_config, "pad_token_id") or model_config.pad_token_id is None:
         model_config.pad_token_id = tokenizer.pad_token_id
-    if not hasattr(model_config, "use_return_dict"):
-        model_config.use_return_dict = True
+    if not hasattr(model_config, "return_dict"):
+        model_config.return_dict = True
 
     # Load model with output_loading_info to inspect missing keys
     model, loading_info = AutoModelForMaskedLM.from_pretrained(
@@ -202,6 +202,7 @@ def _build_model_and_tokenizer(
         revision=config.model_revision,
         trust_remote_code=True,
         output_loading_info=True,
+        low_cpu_mem_usage=False,
     )
 
     # Sync model.config with tokenizer
