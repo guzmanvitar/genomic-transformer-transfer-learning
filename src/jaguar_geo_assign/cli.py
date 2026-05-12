@@ -292,8 +292,10 @@ def main(argv: Sequence[str] | None = None) -> int:
                 integration_test(use_real_model=False)
             else:
                 run_felid_foundation_training(args.config)
-        except (RuntimeError, ValueError) as error:
-            print(str(error))
+        except (RuntimeError, ValueError):
+            import traceback
+
+            traceback.print_exc()
             return 1
         return 0
 

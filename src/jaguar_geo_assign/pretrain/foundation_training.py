@@ -195,36 +195,39 @@ def _build_model_and_tokenizer(
     if not hasattr(model_config, "return_dict"):
         model_config.return_dict = True
 
-    # Load model with output_loading_info to inspect missing keys
-    model, loading_info = AutoModelForMaskedLM.from_pretrained(
-        config.model_identifier,
-        config=model_config,
-        revision=config.model_revision,
+    # Bypass from_pretrained's meta-device initialization (transformers v5.x
+    # creates tensors on torch.device("meta") internally, which crashes with
+    # DNABERT-2's v4.x custom code).  Instead: create model on CPU from config,
+    # then load the pretrained state dict manually.
+    from huggingface_hub import hf_hub_download
+
+    model = AutoModelForMaskedLM.from_config(
+        model_config,
         trust_remote_code=True,
-        output_loading_info=True,
-        low_cpu_mem_usage=False,
-        device_map=None,
     )
 
-    # DNABERT-2's custom code registers buffers (position_ids, token_type_ids)
-    # that end up on meta device under transformers v5.x.  Materialize them on
-    # CPU so accelerator.prepare() can move the model to GPU later.
-    for _name, module in model.named_modules():
-        for buf_name in list(module._buffers):
-            buf = module._buffers[buf_name]
-            if buf is not None and buf.device.type == "meta":
-                if "position_ids" in buf_name:
-                    seq_len = buf.shape[-1]
-                    module._buffers[buf_name] = torch.arange(seq_len).unsqueeze(0)
-                else:
-                    module._buffers[buf_name] = torch.zeros(buf.shape, dtype=buf.dtype)
-        for param_name in list(module._parameters):
-            p = module._parameters[param_name]
-            if p is not None and p.device.type == "meta":
-                module._parameters[param_name] = torch.nn.Parameter(
-                    torch.zeros(p.shape, dtype=p.dtype),
-                    requires_grad=p.requires_grad,
-                )
+    try:
+        weight_path = hf_hub_download(
+            config.model_identifier,
+            "model.safetensors",
+            revision=config.model_revision,
+        )
+        from safetensors.torch import load_file
+
+        state_dict = load_file(weight_path, device="cpu")
+    except Exception:
+        weight_path = hf_hub_download(
+            config.model_identifier,
+            "pytorch_model.bin",
+            revision=config.model_revision,
+        )
+        state_dict = torch.load(weight_path, map_location="cpu", weights_only=True)
+
+    load_result = model.load_state_dict(state_dict, strict=False)
+    loading_info = {
+        "missing_keys": list(load_result.missing_keys),
+        "unexpected_keys": list(load_result.unexpected_keys),
+    }
 
     # Sync model.config with tokenizer
     model.config.pad_token_id = tokenizer.pad_token_id
