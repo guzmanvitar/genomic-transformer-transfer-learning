@@ -181,8 +181,8 @@ def _build_model_and_tokenizer(
             },
         )
 
-    # Load config first and patch is_decoder for DNABERT-2 compatibility
-    # (its custom bert_layers.py expects this attribute, removed in transformers v5+)
+    # Load config first and patch attributes removed from BertConfig in transformers v5+
+    # that DNABERT-2's custom bert_layers.py still accesses directly.
     model_config = AutoConfig.from_pretrained(
         config.model_identifier,
         revision=config.model_revision,
@@ -190,6 +190,10 @@ def _build_model_and_tokenizer(
     )
     if not hasattr(model_config, "is_decoder"):
         model_config.is_decoder = False
+    if model_config.pad_token_id is None:
+        model_config.pad_token_id = tokenizer.pad_token_id
+    if not hasattr(model_config, "use_return_dict"):
+        model_config.use_return_dict = True
 
     # Load model with output_loading_info to inspect missing keys
     model, loading_info = AutoModelForMaskedLM.from_pretrained(
