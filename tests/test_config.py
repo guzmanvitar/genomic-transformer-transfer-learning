@@ -13,6 +13,7 @@ from pathlib import Path
 import pytest
 
 from jaguar_geo_assign.config import (
+    _find_project_root,
     _validate_felid_species_entries,
     load_experiment_config,
     load_felid_foundation_pipeline_config,
@@ -182,6 +183,29 @@ def test_load_foundation_training_config_rejects_unpinned_model_revision(
         match=rf"training\.model_revision must be pinned to {DNABERT2_TOKENIZER_REVISION}",
     ):
         load_foundation_training_config(config_path)
+
+
+def test_find_project_root_walks_up(tmp_path: Path) -> None:
+    """_find_project_root walks parent directories to find pyproject.toml."""
+    (tmp_path / "pyproject.toml").write_text("", encoding="utf-8")
+    nested = tmp_path / "a" / "b" / "c"
+    nested.mkdir(parents=True)
+    assert _find_project_root(nested) == tmp_path
+
+
+def test_find_project_root_raises_when_not_found(tmp_path: Path) -> None:
+    """_find_project_root raises ValueError when no pyproject.toml exists anywhere above start."""
+    # Guard: if pytest has placed tmp_path inside the repo tree (non-default but valid
+    # via --basetemp), the walk would find the real pyproject.toml and no error would
+    # be raised, making this a false positive. Skip rather than silently misbehave.
+    current = tmp_path.resolve()
+    while current != current.parent:
+        if (current / "pyproject.toml").is_file():
+            pytest.skip("tmp_path sits inside a project tree; test would be a false positive")
+        current = current.parent
+
+    with pytest.raises(ValueError, match="pyproject.toml"):
+        _find_project_root(tmp_path)
 
 
 def test_validate_felid_species_entries_rejects_legacy_accession_key() -> None:

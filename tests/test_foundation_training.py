@@ -49,7 +49,8 @@ from jaguar_geo_assign.pretrain.foundation_training import (
     integration_test,
     run_felid_foundation_training,
 )
-from tests.conftest import DummyLoader, make_dummy_loader, write_train_config as _write_train_config
+from tests.conftest import DummyLoader, make_dummy_loader
+from tests.conftest import write_train_config as _write_train_config
 
 try:
     from accelerate import Accelerator
@@ -353,6 +354,24 @@ seed = 42
     assert config.model_identifier == "zhihan1996/DNABERT-2-117M"
     assert config.max_steps == 10000
     assert config.learning_rate == 1e-4
+
+
+def test_foundation_training_config_relative_corpus_path(tmp_path: Path) -> None:
+    """Relative corpus_metadata_path is resolved against the project root."""
+    (tmp_path / "pyproject.toml").write_text("", encoding="utf-8")
+    configs_dir = tmp_path / "configs"
+    configs_dir.mkdir()
+    config_file = configs_dir / "train.toml"
+    config_file.write_text("""
+[training]
+corpus_metadata_path = "data/corpus/metadata.json"
+model_identifier = "zhihan1996/DNABERT-2-117M"
+model_revision = "7bce263b15377fc15361f52cfab88f8b586abda0"
+max_steps = 10000
+""")
+    config = load_foundation_training_config(config_file)
+    assert config.corpus_metadata_path.is_absolute()
+    assert config.corpus_metadata_path == (tmp_path / "data" / "corpus" / "metadata.json").resolve()
 
 
 def test_foundation_training_config_invalid_model_id(tmp_path: Path) -> None:
@@ -788,10 +807,12 @@ def test_nan_loss_skips_token_accuracy_accumulation(
             )
 
             assert 0.0 <= token_correct <= 1.0, (
-                f"Finite-step token_correct should stay within one masked token; got {token_correct}"
+                "Finite-step token_correct should stay within one masked token;"
+                f" got {token_correct}"
             )
             assert token_masked == 1.0, (
-                f"NaN step should not add masked tokens beyond the one finite batch; got {token_masked}"
+                "NaN step should not add masked tokens beyond the one finite batch;"
+                f" got {token_masked}"
             )
 
 
