@@ -225,8 +225,8 @@ class TokenizedCorpusReader(IterableDataset):
             raise CorpusSchemaError("pyarrow is required for Parquet schema validation") from exc
 
         try:
-            parquet_file = pyarrow.parquet.ParquetFile(parquet_path)
-            schema_names = set(parquet_file.schema.names)
+            schema = pyarrow.parquet.read_schema(parquet_path)
+            schema_names = set(schema.names)
         except Exception as exc:
             msg = f"Failed to read Parquet schema from {parquet_path}: {exc}"
             raise CorpusSchemaError(msg) from exc
@@ -339,7 +339,11 @@ class TokenizedCorpusReader(IterableDataset):
             for batch in parquet_file.iter_batches(batch_size=256):
                 batch_dict = batch.to_pydict()
                 for row_idx in range(len(batch)):
-                    row = {k: v[row_idx] for k, v in batch_dict.items()}
+                    row = {
+                        k: v[row_idx]
+                        for k, v in batch_dict.items()
+                        if k in ("input_ids", "attention_mask", "labels")
+                    }
 
                     # Truncate to max_seq_length
                     if "input_ids" in row:
