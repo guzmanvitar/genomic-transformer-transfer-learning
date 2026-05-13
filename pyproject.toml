@@ -29,6 +29,9 @@ dev = [
     "ruff>=0.9,<1",
     "tomli-w>=1.2.0",
 ]
+hf = [
+    "httpx[socks]>=0.25.0",
+]
 
 [tool.ruff]
 line-length = 100
