@@ -197,6 +197,10 @@ def _build_model_and_tokenizer(
         model_config.pad_token_id = tokenizer.pad_token_id
     if not hasattr(model_config, "return_dict"):
         model_config.return_dict = True
+    # DNABERT-2's bundled flash_attn_triton.py uses tl.dot(trans_b=True) which
+    # was removed in Triton 2.1+. Disable flash attention so bert_layers.py
+    # falls back to standard PyTorch attention (same math, slower but compatible).
+    model_config.use_flash_attn = False
 
     # Bypass from_pretrained's meta-device initialization: transformers v5.x
     # creates tensors on torch.device("meta") internally, which raises
