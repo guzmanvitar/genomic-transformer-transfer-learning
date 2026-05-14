@@ -14,10 +14,8 @@ import torch
 from transformers import AutoModelForMaskedLM, BertConfig
 
 try:
-    from accelerate import Accelerator
     from accelerate.state import AcceleratorState, PartialState
 except ImportError:
-    Accelerator = None
     AcceleratorState = None
     PartialState = None
 
@@ -88,31 +86,37 @@ class DummyLoader:
         dataset: DummyDataset instance with set_epoch method and record_count.
         num_batches: Number of batches to yield per __iter__.
         masked_label_count: Number of non-masked labels per batch.
+        device: Device used for the yielded tensors.
     """
 
-    def __init__(self, num_batches: int = 1, masked_label_count: int = 1):
+    def __init__(
+        self,
+        num_batches: int = 1,
+        masked_label_count: int = 1,
+        device: torch.device | None = None,
+    ):
         """Initialize loader with configurable batch count and label pattern.
 
         Args:
             num_batches: Number of batches to yield in __iter__.
             masked_label_count: Number of non-masked labels in the batch.
+            device: Optional device for yielded tensors. Defaults to CPU so the
+                helper never initializes Accelerate state before the test under
+                test constructs its own accelerator.
         """
         self.dataset = DummyDataset(record_count=num_batches)
         self.num_batches = num_batches
         self.masked_label_count = masked_label_count
+        self.device = torch.device("cpu") if device is None else device
 
     def __iter__(self):
-        """Yield num_batches of fixed-shape batches on the accelerator device."""
-        if Accelerator is None:
-            device = torch.device("cpu")
-        else:
-            device = Accelerator().device
+        """Yield num_batches of fixed-shape batches on the configured device."""
 
         for _ in range(self.num_batches):
             yield {
-                "input_ids": torch.tensor([[101, 200, 102, 0]], device=device),
-                "attention_mask": torch.tensor([[1, 1, 1, 0]], device=device),
-                "labels": torch.tensor([[-100, 200, -100, -100]], device=device),
+                "input_ids": torch.tensor([[101, 200, 102, 0]], device=self.device),
+                "attention_mask": torch.tensor([[1, 1, 1, 0]], device=self.device),
+                "labels": torch.tensor([[-100, 200, -100, -100]], device=self.device),
             }
 
     def __len__(self) -> int:
