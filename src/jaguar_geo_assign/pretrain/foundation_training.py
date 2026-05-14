@@ -32,13 +32,9 @@ from typing import Any, Literal
 
 import torch
 from accelerate import Accelerator
-from huggingface_hub import hf_hub_download
-from huggingface_hub.errors import EntryNotFoundError
-from safetensors.torch import load_file as safetensors_load_file
 from torch.optim import AdamW
 from torch.utils.data import DataLoader
 from transformers import (
-    AutoConfig,
     AutoModelForMaskedLM,
     DataCollatorForLanguageModeling,
     get_cosine_schedule_with_warmup,
@@ -184,50 +180,17 @@ def _build_model_and_tokenizer(
             },
         )
 
-    # Load config first and patch attributes removed from BertConfig in transformers v5+
-    # that DNABERT-2's custom bert_layers.py still accesses directly.
-    model_config = AutoConfig.from_pretrained(
+    model, loading_info = AutoModelForMaskedLM.from_pretrained(
         config.model_identifier,
         revision=config.model_revision,
         trust_remote_code=True,
+        output_loading_info=True,
     )
-    if not hasattr(model_config, "is_decoder"):
-        model_config.is_decoder = False
-    if not hasattr(model_config, "pad_token_id") or model_config.pad_token_id is None:
-        model_config.pad_token_id = tokenizer.pad_token_id
-    if not hasattr(model_config, "return_dict"):
-        model_config.return_dict = True
-
-    # Bypass from_pretrained's meta-device initialization: transformers v5.x
-    # creates tensors on torch.device("meta") internally, which raises
-    # RuntimeError with DNABERT-2's v4.x custom code.  Create on CPU from
-    # config, then load the pretrained state dict manually.
-    model = AutoModelForMaskedLM.from_config(
-        model_config,
-        trust_remote_code=True,
-    )
-
-    try:
-        weight_path = hf_hub_download(
-            config.model_identifier,
-            "model.safetensors",
-            revision=config.model_revision,
+    if loading_info.get("error_msgs"):
+        logger.warning(
+            "from_pretrained reported non-empty error_msgs: %s",
+            loading_info["error_msgs"],
         )
-        state_dict = safetensors_load_file(weight_path, device="cpu")
-    except (EntryNotFoundError, FileNotFoundError):
-        weight_path = hf_hub_download(
-            config.model_identifier,
-            "pytorch_model.bin",
-            revision=config.model_revision,
-        )
-        # weights_only=True is safe: DNABERT-2's .bin is a standard state dict.
-        state_dict = torch.load(weight_path, map_location="cpu", weights_only=True)
-
-    load_result = model.load_state_dict(state_dict, strict=False)
-    loading_info = {
-        "missing_keys": list(load_result.missing_keys),
-        "unexpected_keys": list(load_result.unexpected_keys),
-    }
 
     # Sync model.config with tokenizer
     model.config.pad_token_id = tokenizer.pad_token_id
@@ -1095,15 +1058,9 @@ def integration_test(
 
         # Load or create model
         if use_real_model:
-            # Use from_config + manual weight loading, same as production path,
-            # to avoid transformers v5.x meta-device RuntimeError.
-            real_cfg = AutoConfig.from_pretrained(
+            model = AutoModelForMaskedLM.from_pretrained(
                 "zhihan1996/DNABERT-2-117M", trust_remote_code=True
             )
-            model = AutoModelForMaskedLM.from_config(real_cfg, trust_remote_code=True)
-            _weight_path = hf_hub_download("zhihan1996/DNABERT-2-117M", "model.safetensors")
-            model.load_state_dict(safetensors_load_file(_weight_path, device="cpu"), strict=False)
-            _tokenizer, _ = load_dnabert2_tokenizer()
         else:
             # Tiny model for fast testing
             from transformers import BertConfig
@@ -1162,13 +1119,11 @@ def integration_test(
         logger.info("✓ Assertion 3: save_pretrained writes config.json + safetensors")
 
         # Assertion 4: reload yields identical state_dict keys.
-        # Use from_config + safetensors to avoid the same meta-device issue.
-        reload_cfg = AutoConfig.from_pretrained(str(model_dir), trust_remote_code=use_real_model)
-        reloaded = AutoModelForMaskedLM.from_config(reload_cfg, trust_remote_code=use_real_model)
         st_files = list(model_dir.glob("*.safetensors"))
         assert st_files, "No safetensors file written by save_pretrained"
-        reload_sd = safetensors_load_file(str(st_files[0]), device="cpu")
-        reloaded.load_state_dict(reload_sd, strict=False)
+        reloaded = AutoModelForMaskedLM.from_pretrained(
+            str(model_dir), trust_remote_code=use_real_model
+        )
         orig_keys = set(model.state_dict().keys())
         reload_keys = set(reloaded.state_dict().keys())
         assert orig_keys == reload_keys, f"State dict keys differ: {orig_keys ^ reload_keys}"
