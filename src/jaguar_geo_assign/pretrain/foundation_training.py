@@ -7,7 +7,7 @@ with atomic writes, and integration testing via synthetic or real models.
 
 Key design decisions:
 - IterableDataset is used (streaming reader); resume restarts at epoch boundary.
-- Perplexity is clamped at exp(20) to protect against bf16 noise.
+- Perplexity is clamped at exp(20) to avoid reporting astronomically large values.
 - Pad-token guard implements all three fallback strategies (eos/unk/add_pad).
 - Evaluation uses a deterministic eval_max_steps to prevent DDP deadlock.
 
@@ -41,6 +41,7 @@ from transformers import (
 )
 
 from jaguar_geo_assign.config import FoundationTrainingConfig
+from jaguar_geo_assign.data.pipeline_contract import DNABERT2_TOKENIZER_REVISION
 from jaguar_geo_assign.data.preprocessor import load_dnabert2_tokenizer
 from jaguar_geo_assign.data.tokenized_corpus_reader import (
     CorpusReaderError,
@@ -692,7 +693,20 @@ def run_felid_foundation_training(
                     loss_f = loss.detach().float()
                     if not torch.isfinite(loss_f).all():
                         train_metric.nan_count += 1
-                        logger.warning(f"NaN/Inf loss detected at step {step}")
+                        if accelerator.sync_gradients:
+                            logger.warning(
+                                "NaN/Inf loss detected at step %d on a sync step; "
+                                "clearing gradients before continuing.",
+                                step,
+                            )
+                        else:
+                            logger.warning(
+                                "NaN/Inf loss detected at step %d during a "
+                                "gradient-accumulation micro-step; discarding any "
+                                "previously accumulated gradients before the next "
+                                "optimizer step.",
+                                step,
+                            )
                         optimizer.zero_grad()
                         continue
                     else:
@@ -781,7 +795,7 @@ def run_felid_foundation_training(
                         token_acc = (
                             float("nan") if global_masked == 0 else global_correct / global_masked
                         )
-                        # Perplexity clamped at 20 to prevent bf16 overflow (exp grows too fast)
+                        # Perplexity is clamped at 20 to avoid astronomically large values.
                         ppl = (
                             float("nan")
                             if train_metric.step_count == 0
@@ -1059,7 +1073,9 @@ def integration_test(
         # Load or create model
         if use_real_model:
             model = AutoModelForMaskedLM.from_pretrained(
-                "zhihan1996/DNABERT-2-117M", trust_remote_code=True
+                "zhihan1996/DNABERT-2-117M",
+                revision=DNABERT2_TOKENIZER_REVISION,
+                trust_remote_code=True,
             )
         else:
             # Tiny model for fast testing
@@ -1119,8 +1135,7 @@ def integration_test(
         logger.info("✓ Assertion 3: save_pretrained writes config.json + safetensors")
 
         # Assertion 4: reload yields identical state_dict keys.
-        st_files = list(model_dir.glob("*.safetensors"))
-        assert st_files, "No safetensors file written by save_pretrained"
+        assert any(model_dir.glob("*.safetensors"))
         reloaded = AutoModelForMaskedLM.from_pretrained(
             str(model_dir), trust_remote_code=use_real_model
         )
