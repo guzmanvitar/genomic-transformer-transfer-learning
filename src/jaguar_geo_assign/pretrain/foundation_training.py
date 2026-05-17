@@ -569,14 +569,6 @@ def run_felid_foundation_training(
     output_dir = Path(config.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Load model and tokenizer
-    model, tokenizer, pad_fallback, mlm_random_init = _build_model_and_tokenizer(config)
-
-    # Build optimizer, scheduler, dataloaders
-    optimizer = _build_optimizer(model, config.learning_rate, config.weight_decay)
-    scheduler = _build_scheduler(optimizer, config.warmup_steps, config.max_steps)
-    train_loader, eval_loader = _build_dataloaders(config, tokenizer)
-
     # Initialize Accelerator with bf16 mixed precision
     accelerator = Accelerator(
         mixed_precision="bf16",
@@ -584,6 +576,13 @@ def run_felid_foundation_training(
         log_with="tensorboard",
         project_dir=str(output_dir / config.tensorboard_subdir),
     )
+    # Load model and tokenizer
+    model, tokenizer, pad_fallback, mlm_random_init = _build_model_and_tokenizer(config)
+
+    # Build optimizer, scheduler, dataloaders
+    optimizer = _build_optimizer(model, config.learning_rate, config.weight_decay)
+    scheduler = _build_scheduler(optimizer, config.warmup_steps, config.max_steps)
+    train_loader, eval_loader = _build_dataloaders(config, tokenizer)
 
     # Check for resumed state
     latest_state_path = output_dir / "latest" / "accelerate_state"
