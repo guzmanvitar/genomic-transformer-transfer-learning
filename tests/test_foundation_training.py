@@ -54,10 +54,9 @@ from tests.conftest import write_train_config as _write_train_config
 
 try:
     from accelerate import Accelerator
-    from accelerate.state import AcceleratorState, PartialState
+    from accelerate.state import PartialState
 except ImportError:
     Accelerator = None
-    AcceleratorState = None
     PartialState = None
 
 
@@ -69,18 +68,6 @@ def write_train_config(tmp_path: Path, metadata_path: Path, **overrides) -> Path
     """
     overrides.setdefault("model_revision", DNABERT2_TOKENIZER_REVISION)
     return _write_train_config(tmp_path, metadata_path, **overrides)
-
-
-@pytest.fixture(autouse=True)
-def reset_accelerate_state():
-    """Reset AcceleratorState before and after each test to prevent cross-test pollution."""
-    if AcceleratorState is not None:
-        AcceleratorState._reset_state()
-        PartialState._reset_state()
-    yield
-    if AcceleratorState is not None:
-        AcceleratorState._reset_state()
-        PartialState._reset_state()
 
 
 class FakeTokenizer:
@@ -169,6 +156,23 @@ def _write_tiny_corpus(tmp_path: Path, split_records: dict[str, int]) -> Path:
     return output_dir / "metadata.json"
 
 
+def _read_single_window_locus_id(file_path: Path) -> str:
+    """Return the stored ``window.locus_id`` for a one-record synthetic shard.
+
+    The reader now yields only model tensor columns, so the DDP sharding tests
+    must recover shard identity from the raw Parquet payload instead of the
+    streamed row dictionaries.
+    """
+    import pyarrow.parquet as pyarrow_parquet
+
+    batch = next(pyarrow_parquet.ParquetFile(file_path).iter_batches(batch_size=1))
+    window = batch.to_pydict()["window"][0]
+    assert isinstance(window, dict)
+    locus_id = window["locus_id"]
+    assert isinstance(locus_id, str)
+    return locus_id
+
+
 def test_reader_cold_start_missing_metadata(tmp_path: Path) -> None:
     """Test (e): missing metadata.json raises CorpusReaderError with actionable message.
 
@@ -230,7 +234,12 @@ def test_reader_sharded_workers_disjoint_rows(tmp_path: Path) -> None:
     Each should read a disjoint subset of files.
     """
     pytest.importorskip("pyarrow.parquet")
+    import pyarrow.parquet as pyarrow_parquet
+
     metadata_path = _write_tiny_corpus(tmp_path, {"train": 10})
+    original_parquet_file = pyarrow_parquet.ParquetFile
+    opened_files_0: list[Path] = []
+    opened_files_1: list[Path] = []
 
     # Skip this test if schema validation fails due to PyArrow flattening
     # The reader validates the schema on construction, so we need to
@@ -244,29 +253,43 @@ def test_reader_sharded_workers_disjoint_rows(tmp_path: Path) -> None:
             seed=42,
         )
 
+        def record_worker_0_shard(path: str | Path, *args: object, **kwargs: object):
+            """Record which Parquet shard worker 0 opens during iteration."""
+            opened_files_0.append(Path(path))
+            return original_parquet_file(path, *args, **kwargs)
+
         # Simulate worker 0
         patch_path = "jaguar_geo_assign.data.tokenized_corpus_reader._get_distributed_state"
-        with patch(patch_path) as mock_state:
+        with (
+            patch(patch_path) as mock_state,
+            patch(
+                "pyarrow.parquet.ParquetFile",
+                side_effect=record_worker_0_shard,
+            ),
+        ):
             # process=0, num_procs=1, worker=0, num_workers=2
             mock_state.return_value = (0, 1, 0, 2)
-            rows_worker_0 = list(reader)
+            list(reader)
+
+        def record_worker_1_shard(path: str | Path, *args: object, **kwargs: object):
+            """Record which Parquet shard worker 1 opens during iteration."""
+            opened_files_1.append(Path(path))
+            return original_parquet_file(path, *args, **kwargs)
 
         # Simulate worker 1
-        with patch(patch_path) as mock_state:
+        with (
+            patch(patch_path) as mock_state,
+            patch(
+                "pyarrow.parquet.ParquetFile",
+                side_effect=record_worker_1_shard,
+            ),
+        ):
             # process=0, num_procs=1, worker=1, num_workers=2
             mock_state.return_value = (0, 1, 1, 2)
-            rows_worker_1 = list(reader)
+            list(reader)
 
-        # Extract locus_ids to verify disjointness (look for window.locus_id)
-        loci_0 = set()
-        for row in rows_worker_0:
-            if "window" in row and isinstance(row["window"], dict):
-                loci_0.add(row["window"].get("locus_id"))
-
-        loci_1 = set()
-        for row in rows_worker_1:
-            if "window" in row and isinstance(row["window"], dict):
-                loci_1.add(row["window"].get("locus_id"))
+        loci_0 = {_read_single_window_locus_id(path) for path in opened_files_0}
+        loci_1 = {_read_single_window_locus_id(path) for path in opened_files_1}
 
         assert len(loci_0) > 0, "Worker 0 should have read at least one row"
         assert len(loci_1) > 0, "Worker 1 should have read at least one row"
@@ -484,8 +507,9 @@ def test_nan_loss_skips_backward_pass_in_training_loop(tmp_path: Path) -> None:
 
     This unit test patches config/model setup so it can inject one NaN micro-batch
     followed by one finite micro-batch and assert the training loop only calls
-    ``backward()`` for the finite loss. That prevents NaN gradients from entering
-    the accumulated optimizer state.
+    ``backward()`` for the finite loss. It also verifies that a NaN on a
+    gradient-accumulation micro-step emits the discard warning before
+    ``optimizer.zero_grad()`` clears any partial state.
     """
 
     class _FakeAccelerator:
@@ -494,11 +518,18 @@ def test_nan_loss_skips_backward_pass_in_training_loop(tmp_path: Path) -> None:
         def __init__(self) -> None:
             """Initialize a CPU-only stub with call recording."""
             self.device = torch.device("cpu")
-            self.sync_gradients = True
             self.is_main_process = False
             self.num_processes = 1
             self.backward_calls: list[torch.Tensor] = []
             self.logged: list[tuple[dict[str, float], int | None]] = []
+            self._sync_gradients = True
+            self._sync_pattern = [False, True]
+            self._accumulate_calls = 0
+
+        @property
+        def sync_gradients(self) -> bool:
+            """Return whether the scripted micro-batch should sync gradients."""
+            return self._sync_gradients
 
         def wait_for_everyone(self) -> None:
             """Mirror the barrier API without synchronizing real processes."""
@@ -508,7 +539,9 @@ def test_nan_loss_skips_backward_pass_in_training_loop(tmp_path: Path) -> None:
             return args
 
         def accumulate(self, _model: torch.nn.Module):
-            """Provide a no-op accumulation context manager."""
+            """Advance a scripted sync/non-sync pattern per micro-batch."""
+            self._sync_gradients = self._sync_pattern[self._accumulate_calls]
+            self._accumulate_calls += 1
             return nullcontext()
 
         def init_trackers(self, *_args, **_kwargs) -> None:
@@ -585,7 +618,7 @@ def test_nan_loss_skips_backward_pass_in_training_loop(tmp_path: Path) -> None:
         weight_decay=0.0,
         warmup_steps=0,
         max_steps=1,
-        gradient_accumulation_steps=1,
+        gradient_accumulation_steps=2,
         tensorboard_subdir="tb",
         log_every=1,
         eval_every=1,
@@ -599,6 +632,16 @@ def test_nan_loss_skips_backward_pass_in_training_loop(tmp_path: Path) -> None:
     optimizer = MagicMock()
     scheduler = MagicMock()
     scheduler.get_last_lr.return_value = [1e-4]
+    event_log: list[tuple[str, str | None]] = []
+    warning_messages: list[str] = []
+
+    def record_warning(message: str, *args) -> None:
+        """Capture warning text so the test can verify ordering and content."""
+        rendered = message % args if args else message
+        warning_messages.append(rendered)
+        event_log.append(("warning", rendered))
+
+    optimizer.zero_grad.side_effect = lambda: event_log.append(("zero_grad", None))
 
     with (
         patch("jaguar_geo_assign.config.load_foundation_training_config", return_value=config),
@@ -622,12 +665,23 @@ def test_nan_loss_skips_backward_pass_in_training_loop(tmp_path: Path) -> None:
             "jaguar_geo_assign.pretrain.foundation_training.Accelerator",
             return_value=fake_accelerator,
         ),
+        patch("logging.Logger.warning", side_effect=record_warning),
     ):
         result = run_felid_foundation_training(tmp_path / "config.toml")
 
     assert result.final_step == 1
     assert len(fake_accelerator.backward_calls) == 1
     assert float(fake_accelerator.backward_calls[0].item()) == pytest.approx(1.25)
+    assert optimizer.zero_grad.call_count == 2
+    assert event_log[:2] == [
+        ("warning", warning_messages[0]),
+        ("zero_grad", None),
+    ]
+    assert any(
+        "gradient-accumulation micro-step" in message
+        and "discarding any previously accumulated gradients" in message
+        for message in warning_messages
+    )
 
     train_logs = [
         values for values, _step in fake_accelerator.logged if "train/nan_steps" in values
@@ -1663,11 +1717,17 @@ def test_reader_full_ddp_sharding_coverage(tmp_path: Path) -> None:
     """Verify DDP sharding distributes files evenly without duplicates."""
 
     class FakeBatch:
+        """Tiny batch stub that exposes one unique marker via ``input_ids``."""
+
         def __init__(self, locus_id):
             self.locus_id = locus_id
 
         def to_pydict(self):
-            return {"locus_id": [[self.locus_id]]}
+            """Mirror the reader's current tensor-only row contract."""
+            return {
+                "attention_mask": [[1]],
+                "input_ids": [[self.locus_id]],
+            }
 
         def __len__(self):
             return 1
@@ -1719,9 +1779,9 @@ def test_reader_full_ddp_sharding_coverage(tmp_path: Path) -> None:
                     reader._files = [Path(f"file_{i}.parquet") for i in range(16)]
                     reader._record_count = 16
 
-                    # Extract the unique marker from each yielded record
+                    # Extract the unique marker from the tensor payload preserved by the reader
                     records = list(reader)
-                    markers = [rec["locus_id"][0] for rec in records]
+                    markers = [rec["input_ids"][0] for rec in records]
                     collected_markers.extend(markers)
                     all_worker_markers.append(set(markers))
 
@@ -1998,7 +2058,7 @@ def test_eval_loop_respects_max_steps(tmp_path: Path, cpu_accelerator, tiny_bert
         mock_build.return_value = (tiny_bert_model, tokenizer, "none", False)
 
         # The DummyLoader yields 5 batches, but we set eval_max_steps=2
-        dummy_loader = DummyLoader(num_batches=5)
+        dummy_loader = DummyLoader(num_batches=5, device=torch.device("cpu"))
         mock_loaders.return_value = (dummy_loader, dummy_loader)
 
         # Run training, tracking how many times gather_for_metrics was called
@@ -2055,7 +2115,7 @@ eval_every = 1
         patch("accelerate.Accelerator.load_state"),
     ):
         mock_build.return_value = (tiny_bert_model, tokenizer, "none", False)
-        empty_loader = DummyLoader(num_batches=0)
+        empty_loader = DummyLoader(num_batches=0, device=torch.device("cpu"))
         mock_loaders.return_value = (empty_loader, None)
 
         result = run_felid_foundation_training(config_file, integration_test_mode="off")
@@ -2097,7 +2157,7 @@ eval_every = 1
         patch("logging.Logger.info") as mock_info,
     ):
         mock_build.return_value = (tiny_bert_model, tokenizer, "none", False)
-        mock_loaders.return_value = (DummyLoader(num_batches=0), None)
+        mock_loaders.return_value = (DummyLoader(num_batches=0, device=torch.device("cpu")), None)
 
         result = run_felid_foundation_training(config_file, integration_test_mode="off")
         assert result.final_step == 0
@@ -2141,7 +2201,7 @@ eval_every = 1
         patch("logging.Logger.warning") as mock_warning,
     ):
         mock_build.return_value = (tiny_bert_model, tokenizer, "none", False)
-        mock_loaders.return_value = (DummyLoader(num_batches=0), None)
+        mock_loaders.return_value = (DummyLoader(num_batches=0, device=torch.device("cpu")), None)
 
         result = run_felid_foundation_training(config_file, integration_test_mode="off")
         assert result.final_step == 0
@@ -2238,11 +2298,21 @@ def test_reader_disjoint_when_bypassing_prepare(tmp_path: Path) -> None:
     - Union of file paths from both ranks covers all corpus files
     """
     pytest.importorskip("pyarrow.parquet")
+    import pyarrow.parquet as pyarrow_parquet
+
     if Accelerator is None:
         pytest.skip("accelerate not available")
 
     # Create a 4-file corpus (ensures 2 ranks get 2 files each)
     metadata_path = _write_tiny_corpus(tmp_path, {"train": 4})
+    original_parquet_file = pyarrow_parquet.ParquetFile
+    opened_files_0: list[Path] = []
+    opened_files_1: list[Path] = []
+
+    def record_rank_0_shard(path: str | Path, *args: object, **kwargs: object):
+        """Record which Parquet shards rank 0 opens while streaming."""
+        opened_files_0.append(Path(path))
+        return original_parquet_file(path, *args, **kwargs)
 
     # Patch _get_distributed_state to simulate rank 0
     with (
@@ -2250,6 +2320,7 @@ def test_reader_disjoint_when_bypassing_prepare(tmp_path: Path) -> None:
             "jaguar_geo_assign.data.tokenized_corpus_reader._get_distributed_state"
         ) as mock_state,
         patch.object(TokenizedCorpusReader, "_probe_parquet_schema", return_value=None),
+        patch("pyarrow.parquet.ParquetFile", side_effect=record_rank_0_shard),
     ):
         mock_state.return_value = (0, 2, 0, 1)  # rank 0 of 2, single worker
         reader_0 = TokenizedCorpusReader(
@@ -2260,12 +2331,18 @@ def test_reader_disjoint_when_bypassing_prepare(tmp_path: Path) -> None:
         )
         reader_0_records = list(reader_0)
 
+    def record_rank_1_shard(path: str | Path, *args: object, **kwargs: object):
+        """Record which Parquet shards rank 1 opens while streaming."""
+        opened_files_1.append(Path(path))
+        return original_parquet_file(path, *args, **kwargs)
+
     # Patch _get_distributed_state to simulate rank 1
     with (
         patch(
             "jaguar_geo_assign.data.tokenized_corpus_reader._get_distributed_state"
         ) as mock_state,
         patch.object(TokenizedCorpusReader, "_probe_parquet_schema", return_value=None),
+        patch("pyarrow.parquet.ParquetFile", side_effect=record_rank_1_shard),
     ):
         mock_state.return_value = (1, 2, 0, 1)  # rank 1 of 2, single worker
         reader_1 = TokenizedCorpusReader(
@@ -2280,10 +2357,8 @@ def test_reader_disjoint_when_bypassing_prepare(tmp_path: Path) -> None:
     assert len(reader_0_records) > 0, "Rank 0 reader yielded no records"
     assert len(reader_1_records) > 0, "Rank 1 reader yielded no records"
 
-    # Extract locus_ids from window objects to verify file-level sharding is disjoint
-    # Rank 0 should have file 0 and 2; Rank 1 should have files 1 and 3
-    loci_0 = {r.get("window", {}).get("locus_id") for r in reader_0_records if r.get("window")}
-    loci_1 = {r.get("window", {}).get("locus_id") for r in reader_1_records if r.get("window")}
+    loci_0 = {_read_single_window_locus_id(path) for path in opened_files_0}
+    loci_1 = {_read_single_window_locus_id(path) for path in opened_files_1}
 
     # Assert disjointness
     intersection = loci_0 & loci_1

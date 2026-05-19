@@ -7,7 +7,7 @@ with atomic writes, and integration testing via synthetic or real models.
 
 Key design decisions:
 - IterableDataset is used (streaming reader); resume restarts at epoch boundary.
-- Perplexity is clamped at exp(20) to protect against bf16 noise.
+- Perplexity is clamped at exp(20) to avoid reporting astronomically large values.
 - Pad-token guard implements all three fallback strategies (eos/unk/add_pad).
 - Evaluation uses a deterministic eval_max_steps to prevent DDP deadlock.
 
@@ -32,19 +32,16 @@ from typing import Any, Literal
 
 import torch
 from accelerate import Accelerator
-from huggingface_hub import hf_hub_download
-from huggingface_hub.errors import EntryNotFoundError
-from safetensors.torch import load_file as safetensors_load_file
 from torch.optim import AdamW
 from torch.utils.data import DataLoader
 from transformers import (
-    AutoConfig,
     AutoModelForMaskedLM,
     DataCollatorForLanguageModeling,
     get_cosine_schedule_with_warmup,
 )
 
 from jaguar_geo_assign.config import FoundationTrainingConfig
+from jaguar_geo_assign.data.pipeline_contract import DNABERT2_TOKENIZER_REVISION
 from jaguar_geo_assign.data.preprocessor import load_dnabert2_tokenizer
 from jaguar_geo_assign.data.tokenized_corpus_reader import (
     CorpusReaderError,
@@ -184,50 +181,17 @@ def _build_model_and_tokenizer(
             },
         )
 
-    # Load config first and patch attributes removed from BertConfig in transformers v5+
-    # that DNABERT-2's custom bert_layers.py still accesses directly.
-    model_config = AutoConfig.from_pretrained(
+    model, loading_info = AutoModelForMaskedLM.from_pretrained(
         config.model_identifier,
         revision=config.model_revision,
         trust_remote_code=True,
+        output_loading_info=True,
     )
-    if not hasattr(model_config, "is_decoder"):
-        model_config.is_decoder = False
-    if not hasattr(model_config, "pad_token_id") or model_config.pad_token_id is None:
-        model_config.pad_token_id = tokenizer.pad_token_id
-    if not hasattr(model_config, "return_dict"):
-        model_config.return_dict = True
-
-    # Bypass from_pretrained's meta-device initialization: transformers v5.x
-    # creates tensors on torch.device("meta") internally, which raises
-    # RuntimeError with DNABERT-2's v4.x custom code.  Create on CPU from
-    # config, then load the pretrained state dict manually.
-    model = AutoModelForMaskedLM.from_config(
-        model_config,
-        trust_remote_code=True,
-    )
-
-    try:
-        weight_path = hf_hub_download(
-            config.model_identifier,
-            "model.safetensors",
-            revision=config.model_revision,
+    if loading_info.get("error_msgs"):
+        logger.warning(
+            "from_pretrained reported non-empty error_msgs: %s",
+            loading_info["error_msgs"],
         )
-        state_dict = safetensors_load_file(weight_path, device="cpu")
-    except (EntryNotFoundError, FileNotFoundError):
-        weight_path = hf_hub_download(
-            config.model_identifier,
-            "pytorch_model.bin",
-            revision=config.model_revision,
-        )
-        # weights_only=True is safe: DNABERT-2's .bin is a standard state dict.
-        state_dict = torch.load(weight_path, map_location="cpu", weights_only=True)
-
-    load_result = model.load_state_dict(state_dict, strict=False)
-    loading_info = {
-        "missing_keys": list(load_result.missing_keys),
-        "unexpected_keys": list(load_result.unexpected_keys),
-    }
 
     # Sync model.config with tokenizer
     model.config.pad_token_id = tokenizer.pad_token_id
@@ -605,14 +569,6 @@ def run_felid_foundation_training(
     output_dir = Path(config.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Load model and tokenizer
-    model, tokenizer, pad_fallback, mlm_random_init = _build_model_and_tokenizer(config)
-
-    # Build optimizer, scheduler, dataloaders
-    optimizer = _build_optimizer(model, config.learning_rate, config.weight_decay)
-    scheduler = _build_scheduler(optimizer, config.warmup_steps, config.max_steps)
-    train_loader, eval_loader = _build_dataloaders(config, tokenizer)
-
     # Initialize Accelerator with bf16 mixed precision
     accelerator = Accelerator(
         mixed_precision="bf16",
@@ -620,6 +576,13 @@ def run_felid_foundation_training(
         log_with="tensorboard",
         project_dir=str(output_dir / config.tensorboard_subdir),
     )
+    # Load model and tokenizer
+    model, tokenizer, pad_fallback, mlm_random_init = _build_model_and_tokenizer(config)
+
+    # Build optimizer, scheduler, dataloaders
+    optimizer = _build_optimizer(model, config.learning_rate, config.weight_decay)
+    scheduler = _build_scheduler(optimizer, config.warmup_steps, config.max_steps)
+    train_loader, eval_loader = _build_dataloaders(config, tokenizer)
 
     # Check for resumed state
     latest_state_path = output_dir / "latest" / "accelerate_state"
@@ -729,7 +692,20 @@ def run_felid_foundation_training(
                     loss_f = loss.detach().float()
                     if not torch.isfinite(loss_f).all():
                         train_metric.nan_count += 1
-                        logger.warning(f"NaN/Inf loss detected at step {step}")
+                        if accelerator.sync_gradients:
+                            logger.warning(
+                                "NaN/Inf loss detected at step %d on a sync step; "
+                                "clearing gradients before continuing.",
+                                step,
+                            )
+                        else:
+                            logger.warning(
+                                "NaN/Inf loss detected at step %d during a "
+                                "gradient-accumulation micro-step; discarding any "
+                                "previously accumulated gradients before the next "
+                                "optimizer step.",
+                                step,
+                            )
                         optimizer.zero_grad()
                         continue
                     else:
@@ -818,7 +794,7 @@ def run_felid_foundation_training(
                         token_acc = (
                             float("nan") if global_masked == 0 else global_correct / global_masked
                         )
-                        # Perplexity clamped at 20 to prevent bf16 overflow (exp grows too fast)
+                        # Perplexity is clamped at 20 to avoid astronomically large values.
                         ppl = (
                             float("nan")
                             if train_metric.step_count == 0
@@ -1095,15 +1071,11 @@ def integration_test(
 
         # Load or create model
         if use_real_model:
-            # Use from_config + manual weight loading, same as production path,
-            # to avoid transformers v5.x meta-device RuntimeError.
-            real_cfg = AutoConfig.from_pretrained(
-                "zhihan1996/DNABERT-2-117M", trust_remote_code=True
+            model = AutoModelForMaskedLM.from_pretrained(
+                "zhihan1996/DNABERT-2-117M",
+                revision=DNABERT2_TOKENIZER_REVISION,
+                trust_remote_code=True,
             )
-            model = AutoModelForMaskedLM.from_config(real_cfg, trust_remote_code=True)
-            _weight_path = hf_hub_download("zhihan1996/DNABERT-2-117M", "model.safetensors")
-            model.load_state_dict(safetensors_load_file(_weight_path, device="cpu"), strict=False)
-            _tokenizer, _ = load_dnabert2_tokenizer()
         else:
             # Tiny model for fast testing
             from transformers import BertConfig
@@ -1162,13 +1134,10 @@ def integration_test(
         logger.info("✓ Assertion 3: save_pretrained writes config.json + safetensors")
 
         # Assertion 4: reload yields identical state_dict keys.
-        # Use from_config + safetensors to avoid the same meta-device issue.
-        reload_cfg = AutoConfig.from_pretrained(str(model_dir), trust_remote_code=use_real_model)
-        reloaded = AutoModelForMaskedLM.from_config(reload_cfg, trust_remote_code=use_real_model)
-        st_files = list(model_dir.glob("*.safetensors"))
-        assert st_files, "No safetensors file written by save_pretrained"
-        reload_sd = safetensors_load_file(str(st_files[0]), device="cpu")
-        reloaded.load_state_dict(reload_sd, strict=False)
+        assert any(model_dir.glob("*.safetensors"))
+        reloaded = AutoModelForMaskedLM.from_pretrained(
+            str(model_dir), trust_remote_code=use_real_model
+        )
         orig_keys = set(model.state_dict().keys())
         reload_keys = set(reloaded.state_dict().keys())
         assert orig_keys == reload_keys, f"State dict keys differ: {orig_keys ^ reload_keys}"
