@@ -651,6 +651,7 @@ def run_felid_foundation_training(
     # IterableDataset cannot restore cursor position; restart at epoch boundary.
     # This trades perfect resume (a few duplicate rows in first batch) for robustness.
     step = 0
+    patience_counter = 0
     if resumed:
         accelerator.load_state(str(latest_state_path))
 
@@ -662,6 +663,7 @@ def run_felid_foundation_training(
             try:
                 train_state = json.loads(train_state_path.read_text(encoding="utf-8"))
                 step = int(train_state.get("step", 0))
+                patience_counter = int(train_state.get("patience_counter", 0))
             except (OSError, json.JSONDecodeError, ValueError) as exc:
                 logger.warning(
                     "Failed to parse %s on resume; restarting step counter at 0: %s",
@@ -681,7 +683,6 @@ def run_felid_foundation_training(
     # Note: tokens-trained-so-far implications: no metrics currently use step as a
     # denominator in a way that breaks on resume. step counts all previous steps.
     best_eval_loss = float("inf") if best_eval_loss is None else float(best_eval_loss)
-    patience_counter = 0
     early_stopped = False
     train_metric = MetricAccumulator()
     eval_metric = MetricAccumulator()
@@ -1075,7 +1076,11 @@ def run_felid_foundation_training(
 
                                 _save_json_atomically(
                                     latest_dir / "train_state.json",
-                                    {"step": step, "best_eval_loss": best_eval_loss},
+                                    {
+                                        "step": step,
+                                        "best_eval_loss": best_eval_loss,
+                                        "patience_counter": patience_counter,
+                                    },
                                 )
                             except Exception as e:
                                 # Catch exception to broadcast to other ranks (prevents deadlock)
