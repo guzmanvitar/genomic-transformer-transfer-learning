@@ -24,6 +24,7 @@ import logging
 import math
 import os
 import shutil
+import sys
 import tempfile
 from collections.abc import Iterator
 from dataclasses import dataclass, field
@@ -187,6 +188,21 @@ def _build_model_and_tokenizer(
         trust_remote_code=True,
         output_loading_info=True,
     )
+
+    # DNABERT-2's bundled flash_attn_triton.py uses tl.dot(trans_b=True), removed
+    # in Triton 2.2+. Null out the function so bert_layers falls back to the standard
+    # PyTorch attention path (the model's own fallback, line 161 in bert_layers.py).
+    bert_layers_mod = sys.modules.get(
+        "transformers_modules.zhihan1996.DNABERT_hyphen_2_hyphen_117M."
+        f"{config.model_revision}.bert_layers"
+    )
+    if (
+        bert_layers_mod is not None
+        and getattr(bert_layers_mod, "flash_attn_qkvpacked_func", None) is not None
+    ):
+        bert_layers_mod.flash_attn_qkvpacked_func = None
+        logger.info("Disabled DNABERT-2 Triton flash attention; using PyTorch fallback.")
+
     if loading_info.get("error_msgs"):
         logger.warning(
             "from_pretrained reported non-empty error_msgs: %s",
@@ -883,15 +899,16 @@ def run_felid_foundation_training(
                                     preds = outputs.logits.argmax(dim=-1)
                                     labels = eval_batch.get("labels")
                                     if labels is not None:
-                                        gathered_preds = accelerator.gather_for_metrics(preds)
-                                        gathered_labels = accelerator.gather_for_metrics(labels)
-                                        gathered_mask = gathered_labels != -100
+                                        mask = labels != -100
+                                        correct = ((preds == labels) & mask).sum()
+                                        masked = mask.sum()
+                                        gathered_correct = accelerator.gather_for_metrics(correct)
+                                        gathered_masked = accelerator.gather_for_metrics(masked)
                                         if accelerator.is_main_process:
-                                            mask_match = (
-                                                gathered_preds == gathered_labels
-                                            ) & gathered_mask
-                                            eval_metric.token_correct += mask_match.sum().item()
-                                            eval_metric.token_masked += gathered_mask.sum().item()
+                                            eval_metric.token_correct += (
+                                                gathered_correct.sum().item()
+                                            )
+                                            eval_metric.token_masked += gathered_masked.sum().item()
 
                         model.train()
                         mean_eval_loss = (
