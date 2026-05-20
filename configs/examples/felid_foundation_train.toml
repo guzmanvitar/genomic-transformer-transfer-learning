@@ -82,6 +82,10 @@ eval_every = 500
 # Uncomment and set to enable explicit cap:
 # eval_max_steps = 5000
 
+# Early stopping patience (OPTIONAL: disabled if omitted).
+# Stop training if eval loss does not improve for this many consecutive eval cycles.
+# patience = 5
+
 # Checkpoint save frequency (every N training steps).
 # "latest" checkpoint is overwritten; "best" is kept only if eval loss improves.
 save_every = 1000

@@ -1487,7 +1487,7 @@ def test_accelerate_state_written_through_tmp_dir(
 def test_eval_accuracy_uses_gather_for_metrics(
     tmp_path: Path, cpu_accelerator, tiny_bert_model
 ) -> None:
-    """Verify eval accuracy gathers preds/labels across ranks."""
+    """Verify eval accuracy gathers scalar counts across ranks."""
     metadata_path = _write_tiny_corpus(tmp_path, {"train": 1, "validation": 2})
     config_file = write_train_config(
         tmp_path, metadata_path, eval_every=1, per_device_eval_batch_size=1
@@ -1514,12 +1514,12 @@ def test_eval_accuracy_uses_gather_for_metrics(
 
         gathered_tensors = [call.args[0] for call in mock_gather.call_args_list]
 
-        # Find preds and labels
-        found_preds = any(
-            getattr(t, "dtype", None) == torch.int64 and getattr(t, "dim", lambda: 0)() == 2
-            for t in gathered_tensors
+        # Eval now gathers scalar counts (correct, masked) instead of full tensors.
+        # Check that gather_for_metrics was called with 0-dim int tensors (the counts).
+        found_scalar_counts = any(
+            isinstance(t, torch.Tensor) and t.dim() == 0 for t in gathered_tensors
         )
-        assert found_preds, "gather_for_metrics was not called with preds/labels"
+        assert found_scalar_counts, "gather_for_metrics was not called with scalar counts"
 
         mock_gather.reset_mock()
 
