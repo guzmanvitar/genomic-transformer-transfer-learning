@@ -871,6 +871,16 @@ def run_felid_foundation_training(
                                 config.per_device_eval_batch_size,
                                 accelerator.num_processes,
                             )
+                            # Files are distributed slightly unevenly across ranks/workers, so
+                            # the per-rank loader may exhaust before eval_max_steps is reached
+                            # on some ranks but not others, causing a collective hang. Sync to
+                            # the minimum across all ranks so every rank agrees on when to stop.
+                            eval_max_steps_t = torch.tensor(
+                                eval_max_steps, dtype=torch.long, device=accelerator.device
+                            )
+                            eval_max_steps = int(
+                                accelerator.reduce(eval_max_steps_t, reduction="min").item()
+                            )
                         else:
                             auto_cap = eval_loader.dataset.record_count // (
                                 config.per_device_eval_batch_size * accelerator.num_processes
