@@ -651,6 +651,7 @@ def run_felid_foundation_training(
     # IterableDataset cannot restore cursor position; restart at epoch boundary.
     # This trades perfect resume (a few duplicate rows in first batch) for robustness.
     step = 0
+    patience_counter = 0
     if resumed:
         accelerator.load_state(str(latest_state_path))
 
@@ -662,6 +663,7 @@ def run_felid_foundation_training(
             try:
                 train_state = json.loads(train_state_path.read_text(encoding="utf-8"))
                 step = int(train_state.get("step", 0))
+                patience_counter = int(train_state.get("patience_counter", 0))
             except (OSError, json.JSONDecodeError, ValueError) as exc:
                 logger.warning(
                     "Failed to parse %s on resume; restarting step counter at 0: %s",
@@ -681,6 +683,7 @@ def run_felid_foundation_training(
     # Note: tokens-trained-so-far implications: no metrics currently use step as a
     # denominator in a way that breaks on resume. step counts all previous steps.
     best_eval_loss = float("inf") if best_eval_loss is None else float(best_eval_loss)
+    early_stopped = False
     train_metric = MetricAccumulator()
     eval_metric = MetricAccumulator()
 
@@ -694,7 +697,7 @@ def run_felid_foundation_training(
             if has_set_epoch:
                 train_loader.dataset.set_epoch(_epoch - 1)  # 0-indexed
             for batch in train_loader:
-                if step >= config.max_steps:
+                if step >= config.max_steps or early_stopped:
                     break
 
                 # Manual device placement (dataloaders bypassed accelerator.prepare)
@@ -833,6 +836,17 @@ def run_felid_foundation_training(
 
                         accelerator.log(logs, step=step)
 
+                        if accelerator.is_main_process:
+                            logger.info(
+                                "[Step %d/%d] loss=%.4f ppl=%.2f token_acc=%.4f lr=%.2e",
+                                step,
+                                config.max_steps,
+                                mean_loss,
+                                ppl,
+                                token_acc,
+                                scheduler.get_last_lr()[0],
+                            )
+
                         # Log grad_norm_hist as TensorBoard histogram (rank-0 only).
                         # Must be done separately from accelerator.log because histograms need
                         # direct access to the TensorBoard writer, not the generic log interface.
@@ -938,6 +952,17 @@ def run_felid_foundation_training(
                             step=step,
                         )
 
+                        if accelerator.is_main_process:
+                            logger.info(
+                                "[Eval @ step %d] eval_loss=%.4f eval_ppl=%.2f "
+                                "eval_token_acc=%.4f best_eval_loss=%.4f",
+                                step,
+                                mean_eval_loss,
+                                eval_ppl,
+                                eval_token_acc,
+                                best_eval_loss,
+                            )
+
                         # Skip best-checkpoint update if all eval batches were non-finite.
                         # Avoids poisoning best-loss with NaN or treating "no data" as "worst".
                         # Warn so operators can investigate potential data/tokenization issues.
@@ -950,6 +975,7 @@ def run_felid_foundation_training(
                             )
                         elif mean_eval_loss < best_eval_loss:
                             best_eval_loss = mean_eval_loss
+                            patience_counter = 0
                             # Save best checkpoint
                             best_dir = output_dir / "best"
 
@@ -1006,8 +1032,28 @@ def run_felid_foundation_training(
                                     "all ranks to allow torchrun cleanup. Inspect rank-0 "
                                     "logs for the original exception."
                                 )
+                        else:
+                            patience_counter += 1
+                            if accelerator.is_main_process:
+                                logger.info(
+                                    "No improvement at step %d (patience %d/%s).",
+                                    step,
+                                    patience_counter,
+                                    config.patience if config.patience is not None else "inf",
+                                )
 
                         eval_metric.reset()
+
+                        if config.patience is not None and patience_counter >= config.patience:
+                            if accelerator.is_main_process:
+                                logger.info(
+                                    "Early stopping triggered at step %d after %d eval cycles "
+                                    "without improvement.",
+                                    step,
+                                    patience_counter,
+                                )
+                            early_stopped = True
+                            break
 
                     # Save latest checkpoint at save_every
                     if step % config.save_every == 0:
@@ -1030,7 +1076,11 @@ def run_felid_foundation_training(
 
                                 _save_json_atomically(
                                     latest_dir / "train_state.json",
-                                    {"step": step, "best_eval_loss": best_eval_loss},
+                                    {
+                                        "step": step,
+                                        "best_eval_loss": best_eval_loss,
+                                        "patience_counter": patience_counter,
+                                    },
                                 )
                             except Exception as e:
                                 # Catch exception to broadcast to other ranks (prevents deadlock)
@@ -1049,7 +1099,7 @@ def run_felid_foundation_training(
                                 "logs for the original exception."
                             )
 
-            if step >= config.max_steps:
+            if step >= config.max_steps or early_stopped:
                 break
 
     finally:

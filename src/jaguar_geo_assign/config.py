@@ -929,6 +929,8 @@ class FoundationTrainingConfig:
         warmup_steps: Linear warmup steps before cosine decay.
         eval_every: Validation frequency (steps).
         eval_max_steps: Max validation steps per epoch (auto-derived if None).
+        patience: Early stopping patience (eval cycles without improvement).
+            None disables early stopping.
         save_every: Checkpoint save frequency (steps).
         log_every: Logging frequency (steps).
         gradient_clip: Gradient norm clipping value.
@@ -954,6 +956,7 @@ class FoundationTrainingConfig:
     warmup_steps: int = 1000
     eval_every: int = 500
     eval_max_steps: int | None = None
+    patience: int | None = None
     save_every: int = 1000
     log_every: int = 10
     gradient_clip: float = 1.0
@@ -1008,6 +1011,8 @@ def load_foundation_training_config(path: str | Path) -> FoundationTrainingConfi
         eval_every = int(training.get("eval_every", 500))
         eval_max_steps_raw = training.get("eval_max_steps")
         eval_max_steps = int(eval_max_steps_raw) if eval_max_steps_raw is not None else None
+        patience_raw = training.get("patience")
+        patience = int(patience_raw) if patience_raw is not None else None
         save_every = int(training.get("save_every", 1000))
         log_every = int(training.get("log_every", 10))
         gradient_clip = float(training.get("gradient_clip", 1.0))
@@ -1036,6 +1041,8 @@ def load_foundation_training_config(path: str | Path) -> FoundationTrainingConfi
             raise ValueError("training.per_device_eval_batch_size must be positive")
         if gradient_clip < 0.0:
             raise ValueError("training.gradient_clip must be non-negative")
+        if patience is not None and patience <= 0:
+            raise ValueError("training.patience must be positive (or omitted to disable)")
         if pad_token_fallback not in {"eos", "unk", "add_pad"}:
             raise ValueError("training.pad_token_fallback must be one of: eos, unk, add_pad")
 
@@ -1059,6 +1066,7 @@ def load_foundation_training_config(path: str | Path) -> FoundationTrainingConfi
         warmup_steps=warmup_steps,
         eval_every=eval_every,
         eval_max_steps=eval_max_steps,
+        patience=patience,
         save_every=save_every,
         log_every=log_every,
         gradient_clip=gradient_clip,
