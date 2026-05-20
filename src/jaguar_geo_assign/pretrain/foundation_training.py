@@ -960,9 +960,14 @@ def run_felid_foundation_training(
                                     )
                                     unwrapped_model = accelerator.unwrap_model(model)
                                     with atomic_dir_replace(best_dir / "hf_model") as tmp_model_dir:
+                                        # safe_serialization=False: DNABERT-2 ties the MLM head
+                                        # decoder to the embedding matrix and does not declare
+                                        # _tied_weights_keys, so safetensors rejects the save.
+                                        # Pickle is acceptable here because checkpoints are only
+                                        # loaded from trusted internal paths.
                                         unwrapped_model.save_pretrained(
                                             str(tmp_model_dir),
-                                            safe_serialization=True,
+                                            safe_serialization=False,
                                         )
                                     with atomic_dir_replace(best_dir / "tokenizer") as tmp_tok_dir:
                                         tokenizer.save_pretrained(str(tmp_tok_dir))
@@ -1124,17 +1129,16 @@ def integration_test(
         assert any(d > 0 for d in l2_diffs), "No parameters changed after optimizer step"
         logger.info(f"✓ Assertion 2: Optimizer step changed parameters (L2 diffs: {l2_diffs[:3]})")
 
-        # Assertion 3: save_pretrained writes config.json + safetensors
+        # Assertion 3: save_pretrained writes config.json + weights file
         model_dir = tmp_path / "hf_model"
-        model.save_pretrained(str(model_dir), safe_serialization=True)
+        model.save_pretrained(str(model_dir), safe_serialization=False)
         assert (model_dir / "config.json").exists(), "config.json not written"
-        assert any(p.suffix == ".safetensors" for p in model_dir.glob("*")), (
-            "No safetensors file written"
+        assert any(p.suffix in {".safetensors", ".bin"} for p in model_dir.glob("*")), (
+            "No weights file written"
         )
-        logger.info("✓ Assertion 3: save_pretrained writes config.json + safetensors")
+        logger.info("✓ Assertion 3: save_pretrained writes config.json + weights file")
 
         # Assertion 4: reload yields identical state_dict keys.
-        assert any(model_dir.glob("*.safetensors"))
         reloaded = AutoModelForMaskedLM.from_pretrained(
             str(model_dir), trust_remote_code=use_real_model
         )
