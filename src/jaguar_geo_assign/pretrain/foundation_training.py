@@ -24,6 +24,7 @@ import logging
 import math
 import os
 import shutil
+import sys
 import tempfile
 from collections.abc import Iterator
 from dataclasses import dataclass, field
@@ -187,6 +188,21 @@ def _build_model_and_tokenizer(
         trust_remote_code=True,
         output_loading_info=True,
     )
+
+    # DNABERT-2's bundled flash_attn_triton.py uses tl.dot(trans_b=True), removed
+    # in Triton 2.2+. Null out the function so bert_layers falls back to the standard
+    # PyTorch attention path (the model's own fallback, line 161 in bert_layers.py).
+    bert_layers_mod = sys.modules.get(
+        "transformers_modules.zhihan1996.DNABERT_hyphen_2_hyphen_117M."
+        f"{config.model_revision}.bert_layers"
+    )
+    if (
+        bert_layers_mod is not None
+        and getattr(bert_layers_mod, "flash_attn_qkvpacked_func", None) is not None
+    ):
+        bert_layers_mod.flash_attn_qkvpacked_func = None
+        logger.info("Disabled DNABERT-2 Triton flash attention; using PyTorch fallback.")
+
     if loading_info.get("error_msgs"):
         logger.warning(
             "from_pretrained reported non-empty error_msgs: %s",
