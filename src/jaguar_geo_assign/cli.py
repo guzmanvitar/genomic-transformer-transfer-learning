@@ -15,6 +15,7 @@ branch's error contract.
 from __future__ import annotations
 
 import argparse
+import logging
 import traceback
 from collections.abc import Sequence
 from pathlib import Path
@@ -218,6 +219,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     Returns:
         Exit code: ``0`` on success, ``1`` on handled errors.
     """
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
     parser = build_parser()
     args = parser.parse_args(list(argv) if argv is not None else None)
 
