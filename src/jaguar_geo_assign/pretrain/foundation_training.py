@@ -960,6 +960,11 @@ def run_felid_foundation_training(
                                     )
                                     unwrapped_model = accelerator.unwrap_model(model)
                                     with atomic_dir_replace(best_dir / "hf_model") as tmp_model_dir:
+                                        # safe_serialization=False: DNABERT-2 ties the MLM head
+                                        # decoder to the embedding matrix and does not declare
+                                        # _tied_weights_keys, so safetensors rejects the save.
+                                        # Pickle is acceptable here because checkpoints are only
+                                        # loaded from trusted internal paths.
                                         unwrapped_model.save_pretrained(
                                             str(tmp_model_dir),
                                             safe_serialization=False,
@@ -1134,7 +1139,6 @@ def integration_test(
         logger.info("✓ Assertion 3: save_pretrained writes config.json + weights file")
 
         # Assertion 4: reload yields identical state_dict keys.
-        assert any(model_dir.glob("*.safetensors")) or any(model_dir.glob("*.bin"))
         reloaded = AutoModelForMaskedLM.from_pretrained(
             str(model_dir), trust_remote_code=use_real_model
         )
