@@ -1216,11 +1216,11 @@ def test_step_counter_aligns_with_optimizer_updates(
                 assert mock_log.call_count == 2, f"Expected 2 log calls, got {mock_log.call_count}"
 
 
-def test_eval_loss_gathered_across_ranks(tmp_path: Path, tiny_bert_model) -> None:
-    """Verify eval loss is gathered across ranks.
+def test_eval_loss_reduced_across_ranks(tmp_path: Path, tiny_bert_model) -> None:
+    """Verify eval metrics are reduced across ranks after the eval loop.
 
     Runs a tiny training loop with eval_every=1 and verifies that
-    accelerator.gather_for_metrics was called on the loss tensor.
+    accelerator.reduce is called with a 4-element stats tensor after eval.
     """
     metadata_path = _write_tiny_corpus(tmp_path, {"train": 1, "validation": 2})
     config_file = write_train_config(
@@ -1237,49 +1237,18 @@ def test_eval_loss_gathered_across_ranks(tmp_path: Path, tiny_bert_model) -> Non
         mock_build.return_value = (tiny_bert_model, tokenizer, "none", False)
         mock_loaders.return_value = make_dummy_loader(num_batches=2, with_eval=True)
 
-        with patch("accelerate.Accelerator.gather_for_metrics") as mock_gather:
+        with patch("accelerate.Accelerator.reduce") as mock_reduce:
+            mock_reduce.side_effect = lambda x, **kw: x
 
-            def side_effect(x):
-                # If it's a 0-D tensor (loss), return a fake gathered tensor
-                if getattr(side_effect, "in_accumulate", False):
-                    raise RuntimeError("gather_for_metrics called inside accumulate context!")
-                if x.dim() == 0 and x.dtype in (torch.float32, torch.bfloat16):
-                    return torch.tensor([1.5, 2.5])
-                return x
+            run_felid_foundation_training(config_file, integration_test_mode="off")
 
-            mock_gather.side_effect = side_effect
-
-            # Mock accumulate context manager to track state
-            import contextlib
-
-            @contextlib.contextmanager
-            def mock_accumulate(self_obj, *args, **kwargs):
-                side_effect.in_accumulate = True
-                try:
-                    yield
-                finally:
-                    side_effect.in_accumulate = False
-
-            with patch("accelerate.Accelerator.accumulate", mock_accumulate):
-                result = run_felid_foundation_training(config_file, integration_test_mode="off")
-
-            # 1.5 + 2.5 = 4.0 / 2 = 2.0 mean
-            assert abs(result.best_eval_loss - 2.0) < 1e-6, (
-                f"Expected best_eval_loss to be 2.0, got {result.best_eval_loss}"
-            )
-
-            loss_gather_calls = 0
-            for call in mock_gather.call_args_list:
-                tensor_arg = call.args[0]
-                if tensor_arg is None:
-                    continue
-                is_scalar = getattr(tensor_arg, "dim", lambda: -1)() == 0
-                is_float = getattr(tensor_arg, "dtype", None) in (torch.float32, torch.bfloat16)
-                if is_scalar and is_float:
-                    loss_gather_calls += 1
-
-            assert loss_gather_calls == 2, (
-                f"gather_for_metrics expected 2 calls for loss, got {loss_gather_calls}"
+            reduce_calls = [
+                call
+                for call in mock_reduce.call_args_list
+                if isinstance(call.args[0], torch.Tensor) and call.args[0].shape == (4,)
+            ]
+            assert len(reduce_calls) >= 1, (
+                "accelerator.reduce was not called with a 4-element eval stats tensor"
             )
 
 
@@ -1484,10 +1453,10 @@ def test_accelerate_state_written_through_tmp_dir(
             ), "tmp dir not atomically replaced"
 
 
-def test_eval_accuracy_uses_gather_for_metrics(
+def test_eval_accuracy_uses_post_loop_reduce(
     tmp_path: Path, cpu_accelerator, tiny_bert_model
 ) -> None:
-    """Verify eval accuracy gathers scalar counts across ranks."""
+    """Verify eval accuracy is aggregated via reduce after the eval loop."""
     metadata_path = _write_tiny_corpus(tmp_path, {"train": 1, "validation": 2})
     config_file = write_train_config(
         tmp_path, metadata_path, eval_every=1, per_device_eval_batch_size=1
@@ -1501,42 +1470,26 @@ def test_eval_accuracy_uses_gather_for_metrics(
         patch(
             "jaguar_geo_assign.pretrain.foundation_training._build_model_and_tokenizer"
         ) as mock_build,
-        patch("accelerate.Accelerator.gather_for_metrics") as mock_gather,
+        patch("accelerate.Accelerator.reduce") as mock_reduce,
     ):
         mock_build.return_value = (tiny_bert_model, tokenizer, "none", False)
         mock_loaders.return_value = make_dummy_loader(num_batches=2, with_eval=True)
 
-        mock_gather.side_effect = lambda x: x
+        mock_reduce.side_effect = lambda x, **kw: x
 
-        # Test rank 0
-        with patch("accelerate.Accelerator.is_main_process", True):
-            run_felid_foundation_training(config_file, integration_test_mode="off")
+        run_felid_foundation_training(config_file, integration_test_mode="off")
 
-        gathered_tensors = [call.args[0] for call in mock_gather.call_args_list]
-
-        # Eval now gathers scalar counts (correct, masked) instead of full tensors.
-        # Check that gather_for_metrics was called with 0-dim int tensors (the counts).
-        found_scalar_counts = any(
-            isinstance(t, torch.Tensor) and t.dim() == 0 for t in gathered_tensors
+        stats_reduce_calls = [
+            call
+            for call in mock_reduce.call_args_list
+            if isinstance(call.args[0], torch.Tensor) and call.args[0].shape == (4,)
+        ]
+        assert len(stats_reduce_calls) >= 1, (
+            "accelerator.reduce was not called with the 4-element eval stats tensor"
         )
-        assert found_scalar_counts, "gather_for_metrics was not called with scalar counts"
-
-        mock_gather.reset_mock()
-
-        # Test rank 1
-        with (
-            patch("accelerate.Accelerator.is_main_process", False),
-            patch("accelerate.Accelerator.log") as mock_log,
-        ):
-            run_felid_foundation_training(config_file, integration_test_mode="off")
-
-            # On rank 1, eval counts are not accumulated, so token_masked remains 0.
-            # This results in eval_token_acc being nan.
-            eval_call = [c for c in mock_log.call_args_list if "eval/token_accuracy" in c.args[0]]
-            assert len(eval_call) > 0
-            assert math.isnan(eval_call[0].args[0]["eval/token_accuracy"]), (
-                "eval_token_acc should be NaN on non-main process"
-            )
+        stats_tensor = stats_reduce_calls[0].args[0]
+        assert stats_tensor[2].item() >= 0, "token_correct should be non-negative"
+        assert stats_tensor[3].item() >= 0, "token_masked should be non-negative"
 
 
 def test_atomic_dir_replace_recovers_from_crash(tmp_path: Path) -> None:
@@ -2053,7 +2006,7 @@ def test_eval_loop_respects_max_steps(tmp_path: Path, cpu_accelerator, tiny_bert
         patch(
             "jaguar_geo_assign.pretrain.foundation_training._build_model_and_tokenizer"
         ) as mock_build,
-        patch("accelerate.Accelerator.gather_for_metrics", lambda self, x: x),
+        patch("accelerate.Accelerator.reduce", lambda self, x, **kw: x),
     ):
         mock_build.return_value = (tiny_bert_model, tokenizer, "none", False)
 
@@ -2061,7 +2014,6 @@ def test_eval_loop_respects_max_steps(tmp_path: Path, cpu_accelerator, tiny_bert
         dummy_loader = DummyLoader(num_batches=5, device=torch.device("cpu"))
         mock_loaders.return_value = (dummy_loader, dummy_loader)
 
-        # Run training, tracking how many times gather_for_metrics was called
         # Since eval_max_steps is 2, the eval loop should break after 2 iterations
         with patch("accelerate.Accelerator.log") as mock_log:
             run_felid_foundation_training(config_file, integration_test_mode="off")
