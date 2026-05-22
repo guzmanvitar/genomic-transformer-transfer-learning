@@ -76,10 +76,9 @@ warmup_steps = 500
 # Set to 0 to skip validation; recommended range is 500–2000.
 eval_every = 1000
 
-# Maximum validation steps per epoch (OPTIONAL: auto-derived from record_count if omitted).
-# Auto-derivation prevents DDP deadlock by capping eval at a fixed step count.
-# If set explicitly, must be <= record_count / (per_device_eval_batch_size * world_size).
-# Uncomment and set to enable explicit cap:
+# Maximum validation steps per eval cycle (OPTIONAL: auto-derived from record_count if omitted).
+# Caps eval duration; each rank runs its shard up to this many steps, then all ranks
+# meet at a single post-loop reduce — uneven per-rank shard sizes are handled safely.
 eval_max_steps = 500
 
 # Early stopping patience (OPTIONAL: disabled if omitted).

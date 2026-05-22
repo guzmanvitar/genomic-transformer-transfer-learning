@@ -908,6 +908,12 @@ def run_felid_foundation_training(
                         # different number of batches (IterableDataset file sharding
                         # is not perfectly even), so no collectives run inside the
                         # loop — that would deadlock when one rank exhausts early.
+                        # float64 represents integers exactly up to 2^53; float32 only to 2^24
+                        # (~16.7 M), which token counts can exceed at large eval_max_steps.
+                        # MPS does not support float64, so fall back to float32 there.
+                        stats_dtype = (
+                            torch.float32 if accelerator.device.type == "mps" else torch.float64
+                        )
                         local_stats = torch.tensor(
                             [
                                 eval_metric.loss_sum,
@@ -915,7 +921,7 @@ def run_felid_foundation_training(
                                 eval_metric.token_correct,
                                 eval_metric.token_masked,
                             ],
-                            dtype=torch.float32,
+                            dtype=stats_dtype,
                             device=accelerator.device,
                         )
                         global_stats = accelerator.reduce(local_stats, reduction="sum")

@@ -1238,9 +1238,17 @@ def test_eval_loss_reduced_across_ranks(tmp_path: Path, tiny_bert_model) -> None
         mock_loaders.return_value = make_dummy_loader(num_batches=2, with_eval=True)
 
         with patch("accelerate.Accelerator.reduce") as mock_reduce:
-            mock_reduce.side_effect = lambda x, **kw: x
 
-            run_felid_foundation_training(config_file, integration_test_mode="off")
+            def reduce_side_effect(x, **kw):
+                if isinstance(x, torch.Tensor) and x.shape == (4,):
+                    # Return controlled eval stats: loss_sum=3.0, step_count=2
+                    # → expected mean_eval_loss = 3.0 / 2.0 = 1.5
+                    return torch.tensor([3.0, 2.0, 10.0, 50.0], dtype=x.dtype, device=x.device)
+                return x
+
+            mock_reduce.side_effect = reduce_side_effect
+
+            result = run_felid_foundation_training(config_file, integration_test_mode="off")
 
             reduce_calls = [
                 call
@@ -1249,6 +1257,10 @@ def test_eval_loss_reduced_across_ranks(tmp_path: Path, tiny_bert_model) -> None
             ]
             assert len(reduce_calls) >= 1, (
                 "accelerator.reduce was not called with a 4-element eval stats tensor"
+            )
+            assert abs(result.best_eval_loss - 1.5) < 1e-4, (
+                "Expected best_eval_loss=1.5 from mocked reduce (3.0/2.0), got"
+                f" {result.best_eval_loss}"
             )
 
 
