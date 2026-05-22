@@ -452,8 +452,9 @@ def iter_locus_windows_from_vcf(
     loci the VCF contains.
 
     Validation contract (each guard prevents a silent-failure mode):
-        * ``##reference`` header must be present and match the expected
-          build tokens (lockstep with ``consensus.py``).
+        * ``##reference`` header, if present, must match the expected
+          build tokens (lockstep with ``consensus.py``). When absent,
+          a warning is logged and build-token validation is skipped.
         * Every ``##contig=<ID=...>`` declaration must exist in the
           reference FASTA; raises :class:`ContigMismatchError` otherwise.
         * Every per-record ``CHROM`` must exist in the reference; raises
@@ -512,21 +513,24 @@ def iter_locus_windows_from_vcf(
                 if sample_id not in columns[9:]:
                     raise AcquisitionError(f"Sample '{sample_id}' not found in VCF {vcf_path}")
                 if not vcf_reference:
-                    raise ReferenceMismatchError(
-                        f"VCF {vcf_path} is missing explicit reference/build metadata "
-                        "in a ##reference header"
+                    _LOGGER.warning(
+                        "VCF %s is missing a ##reference header — "
+                        "skipping build-token validation. Per-record REF/FASTA "
+                        "checks still guard against assembly mismatches.",
+                        vcf_path,
                     )
-                try:
-                    _validate_finetune_reference_evidence(
-                        vcf_reference,
-                        positive_tokens=positive_reference_tokens,
-                        negative_tokens=negative_reference_tokens,
-                    )
-                except ReferenceMismatchError as e:
-                    raise ReferenceMismatchError(
-                        f"VCF {vcf_path} declares reference '{vcf_reference}', "
-                        f"which failed build evidence validation: {e}"
-                    ) from e
+                else:
+                    try:
+                        _validate_finetune_reference_evidence(
+                            vcf_reference,
+                            positive_tokens=positive_reference_tokens,
+                            negative_tokens=negative_reference_tokens,
+                        )
+                    except ReferenceMismatchError as e:
+                        raise ReferenceMismatchError(
+                            f"VCF {vcf_path} declares reference '{vcf_reference}', "
+                            f"which failed build evidence validation: {e}"
+                        ) from e
                 if header_contigs and not header_contigs.issubset(fasta_contigs):
                     missing_contigs = sorted(header_contigs.difference(fasta_contigs))
                     raise ContigMismatchError(
