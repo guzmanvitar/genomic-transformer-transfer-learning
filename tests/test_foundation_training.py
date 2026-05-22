@@ -2086,6 +2086,79 @@ eval_every = 1
         assert result.final_step == 5000
 
 
+def test_resume_restores_scheduler_state(tmp_path: Path, cpu_accelerator, tiny_bert_model) -> None:
+    """Verify resume restores scheduler position from train_state.json.
+
+    Removing the scheduler from accelerator.prepare() means save_state/load_state
+    no longer persists it automatically. The scheduler state dict must be saved
+    manually in train_state.json and restored on resume so the LR continues from
+    the checkpoint step rather than restarting at the warmup ramp.
+    """
+    out_dir = tmp_path / "out"
+    latest_state = out_dir / "latest" / "accelerate_state"
+    latest_state.mkdir(parents=True)
+
+    # Build a real scheduler so we can capture its state dict at a known step.
+    from torch.optim import AdamW as _AdamW
+    from transformers import get_cosine_schedule_with_warmup as _get_sched
+
+    dummy_param = torch.nn.Linear(2, 2)
+    ref_opt = _AdamW(dummy_param.parameters(), lr=1e-4)
+    ref_sched = _get_sched(ref_opt, num_warmup_steps=10, num_training_steps=100)
+    for _ in range(42):
+        ref_sched.step()
+    saved_state = ref_sched.state_dict()
+    expected_last_epoch = saved_state["last_epoch"]
+
+    (out_dir / "latest" / "train_state.json").write_text(
+        json.dumps({"step": 42, "best_eval_loss": 1.0, "scheduler_state": saved_state})
+    )
+
+    metadata_path = _write_tiny_corpus(tmp_path, {"train": 1})
+    config_file = tmp_path / "train_config_sched_resume.toml"
+    config_file.write_text(f"""
+[training]
+corpus_metadata_path = "{metadata_path}"
+model_identifier = "zhihan1996/DNABERT-2-117M"
+model_revision = "7bce263b15377fc15361f52cfab88f8b586abda0"
+output_dir = "{out_dir}"
+max_steps = 42
+learning_rate = 1e-4
+warmup_steps = 10
+seed = 42
+per_device_train_batch_size = 1
+gradient_accumulation_steps = 1
+log_every = 1
+eval_every = 1
+""")
+
+    tokenizer = FakeTokenizer()
+    captured_scheduler = {}
+
+    with (
+        patch("jaguar_geo_assign.pretrain.foundation_training._build_dataloaders") as mock_loaders,
+        patch(
+            "jaguar_geo_assign.pretrain.foundation_training._build_model_and_tokenizer"
+        ) as mock_build,
+        patch("jaguar_geo_assign.pretrain.foundation_training._build_scheduler") as mock_sched,
+        patch("accelerate.Accelerator.load_state"),
+    ):
+        mock_build.return_value = (tiny_bert_model, tokenizer, "none", False)
+        mock_loaders.return_value = (DummyLoader(num_batches=0, device=torch.device("cpu")), None)
+
+        real_opt = torch.optim.AdamW(tiny_bert_model.parameters(), lr=1e-4)
+        real_sched = _get_sched(real_opt, num_warmup_steps=10, num_training_steps=100)
+        captured_scheduler["sched"] = real_sched
+        mock_sched.return_value = real_sched
+
+        run_felid_foundation_training(config_file, integration_test_mode="off")
+
+    assert captured_scheduler["sched"].last_epoch == expected_last_epoch, (
+        f"Scheduler last_epoch should be {expected_last_epoch} after restore, "
+        f"got {captured_scheduler['sched'].last_epoch}"
+    )
+
+
 def test_resume_handles_missing_train_state(
     tmp_path: Path, cpu_accelerator, tiny_bert_model
 ) -> None:

@@ -668,6 +668,24 @@ def run_felid_foundation_training(
                 train_state = json.loads(train_state_path.read_text(encoding="utf-8"))
                 step = int(train_state.get("step", 0))
                 patience_counter = int(train_state.get("patience_counter", 0))
+
+                # Restore scheduler position. Scheduler is not prepared by Accelerate
+                # (to avoid the 4x LR compression bug), so its state is not included
+                # in accelerator.save_state(). We save it manually in train_state.json.
+                scheduler_state = train_state.get("scheduler_state")
+                if scheduler_state is not None:
+                    scheduler.load_state_dict(scheduler_state)
+                    logger.info("Restored scheduler state at last_epoch=%d", scheduler.last_epoch)
+                else:
+                    # Old checkpoint pre-dating scheduler persistence: fast-forward
+                    # by replaying step() calls so the LR resumes at the right point.
+                    logger.warning(
+                        "scheduler_state missing from train_state.json (old checkpoint); "
+                        "fast-forwarding scheduler to step %d.",
+                        step,
+                    )
+                    for _ in range(step):
+                        scheduler.step()
             except (OSError, json.JSONDecodeError, ValueError) as exc:
                 logger.warning(
                     "Failed to parse %s on resume; restarting step counter at 0: %s",
@@ -1086,6 +1104,10 @@ def run_felid_foundation_training(
                                         "step": step,
                                         "best_eval_loss": best_eval_loss,
                                         "patience_counter": patience_counter,
+                                        # Scheduler is not registered with Accelerate
+                                        # (avoids 4x LR compression on multi-GPU), so
+                                        # its state is persisted here manually.
+                                        "scheduler_state": scheduler.state_dict(),
                                     },
                                 )
                             except Exception as e:
