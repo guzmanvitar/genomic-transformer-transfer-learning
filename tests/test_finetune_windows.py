@@ -376,16 +376,14 @@ def test_fasta_without_build_evidence_raises_reference_mismatch(tmp_path: Path):
         _extract(fasta, vcf)
 
 
-def test_vcf_missing_reference_header_raises(tmp_path: Path):
-    """A VCF without a ``##reference`` header must fail rather than be inferred.
-
-    The fine-tuning pipeline cannot verify build alignment without an
-    explicit declaration, so a missing header is a hard error.
-    """
+def test_vcf_missing_reference_header_warns_and_extracts(tmp_path: Path, caplog):
+    """A VCF without a ``##reference`` header logs a warning but still extracts."""
     vcf_text = _build_vcf(["chr1\t300\t.\tA\tT\t.\tPASS\t.\tGT\t1/1"], reference_token=None)
     fasta, vcf = _write_fixture(tmp_path, vcf_text)
-    with pytest.raises(ReferenceMismatchError, match="missing explicit reference"):
-        _extract(fasta, vcf)
+    with caplog.at_level("WARNING"):
+        windows = _extract(fasta, vcf)
+    assert len(windows) == 1
+    assert any("missing a ##reference header" in msg for msg in caplog.messages)
 
 
 def test_vcf_reference_header_with_mismatched_token_raises(tmp_path: Path):
