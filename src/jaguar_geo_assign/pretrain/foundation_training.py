@@ -628,7 +628,11 @@ def run_felid_foundation_training(
     # handles all sharding. Gradient accumulation via accelerator.accumulate() works because
     # its sync_gradients flag is tied to self.step, not the dataloader. See
     # accelerate/accelerator.py:1228 _do_sync().
-    model, optimizer, scheduler = accelerator.prepare(model, optimizer, scheduler)
+    # Scheduler is NOT passed through prepare() because Accelerate would divide
+    # num_warmup_steps and num_training_steps by num_processes, assuming it also
+    # shards the dataloader. Our dataloaders bypass prepare() (manual file-level
+    # sharding), so each rank runs the full max_steps — the scheduler must too.
+    model, optimizer = accelerator.prepare(model, optimizer)
 
     # Model trainability verification
     # Count trainable vs. total parameters after construction and verify all are trainable.
@@ -664,6 +668,24 @@ def run_felid_foundation_training(
                 train_state = json.loads(train_state_path.read_text(encoding="utf-8"))
                 step = int(train_state.get("step", 0))
                 patience_counter = int(train_state.get("patience_counter", 0))
+
+                # Restore scheduler position. Scheduler is not prepared by Accelerate
+                # (to avoid the 4x LR compression bug), so its state is not included
+                # in accelerator.save_state(). We save it manually in train_state.json.
+                scheduler_state = train_state.get("scheduler_state")
+                if scheduler_state is not None:
+                    scheduler.load_state_dict(scheduler_state)
+                    logger.info("Restored scheduler state at last_epoch=%d", scheduler.last_epoch)
+                else:
+                    # Old checkpoint pre-dating scheduler persistence: fast-forward
+                    # by replaying step() calls so the LR resumes at the right point.
+                    logger.warning(
+                        "scheduler_state missing from train_state.json (old checkpoint); "
+                        "fast-forwarding scheduler to step %d.",
+                        step,
+                    )
+                    for _ in range(step):
+                        scheduler.step()
             except (OSError, json.JSONDecodeError, ValueError) as exc:
                 logger.warning(
                     "Failed to parse %s on resume; restarting step counter at 0: %s",
@@ -871,16 +893,6 @@ def run_felid_foundation_training(
                                 config.per_device_eval_batch_size,
                                 accelerator.num_processes,
                             )
-                        else:
-                            auto_cap = eval_loader.dataset.record_count // (
-                                config.per_device_eval_batch_size * accelerator.num_processes
-                            )
-                            if eval_max_steps > auto_cap:
-                                logger.warning(
-                                    f"Explicit eval_max_steps={eval_max_steps} exceeds "
-                                    f"auto-derived cap ({auto_cap}) and risks DDP deadlock. "
-                                    f"Ranks may iterate unevenly."
-                                )
 
                         model.eval()
                         with torch.no_grad():
@@ -888,41 +900,53 @@ def run_felid_foundation_training(
                                 if eval_step >= eval_max_steps:
                                     break
 
-                                # Manual device placement (dataloaders bypassed accelerator.prepare)
                                 eval_batch = {
                                     k: v.to(accelerator.device, non_blocking=True)
                                     for k, v in eval_batch.items()
                                 }
 
                                 outputs = model(**eval_batch)
-                                loss = outputs.loss
+                                loss_f = outputs.loss.detach().float()
 
-                                loss_f = loss.detach().float()
-                                # Gather eval loss across ranks before accumulation (DDP-safe)
-                                gathered_loss = accelerator.gather_for_metrics(loss_f)
-                                if not (
-                                    torch.isnan(gathered_loss).any()
-                                    or torch.isinf(gathered_loss).any()
-                                ):
-                                    eval_metric.loss_sum += gathered_loss.mean().item()
+                                if not (torch.isnan(loss_f) or torch.isinf(loss_f)):
+                                    eval_metric.loss_sum += loss_f.item()
                                     eval_metric.step_count += 1
 
-                                    # Token accuracy accumulation for eval loop.
-                                    # Only accumulate on finite-loss steps; NaN/Inf logits
-                                    # produce garbage argmax results that corrupt the metric.
                                     preds = outputs.logits.argmax(dim=-1)
                                     labels = eval_batch.get("labels")
                                     if labels is not None:
                                         mask = labels != -100
-                                        correct = ((preds == labels) & mask).sum()
-                                        masked = mask.sum()
-                                        gathered_correct = accelerator.gather_for_metrics(correct)
-                                        gathered_masked = accelerator.gather_for_metrics(masked)
-                                        if accelerator.is_main_process:
-                                            eval_metric.token_correct += (
-                                                gathered_correct.sum().item()
-                                            )
-                                            eval_metric.token_masked += gathered_masked.sum().item()
+                                        eval_metric.token_correct += (
+                                            ((preds == labels) & mask).sum().item()
+                                        )
+                                        eval_metric.token_masked += mask.sum().item()
+
+                        # Aggregate local eval metrics across ranks with a single
+                        # collective after the loop. Each rank may have processed a
+                        # different number of batches (IterableDataset file sharding
+                        # is not perfectly even), so no collectives run inside the
+                        # loop — that would deadlock when one rank exhausts early.
+                        # float64 represents integers exactly up to 2^53; float32 only to 2^24
+                        # (~16.7 M), which token counts can exceed at large eval_max_steps.
+                        # MPS does not support float64, so fall back to float32 there.
+                        stats_dtype = (
+                            torch.float32 if accelerator.device.type == "mps" else torch.float64
+                        )
+                        local_stats = torch.tensor(
+                            [
+                                eval_metric.loss_sum,
+                                eval_metric.step_count,
+                                eval_metric.token_correct,
+                                eval_metric.token_masked,
+                            ],
+                            dtype=stats_dtype,
+                            device=accelerator.device,
+                        )
+                        global_stats = accelerator.reduce(local_stats, reduction="sum")
+                        eval_metric.loss_sum = global_stats[0].item()
+                        eval_metric.step_count = int(global_stats[1].item())
+                        eval_metric.token_correct = int(global_stats[2].item())
+                        eval_metric.token_masked = int(global_stats[3].item())
 
                         model.train()
                         mean_eval_loss = (
@@ -1080,6 +1104,10 @@ def run_felid_foundation_training(
                                         "step": step,
                                         "best_eval_loss": best_eval_loss,
                                         "patience_counter": patience_counter,
+                                        # Scheduler is not registered with Accelerate
+                                        # (avoids 4x LR compression on multi-GPU), so
+                                        # its state is persisted here manually.
+                                        "scheduler_state": scheduler.state_dict(),
                                     },
                                 )
                             except Exception as e:

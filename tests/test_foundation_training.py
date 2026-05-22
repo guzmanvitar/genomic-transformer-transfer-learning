@@ -1216,11 +1216,11 @@ def test_step_counter_aligns_with_optimizer_updates(
                 assert mock_log.call_count == 2, f"Expected 2 log calls, got {mock_log.call_count}"
 
 
-def test_eval_loss_gathered_across_ranks(tmp_path: Path, tiny_bert_model) -> None:
-    """Verify eval loss is gathered across ranks.
+def test_eval_loss_reduced_across_ranks(tmp_path: Path, tiny_bert_model) -> None:
+    """Verify eval metrics are reduced across ranks after the eval loop.
 
     Runs a tiny training loop with eval_every=1 and verifies that
-    accelerator.gather_for_metrics was called on the loss tensor.
+    accelerator.reduce is called with a 4-element stats tensor after eval.
     """
     metadata_path = _write_tiny_corpus(tmp_path, {"train": 1, "validation": 2})
     config_file = write_train_config(
@@ -1237,49 +1237,30 @@ def test_eval_loss_gathered_across_ranks(tmp_path: Path, tiny_bert_model) -> Non
         mock_build.return_value = (tiny_bert_model, tokenizer, "none", False)
         mock_loaders.return_value = make_dummy_loader(num_batches=2, with_eval=True)
 
-        with patch("accelerate.Accelerator.gather_for_metrics") as mock_gather:
+        with patch("accelerate.Accelerator.reduce") as mock_reduce:
 
-            def side_effect(x):
-                # If it's a 0-D tensor (loss), return a fake gathered tensor
-                if getattr(side_effect, "in_accumulate", False):
-                    raise RuntimeError("gather_for_metrics called inside accumulate context!")
-                if x.dim() == 0 and x.dtype in (torch.float32, torch.bfloat16):
-                    return torch.tensor([1.5, 2.5])
+            def reduce_side_effect(x, **kw):
+                if isinstance(x, torch.Tensor) and x.shape == (4,):
+                    # Return controlled eval stats: loss_sum=3.0, step_count=2
+                    # → expected mean_eval_loss = 3.0 / 2.0 = 1.5
+                    return torch.tensor([3.0, 2.0, 10.0, 50.0], dtype=x.dtype, device=x.device)
                 return x
 
-            mock_gather.side_effect = side_effect
+            mock_reduce.side_effect = reduce_side_effect
 
-            # Mock accumulate context manager to track state
-            import contextlib
+            result = run_felid_foundation_training(config_file, integration_test_mode="off")
 
-            @contextlib.contextmanager
-            def mock_accumulate(self_obj, *args, **kwargs):
-                side_effect.in_accumulate = True
-                try:
-                    yield
-                finally:
-                    side_effect.in_accumulate = False
-
-            with patch("accelerate.Accelerator.accumulate", mock_accumulate):
-                result = run_felid_foundation_training(config_file, integration_test_mode="off")
-
-            # 1.5 + 2.5 = 4.0 / 2 = 2.0 mean
-            assert abs(result.best_eval_loss - 2.0) < 1e-6, (
-                f"Expected best_eval_loss to be 2.0, got {result.best_eval_loss}"
+            reduce_calls = [
+                call
+                for call in mock_reduce.call_args_list
+                if isinstance(call.args[0], torch.Tensor) and call.args[0].shape == (4,)
+            ]
+            assert len(reduce_calls) >= 1, (
+                "accelerator.reduce was not called with a 4-element eval stats tensor"
             )
-
-            loss_gather_calls = 0
-            for call in mock_gather.call_args_list:
-                tensor_arg = call.args[0]
-                if tensor_arg is None:
-                    continue
-                is_scalar = getattr(tensor_arg, "dim", lambda: -1)() == 0
-                is_float = getattr(tensor_arg, "dtype", None) in (torch.float32, torch.bfloat16)
-                if is_scalar and is_float:
-                    loss_gather_calls += 1
-
-            assert loss_gather_calls == 2, (
-                f"gather_for_metrics expected 2 calls for loss, got {loss_gather_calls}"
+            assert abs(result.best_eval_loss - 1.5) < 1e-4, (
+                "Expected best_eval_loss=1.5 from mocked reduce (3.0/2.0), got"
+                f" {result.best_eval_loss}"
             )
 
 
@@ -1484,10 +1465,10 @@ def test_accelerate_state_written_through_tmp_dir(
             ), "tmp dir not atomically replaced"
 
 
-def test_eval_accuracy_uses_gather_for_metrics(
+def test_eval_accuracy_uses_post_loop_reduce(
     tmp_path: Path, cpu_accelerator, tiny_bert_model
 ) -> None:
-    """Verify eval accuracy gathers scalar counts across ranks."""
+    """Verify eval accuracy is aggregated via reduce after the eval loop."""
     metadata_path = _write_tiny_corpus(tmp_path, {"train": 1, "validation": 2})
     config_file = write_train_config(
         tmp_path, metadata_path, eval_every=1, per_device_eval_batch_size=1
@@ -1501,42 +1482,26 @@ def test_eval_accuracy_uses_gather_for_metrics(
         patch(
             "jaguar_geo_assign.pretrain.foundation_training._build_model_and_tokenizer"
         ) as mock_build,
-        patch("accelerate.Accelerator.gather_for_metrics") as mock_gather,
+        patch("accelerate.Accelerator.reduce") as mock_reduce,
     ):
         mock_build.return_value = (tiny_bert_model, tokenizer, "none", False)
         mock_loaders.return_value = make_dummy_loader(num_batches=2, with_eval=True)
 
-        mock_gather.side_effect = lambda x: x
+        mock_reduce.side_effect = lambda x, **kw: x
 
-        # Test rank 0
-        with patch("accelerate.Accelerator.is_main_process", True):
-            run_felid_foundation_training(config_file, integration_test_mode="off")
+        run_felid_foundation_training(config_file, integration_test_mode="off")
 
-        gathered_tensors = [call.args[0] for call in mock_gather.call_args_list]
-
-        # Eval now gathers scalar counts (correct, masked) instead of full tensors.
-        # Check that gather_for_metrics was called with 0-dim int tensors (the counts).
-        found_scalar_counts = any(
-            isinstance(t, torch.Tensor) and t.dim() == 0 for t in gathered_tensors
+        stats_reduce_calls = [
+            call
+            for call in mock_reduce.call_args_list
+            if isinstance(call.args[0], torch.Tensor) and call.args[0].shape == (4,)
+        ]
+        assert len(stats_reduce_calls) >= 1, (
+            "accelerator.reduce was not called with the 4-element eval stats tensor"
         )
-        assert found_scalar_counts, "gather_for_metrics was not called with scalar counts"
-
-        mock_gather.reset_mock()
-
-        # Test rank 1
-        with (
-            patch("accelerate.Accelerator.is_main_process", False),
-            patch("accelerate.Accelerator.log") as mock_log,
-        ):
-            run_felid_foundation_training(config_file, integration_test_mode="off")
-
-            # On rank 1, eval counts are not accumulated, so token_masked remains 0.
-            # This results in eval_token_acc being nan.
-            eval_call = [c for c in mock_log.call_args_list if "eval/token_accuracy" in c.args[0]]
-            assert len(eval_call) > 0
-            assert math.isnan(eval_call[0].args[0]["eval/token_accuracy"]), (
-                "eval_token_acc should be NaN on non-main process"
-            )
+        stats_tensor = stats_reduce_calls[0].args[0]
+        assert stats_tensor[2].item() >= 0, "token_correct should be non-negative"
+        assert stats_tensor[3].item() >= 0, "token_masked should be non-negative"
 
 
 def test_atomic_dir_replace_recovers_from_crash(tmp_path: Path) -> None:
@@ -2053,7 +2018,7 @@ def test_eval_loop_respects_max_steps(tmp_path: Path, cpu_accelerator, tiny_bert
         patch(
             "jaguar_geo_assign.pretrain.foundation_training._build_model_and_tokenizer"
         ) as mock_build,
-        patch("accelerate.Accelerator.gather_for_metrics", lambda self, x: x),
+        patch("accelerate.Accelerator.reduce", lambda self, x, **kw: x),
     ):
         mock_build.return_value = (tiny_bert_model, tokenizer, "none", False)
 
@@ -2061,7 +2026,6 @@ def test_eval_loop_respects_max_steps(tmp_path: Path, cpu_accelerator, tiny_bert
         dummy_loader = DummyLoader(num_batches=5, device=torch.device("cpu"))
         mock_loaders.return_value = (dummy_loader, dummy_loader)
 
-        # Run training, tracking how many times gather_for_metrics was called
         # Since eval_max_steps is 2, the eval loop should break after 2 iterations
         with patch("accelerate.Accelerator.log") as mock_log:
             run_felid_foundation_training(config_file, integration_test_mode="off")
@@ -2120,6 +2084,149 @@ eval_every = 1
 
         result = run_felid_foundation_training(config_file, integration_test_mode="off")
         assert result.final_step == 5000
+
+
+def test_resume_restores_scheduler_state(tmp_path: Path, cpu_accelerator, tiny_bert_model) -> None:
+    """Verify resume restores scheduler position from train_state.json.
+
+    Removing the scheduler from accelerator.prepare() means save_state/load_state
+    no longer persists it automatically. The scheduler state dict must be saved
+    manually in train_state.json and restored on resume so the LR continues from
+    the checkpoint step rather than restarting at the warmup ramp.
+    """
+    out_dir = tmp_path / "out"
+    latest_state = out_dir / "latest" / "accelerate_state"
+    latest_state.mkdir(parents=True)
+
+    # Build a real scheduler so we can capture its state dict at a known step.
+    dummy_param = torch.nn.Linear(2, 2)
+    ref_opt = AdamW(dummy_param.parameters(), lr=1e-4)
+    ref_sched = get_cosine_schedule_with_warmup(
+        ref_opt, num_warmup_steps=10, num_training_steps=100
+    )
+    for _ in range(42):
+        ref_sched.step()
+    saved_state = ref_sched.state_dict()
+    expected_last_epoch = saved_state["last_epoch"]
+
+    (out_dir / "latest" / "train_state.json").write_text(
+        json.dumps({"step": 42, "best_eval_loss": 1.0, "scheduler_state": saved_state})
+    )
+
+    metadata_path = _write_tiny_corpus(tmp_path, {"train": 1})
+    config_file = tmp_path / "train_config_sched_resume.toml"
+    config_file.write_text(f"""
+[training]
+corpus_metadata_path = "{metadata_path}"
+model_identifier = "zhihan1996/DNABERT-2-117M"
+model_revision = "7bce263b15377fc15361f52cfab88f8b586abda0"
+output_dir = "{out_dir}"
+max_steps = 42
+learning_rate = 1e-4
+warmup_steps = 10
+seed = 42
+per_device_train_batch_size = 1
+gradient_accumulation_steps = 1
+log_every = 1
+eval_every = 1
+""")
+
+    tokenizer = FakeTokenizer()
+    captured_scheduler = {}
+
+    with (
+        patch("jaguar_geo_assign.pretrain.foundation_training._build_dataloaders") as mock_loaders,
+        patch(
+            "jaguar_geo_assign.pretrain.foundation_training._build_model_and_tokenizer"
+        ) as mock_build,
+        patch("jaguar_geo_assign.pretrain.foundation_training._build_scheduler") as mock_sched,
+        patch("accelerate.Accelerator.load_state"),
+    ):
+        mock_build.return_value = (tiny_bert_model, tokenizer, "none", False)
+        mock_loaders.return_value = (DummyLoader(num_batches=0, device=torch.device("cpu")), None)
+
+        real_opt = torch.optim.AdamW(tiny_bert_model.parameters(), lr=1e-4)
+        real_sched = get_cosine_schedule_with_warmup(
+            real_opt, num_warmup_steps=10, num_training_steps=100
+        )
+        captured_scheduler["sched"] = real_sched
+        mock_sched.return_value = real_sched
+
+        run_felid_foundation_training(config_file, integration_test_mode="off")
+
+    assert captured_scheduler["sched"].last_epoch == expected_last_epoch, (
+        f"Scheduler last_epoch should be {expected_last_epoch} after restore, "
+        f"got {captured_scheduler['sched'].last_epoch}"
+    )
+
+
+def test_resume_fastforward_scheduler_when_state_missing(
+    tmp_path: Path, cpu_accelerator, tiny_bert_model
+) -> None:
+    """Verify legacy checkpoints without scheduler_state fast-forward correctly.
+
+    Old checkpoints written before scheduler state persistence was added have
+    train_state.json with a step counter but no scheduler_state key. The fallback
+    must replay scheduler.step() N times so the LR resumes at the right position
+    rather than restarting from the warmup ramp.
+    """
+    out_dir = tmp_path / "out"
+    latest_state = out_dir / "latest" / "accelerate_state"
+    latest_state.mkdir(parents=True)
+
+    checkpoint_step = 20
+    # Write legacy-format train_state.json — no scheduler_state key
+    (out_dir / "latest" / "train_state.json").write_text(
+        json.dumps({"step": checkpoint_step, "best_eval_loss": 1.0})
+    )
+
+    metadata_path = _write_tiny_corpus(tmp_path, {"train": 1})
+    config_file = tmp_path / "train_config_fastfwd.toml"
+    config_file.write_text(f"""
+[training]
+corpus_metadata_path = "{metadata_path}"
+model_identifier = "zhihan1996/DNABERT-2-117M"
+model_revision = "7bce263b15377fc15361f52cfab88f8b586abda0"
+output_dir = "{out_dir}"
+max_steps = {checkpoint_step}
+learning_rate = 1e-4
+warmup_steps = 10
+seed = 42
+per_device_train_batch_size = 1
+gradient_accumulation_steps = 1
+log_every = 1
+eval_every = 1
+""")
+
+    tokenizer = FakeTokenizer()
+    captured_scheduler = {}
+
+    with (
+        patch("jaguar_geo_assign.pretrain.foundation_training._build_dataloaders") as mock_loaders,
+        patch(
+            "jaguar_geo_assign.pretrain.foundation_training._build_model_and_tokenizer"
+        ) as mock_build,
+        patch("jaguar_geo_assign.pretrain.foundation_training._build_scheduler") as mock_sched,
+        patch("accelerate.Accelerator.load_state"),
+    ):
+        mock_build.return_value = (tiny_bert_model, tokenizer, "none", False)
+        mock_loaders.return_value = (DummyLoader(num_batches=0, device=torch.device("cpu")), None)
+
+        real_opt = torch.optim.AdamW(tiny_bert_model.parameters(), lr=1e-4)
+        real_sched = get_cosine_schedule_with_warmup(
+            real_opt, num_warmup_steps=10, num_training_steps=100
+        )
+        captured_scheduler["sched"] = real_sched
+        mock_sched.return_value = real_sched
+
+        run_felid_foundation_training(config_file, integration_test_mode="off")
+
+    # Fast-forward replays checkpoint_step calls to scheduler.step(), so
+    # last_epoch should equal checkpoint_step.
+    assert captured_scheduler["sched"].last_epoch == checkpoint_step, (
+        f"Fast-forward should set last_epoch={checkpoint_step}, "
+        f"got {captured_scheduler['sched'].last_epoch}"
+    )
 
 
 def test_resume_handles_missing_train_state(

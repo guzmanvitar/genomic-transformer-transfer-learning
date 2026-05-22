@@ -30,7 +30,7 @@ model_revision = "7bce263b15377fc15361f52cfab88f8b586abda0"
 # Total training steps. Use record_count from corpus metadata to estimate:
 #   max_steps = (record_count / (per_device_train_batch_size * world_size)) * num_epochs
 # For the full felid corpus (~2M tokens), 10k steps ≈ 1 epoch on 8 GPUs.
-max_steps = 10000
+max_steps = 50000
 
 # ============================================================================
 # OPTIONAL FIELDS — All have production defaults
@@ -49,20 +49,20 @@ mlm_probability = 0.15
 
 # Per-device batch size for training (before gradient accumulation).
 # Adjust downward if OOM errors occur on smaller GPUs (e.g., 4 or 6).
-per_device_train_batch_size = 8
+per_device_train_batch_size = 32
 
 # Per-device batch size for validation.
-# Smaller than training is common; set to 8 or 16.
-per_device_eval_batch_size = 8
+# Larger than training is fine (no backward pass).
+per_device_eval_batch_size = 32
 
 # Gradient accumulation steps. Increases effective batch size without OOM.
 # Effective batch size = per_device_train_batch_size * gradient_accumulation_steps * world_size
 # Recommended: 1 for large-batch setups, 2-4 for memory-constrained setups.
-gradient_accumulation_steps = 1
+gradient_accumulation_steps = 2
 
 # Initial learning rate for AdamW optimizer. Applied to linear warmup ramp.
-# Standard MLM: 1e-4 or 5e-5. Smaller values (~5e-5) for longer warmup.
-learning_rate = 0.0001
+# Standard MLM: 1e-4 or 5e-5. Smaller values (~5e-5) for continued pre-training.
+learning_rate = 5e-5
 
 # L2 regularization (weight decay) coefficient in AdamW.
 # Applied only to non-bias and non-LayerNorm parameters (per §3.4).
@@ -70,21 +70,20 @@ weight_decay = 0.01
 
 # Linear warmup steps before cosine annealing begins.
 # Typical range: 500–2000 steps. Higher warmup for longer training.
-warmup_steps = 1000
+warmup_steps = 500
 
 # Validation frequency (every N training steps).
 # Set to 0 to skip validation; recommended range is 500–2000.
-eval_every = 500
+eval_every = 1000
 
-# Maximum validation steps per epoch (OPTIONAL: auto-derived from record_count if omitted).
-# Auto-derivation prevents DDP deadlock by capping eval at a fixed step count.
-# If set explicitly, must be <= record_count / (per_device_eval_batch_size * world_size).
-# Uncomment and set to enable explicit cap:
-# eval_max_steps = 5000
+# Maximum validation steps per eval cycle (OPTIONAL: auto-derived from record_count if omitted).
+# Caps eval duration; each rank runs its shard up to this many steps, then all ranks
+# meet at a single post-loop reduce — uneven per-rank shard sizes are handled safely.
+eval_max_steps = 500
 
 # Early stopping patience (OPTIONAL: disabled if omitted).
 # Stop training if eval loss does not improve for this many consecutive eval cycles.
-# patience = 5
+patience = 5
 
 # Checkpoint save frequency (every N training steps).
 # "latest" checkpoint is overwritten; "best" is kept only if eval loss improves.
@@ -104,7 +103,7 @@ seed = 42
 
 # Number of DataLoader worker processes per rank.
 # Increase if data loading is the bottleneck (e.g., 8, 16).
-num_workers = 4
+num_workers = 8
 
 # Row-level shuffle buffer size (number of rows cached for random sampling).
 # Larger values (~8192) improve mixing at the cost of memory; smaller values
