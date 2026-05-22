@@ -406,11 +406,11 @@ The window extraction produces a JSONL file of `FinetuneWindow` records. Each re
 
 ```bash
 uv run python -m jaguar_geo_assign.cli fine-tune \
-  --config configs/mtl_finetune.toml
+  --config configs/examples/mtl_finetune.toml
 
 # Quick smoke test with synthetic data (no pretrained backbone needed)
 uv run python -m jaguar_geo_assign.cli fine-tune \
-  --config configs/mtl_finetune.toml --integration-test
+  --config configs/examples/mtl_finetune.toml --integration-test
 ```
 
 The fine-tuning trainer requires a `MtlFinetuneConfig` TOML with the following fields:
