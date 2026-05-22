@@ -628,7 +628,11 @@ def run_felid_foundation_training(
     # handles all sharding. Gradient accumulation via accelerator.accumulate() works because
     # its sync_gradients flag is tied to self.step, not the dataloader. See
     # accelerate/accelerator.py:1228 _do_sync().
-    model, optimizer, scheduler = accelerator.prepare(model, optimizer, scheduler)
+    # Scheduler is NOT passed through prepare() because Accelerate would divide
+    # num_warmup_steps and num_training_steps by num_processes, assuming it also
+    # shards the dataloader. Our dataloaders bypass prepare() (manual file-level
+    # sharding), so each rank runs the full max_steps — the scheduler must too.
+    model, optimizer = accelerator.prepare(model, optimizer)
 
     # Model trainability verification
     # Count trainable vs. total parameters after construction and verify all are trainable.
