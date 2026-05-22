@@ -178,16 +178,19 @@ The foundation model is trained with **masked language modeling (MLM)**: 15% of 
 
 | Parameter | Value | Rationale |
 |-----------|-------|-----------|
-| Max training steps | 10,000 | Step-based (not epoch-based) for reproducibility across corpus sizes |
-| Learning rate | 1e-4 | Initial LR for AdamW optimizer |
-| LR schedule | Cosine annealing with linear warmup | Linear ramp over 1,000 steps, then cosine decay to near-zero |
+| Max training steps | 50,000 | Safety ceiling only; training normally stops earlier via early stopping |
+| Early stopping patience | 5 eval cycles | Halt if validation loss does not improve for 5 consecutive eval cycles |
+| Learning rate | 5e-5 | Conservative LR for continued pre-training (lower than scratch training) |
+| LR schedule | Cosine annealing with linear warmup | Linear ramp over 500 steps, then cosine decay to near-zero |
 | Weight decay | 0.01 | Applied to all parameters except bias and LayerNorm weights |
 | Gradient clipping | 1.0 | Max L2 norm to prevent gradient explosions |
-| Per-device train batch size | 8 | Before gradient accumulation |
+| Per-device train batch size | 32 | Before gradient accumulation |
+| Gradient accumulation steps | 2 | Effective batch = 32 × 2 × world_size |
 | MLM probability | 0.15 | Standard 15% masking rate |
 | Max sequence length | 512 tokens | Matches the context window size |
 | Mixed precision | BF16 | Bfloat16 prevents gradient overflow while maintaining speed on Ampere/Ada GPUs |
-| Evaluation frequency | Every 500 steps | Validation loss triggers best-checkpoint saves |
+| Evaluation frequency | Every 1,000 steps | Validation loss triggers best-checkpoint saves and early-stopping checks |
+| Max eval steps | 500 | Caps each eval cycle duration; post-loop reduce safely handles uneven per-rank shards |
 
 **Optimizer:** AdamW with decoupled weight decay. Bias and LayerNorm parameters are excluded from weight decay (weight decay = 0.0) following standard transformer training conventions.
 
