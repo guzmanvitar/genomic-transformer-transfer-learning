@@ -443,6 +443,7 @@ def iter_locus_windows_from_vcf(
     reference: ReferenceIndex,
     positive_reference_tokens: Sequence[str] = POSITIVE_REFERENCE_TOKENS,
     negative_reference_tokens: Sequence[str] = NEGATIVE_REFERENCE_TOKENS,
+    _warn_missing_reference: bool = True,
 ) -> Iterator[FinetuneWindow]:
     """Stream windows for one sample without materialising the full list.
 
@@ -513,12 +514,13 @@ def iter_locus_windows_from_vcf(
                 if sample_id not in columns[9:]:
                     raise AcquisitionError(f"Sample '{sample_id}' not found in VCF {vcf_path}")
                 if not vcf_reference:
-                    _LOGGER.warning(
-                        "VCF %s is missing a ##reference header — "
-                        "skipping build-token validation. Per-record REF/FASTA "
-                        "checks still guard against assembly mismatches.",
-                        vcf_path,
-                    )
+                    if _warn_missing_reference:
+                        _LOGGER.warning(
+                            "VCF %s is missing a ##reference header — "
+                            "skipping build-token validation. Per-record REF/FASTA "
+                            "checks still guard against assembly mismatches.",
+                            vcf_path,
+                        )
                 else:
                     try:
                         _validate_finetune_reference_evidence(
@@ -902,6 +904,22 @@ def extract_windows_for_samples(
     output_path = Path(output_jsonl)
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
+    has_reference_header = False
+    with _open_maybe_gzip(vcf_path) as probe:
+        for line in probe:
+            if line.startswith("##reference="):
+                has_reference_header = True
+                break
+            if not line.startswith("##"):
+                break
+    if not has_reference_header:
+        _LOGGER.warning(
+            "VCF %s is missing a ##reference header — "
+            "skipping build-token validation. Per-record REF/FASTA "
+            "checks still guard against assembly mismatches.",
+            vcf_path,
+        )
+
     total_windows = 0
     samples_processed = 0
     samples_skipped = 0
@@ -916,6 +934,7 @@ def extract_windows_for_samples(
                         reference=reference,
                         positive_reference_tokens=positive_reference_tokens,
                         negative_reference_tokens=negative_reference_tokens,
+                        _warn_missing_reference=False,
                     ):
                         handle.write(json.dumps(asdict(window)) + "\n")
                         total_windows += 1
