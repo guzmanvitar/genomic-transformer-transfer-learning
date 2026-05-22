@@ -30,7 +30,7 @@ model_revision = "7bce263b15377fc15361f52cfab88f8b586abda0"
 # Total training steps. Use record_count from corpus metadata to estimate:
 #   max_steps = (record_count / (per_device_train_batch_size * world_size)) * num_epochs
 # For the full felid corpus (~2M tokens), 10k steps ≈ 1 epoch on 8 GPUs.
-max_steps = 5000
+max_steps = 50000
 
 # ============================================================================
 # OPTIONAL FIELDS — All have production defaults
@@ -84,7 +84,7 @@ eval_max_steps = 500
 
 # Early stopping patience (OPTIONAL: disabled if omitted).
 # Stop training if eval loss does not improve for this many consecutive eval cycles.
-# patience = 5
+patience = 5
 
 # Checkpoint save frequency (every N training steps).
 # "latest" checkpoint is overwritten; "best" is kept only if eval loss improves.
