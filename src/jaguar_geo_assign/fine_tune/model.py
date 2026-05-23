@@ -219,6 +219,7 @@ class JaguarMTLModel(nn.Module):
             input_ids=input_ids,
             attention_mask=attention_mask,
             token_type_ids=token_type_ids,
+            return_dict=True,
             **kwargs,
         )
         pooled = self._pool(
