@@ -124,8 +124,10 @@ def _load_tokenizer(config: MtlFinetuneConfig, backbone: Any | None = None) -> A
        embedding matrix is resized so that model and tokenizer remain aligned.
     """
 
+    tokenizer_dir = config.backbone_path.parent / "tokenizer"
+    tokenizer_src = str(tokenizer_dir) if tokenizer_dir.is_dir() else str(config.backbone_path)
     tokenizer = AutoTokenizer.from_pretrained(
-        str(config.backbone_path),
+        tokenizer_src,
         trust_remote_code=True,
     )
 
