@@ -227,3 +227,6 @@ models/foundation_felid/
 
 # Playwright MCP tooling artifacts
 .playwright-mcp/
+
+# Trained models
+/models
