@@ -1017,18 +1017,19 @@ def run_jaguar_mtl_training(config_path: str | Path) -> MTLTrainResult:
 
                 if not torch.isfinite(loss_detached).all():
                     nan_steps += 1
-                    if accelerator.sync_gradients:
-                        logger.warning(
-                            "NaN/Inf loss detected at phase 2 step %d (sync step); "
-                            "clearing gradients before continuing.",
-                            phase2_steps_completed,
-                        )
-                    else:
-                        logger.warning(
-                            "NaN/Inf loss detected at phase 2 step %d (micro-step); "
-                            "discarding accumulated gradients before the next optimizer step.",
-                            phase2_steps_completed,
-                        )
+                    if accelerator.is_main_process:
+                        if accelerator.sync_gradients:
+                            logger.warning(
+                                "NaN/Inf loss detected at phase 2 step %d (sync step); "
+                                "clearing gradients before continuing.",
+                                phase2_steps_completed,
+                            )
+                        else:
+                            logger.warning(
+                                "NaN/Inf loss detected at phase 2 step %d (micro-step); "
+                                "discarding accumulated gradients before the next optimizer step.",
+                                phase2_steps_completed,
+                            )
                     phase2_optimizer.zero_grad()
                     continue
 
