@@ -219,14 +219,14 @@ class JaguarMTLModel(nn.Module):
             input_ids=input_ids,
             attention_mask=attention_mask,
             token_type_ids=token_type_ids,
-            return_dict=True,
             **kwargs,
         )
-        pooled = self._pool(
-            outputs.last_hidden_state,
-            getattr(outputs, "pooler_output", None),
-            attention_mask,
-        )
+        if isinstance(outputs, tuple):
+            hidden_state, pooler_output = outputs[0], outputs[1] if len(outputs) > 1 else None
+        else:
+            hidden_state = outputs.last_hidden_state
+            pooler_output = getattr(outputs, "pooler_output", None)
+        pooled = self._pool(hidden_state, pooler_output, attention_mask)
         coordinate = self.coordinate_head(pooled)
         biome_logits = self.biome_head(pooled) if self.biome_head is not None else None
         return JaguarMTLOutput(coordinate=coordinate, biome_logits=biome_logits)
