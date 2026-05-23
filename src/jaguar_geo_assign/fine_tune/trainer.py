@@ -41,7 +41,12 @@ from jaguar_geo_assign.data.pipeline_contract import (
     DNABERT2_TOKENIZER_ID,
     DNABERT2_TOKENIZER_REVISION,
 )
-from jaguar_geo_assign.fine_tune.dataset import BIOME_CLASSES, CoordStats, build_fold_dataloaders
+from jaguar_geo_assign.fine_tune.dataset import (
+    BIOME_CLASSES,
+    CoordStats,
+    JaguarMTLDataset,
+    build_fold_dataloaders,
+)
 from jaguar_geo_assign.fine_tune.model import JaguarMTLModel
 from jaguar_geo_assign.pretrain.foundation_training import (
     _copy_custom_code,
@@ -543,15 +548,26 @@ def _collect_baseline_targets(source: Any) -> tuple[Tensor, Tensor]:
 
     Baseline metrics should reflect the true split contents rather than the
     stochastic behaviour of the training sampler. When a map-style dataset is
-    available, this helper iterates the dataset directly; otherwise it falls
-    back to consuming the provided iterable of already-collated batches.
+    available, this helper reads the raw records directly (avoiding the
+    per-sample tokenization cost of ``__getitem__``); otherwise it falls back
+    to consuming the provided iterable of already-collated batches.
     """
-
     biome_parts: list[Tensor] = []
     coord_parts: list[Tensor] = []
 
     dataset = getattr(source, "dataset", None)
-    if dataset is not None and hasattr(dataset, "__len__") and hasattr(dataset, "__getitem__"):
+    if isinstance(dataset, JaguarMTLDataset):
+        for record in dataset._records:
+            biome_idx = dataset._biome_to_idx[record["biome_population_label"]]
+            biome_parts.append(torch.tensor(biome_idx, dtype=torch.long).reshape(1))
+            lat_z = (
+                float(record["latitude"]) - dataset._coord_stats.lat_mean
+            ) / dataset._coord_stats.lat_std
+            lon_z = (
+                float(record["longitude"]) - dataset._coord_stats.lon_mean
+            ) / dataset._coord_stats.lon_std
+            coord_parts.append(torch.tensor([lat_z, lon_z], dtype=torch.float32).reshape(1, 2))
+    elif dataset is not None and hasattr(dataset, "__len__") and hasattr(dataset, "__getitem__"):
         for index in range(len(dataset)):
             sample = dataset[index]
             biome_parts.append(torch.as_tensor(sample["biome_label"], dtype=torch.long).reshape(1))
