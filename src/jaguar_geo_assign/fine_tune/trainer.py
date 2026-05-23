@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import logging
 import math
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -564,6 +565,7 @@ def _run_evaluation(
     float,
     float | None,
     float | None,
+    dict[str, float],
 ]:
     """Run evaluation over ``eval_loader`` and update best checkpoint if needed."""
 
@@ -609,7 +611,7 @@ def _run_evaluation(
                 eval_total_loss / max(eval_steps, 1) if eval_steps > 0 else float("nan")
             )
             model.train()
-            return mean_eval_loss, best_eval_haversine_km, best_eval_macro_f1
+            return mean_eval_loss, best_eval_haversine_km, best_eval_macro_f1, {}
 
         all_coord_pred = accelerator.gather_for_metrics(torch.cat(coord_pred_list))
         all_biome = accelerator.gather_for_metrics(torch.cat(biome_list))
@@ -709,7 +711,7 @@ def _run_evaluation(
             )
 
     model.train()
-    return mean_eval_loss, best_eval_haversine_km, best_eval_macro_f1
+    return mean_eval_loss, best_eval_haversine_km, best_eval_macro_f1, metrics
 
 
 def run_jaguar_mtl_training(config_path: str | Path) -> MTLTrainResult:
@@ -744,6 +746,19 @@ def run_jaguar_mtl_training(config_path: str | Path) -> MTLTrainResult:
         str(config.backbone_path),
         trust_remote_code=True,
     )
+
+    # DNABERT-2's bundled flash_attn_triton.py uses tl.dot(trans_b=True), removed
+    # in Triton 2.2+. Scan all modules since local-path loading produces a
+    # non-deterministic key unlike Hub loading (where pretrain uses a fixed key).
+    _patched_any = False
+    for _mod_name, _mod in list(sys.modules.items()):
+        if _mod_name.endswith(".bert_layers") and _mod is not None:
+            if getattr(_mod, "flash_attn_qkvpacked_func", None) is not None:
+                _mod.flash_attn_qkvpacked_func = None
+                _patched_any = True
+    if _patched_any:
+        logger.info("Disabled DNABERT-2 Triton flash attention; using PyTorch fallback.")
+
     tokenizer = _load_tokenizer(config, backbone=backbone)
 
     train_loader, eval_loader, coord_stats = build_fold_dataloaders(config, tokenizer)
@@ -840,6 +855,19 @@ def run_jaguar_mtl_training(config_path: str | Path) -> MTLTrainResult:
 
                 if not torch.isfinite(loss_detached).all():
                     nan_steps += 1
+                    if accelerator.is_main_process:
+                        if accelerator.sync_gradients:
+                            logger.warning(
+                                "NaN/Inf loss detected at phase 1 step %d (sync step); "
+                                "clearing gradients before continuing.",
+                                phase1_steps_completed,
+                            )
+                        else:
+                            logger.warning(
+                                "NaN/Inf loss detected at phase 1 step %d (micro-step); "
+                                "discarding accumulated gradients before the next optimizer step.",
+                                phase1_steps_completed,
+                            )
                     phase1_optimizer.zero_grad()
                     continue
 
@@ -879,6 +907,16 @@ def run_jaguar_mtl_training(config_path: str | Path) -> MTLTrainResult:
                                 "train/phase": 1.0,
                             }
                             accelerator.log(logs, step=global_step)
+                            if accelerator.is_main_process:
+                                logger.info(
+                                    "[Phase 1 | Step %d/%d] loss=%.4f cls=%.4f reg=%.4f lr=%.2e",
+                                    phase1_steps_completed,
+                                    config.phase1_steps,
+                                    logs["train/total_loss"],
+                                    logs["train/cls_loss"],
+                                    logs["train/reg_loss"],
+                                    logs["train/lr_heads"],
+                                )
                             train_loss_sum = train_cls_loss_sum = train_reg_loss_sum = 0.0
                             train_loss_count = 0
                             nan_steps = 0
@@ -889,6 +927,7 @@ def run_jaguar_mtl_training(config_path: str | Path) -> MTLTrainResult:
                                 mean_eval_loss,
                                 best_eval_haversine_km,
                                 best_eval_macro_f1,
+                                eval_metrics,
                             ) = _run_evaluation(
                                 model=model,
                                 eval_loader=eval_loader,
@@ -903,10 +942,18 @@ def run_jaguar_mtl_training(config_path: str | Path) -> MTLTrainResult:
                                 best_eval_macro_f1=best_eval_macro_f1,
                                 output_dir=output_dir,
                             )
-                            logger.info(
-                                "phase1_eval",
-                                extra={"step": global_step, "loss": mean_eval_loss},
-                            )
+                            if accelerator.is_main_process:
+                                logger.info(
+                                    "[Phase 1 | Eval @ step %d] loss=%.4f hav_median=%.1fkm"
+                                    " f1=%.4f best_hav=%.1fkm",
+                                    global_step,
+                                    mean_eval_loss,
+                                    eval_metrics.get("haversine_km_median", float("nan")),
+                                    eval_metrics.get("macro_f1", float("nan")),
+                                    best_eval_haversine_km
+                                    if best_eval_haversine_km is not None
+                                    else float("nan"),
+                                )
 
                         if global_step % config.save_every == 0 and accelerator.is_main_process:
                             _save_json_atomically(
@@ -971,6 +1018,19 @@ def run_jaguar_mtl_training(config_path: str | Path) -> MTLTrainResult:
 
                 if not torch.isfinite(loss_detached).all():
                     nan_steps += 1
+                    if accelerator.is_main_process:
+                        if accelerator.sync_gradients:
+                            logger.warning(
+                                "NaN/Inf loss detected at phase 2 step %d (sync step); "
+                                "clearing gradients before continuing.",
+                                phase2_steps_completed,
+                            )
+                        else:
+                            logger.warning(
+                                "NaN/Inf loss detected at phase 2 step %d (micro-step); "
+                                "discarding accumulated gradients before the next optimizer step.",
+                                phase2_steps_completed,
+                            )
                     phase2_optimizer.zero_grad()
                     continue
 
@@ -1010,6 +1070,18 @@ def run_jaguar_mtl_training(config_path: str | Path) -> MTLTrainResult:
                                 "train/phase": 2.0,
                             }
                             accelerator.log(logs, step=global_step)
+                            if accelerator.is_main_process:
+                                logger.info(
+                                    "[Phase 2 | Step %d/%d] loss=%.4f cls=%.4f reg=%.4f"
+                                    " lr_bb=%.2e lr_hd=%.2e",
+                                    phase2_steps_completed,
+                                    config.phase2_steps,
+                                    logs["train/total_loss"],
+                                    logs["train/cls_loss"],
+                                    logs["train/reg_loss"],
+                                    logs["train/lr_backbone"],
+                                    logs["train/lr_heads"],
+                                )
                             train_loss_sum = train_cls_loss_sum = train_reg_loss_sum = 0.0
                             train_loss_count = 0
                             nan_steps = 0
@@ -1020,6 +1092,7 @@ def run_jaguar_mtl_training(config_path: str | Path) -> MTLTrainResult:
                                 mean_eval_loss,
                                 best_eval_haversine_km,
                                 best_eval_macro_f1,
+                                eval_metrics,
                             ) = _run_evaluation(
                                 model=model,
                                 eval_loader=eval_loader,
@@ -1034,10 +1107,18 @@ def run_jaguar_mtl_training(config_path: str | Path) -> MTLTrainResult:
                                 best_eval_macro_f1=best_eval_macro_f1,
                                 output_dir=output_dir,
                             )
-                            logger.info(
-                                "phase2_eval",
-                                extra={"step": global_step, "loss": mean_eval_loss},
-                            )
+                            if accelerator.is_main_process:
+                                logger.info(
+                                    "[Phase 2 | Eval @ step %d] loss=%.4f hav_median=%.1fkm"
+                                    " f1=%.4f best_hav=%.1fkm",
+                                    global_step,
+                                    mean_eval_loss,
+                                    eval_metrics.get("haversine_km_median", float("nan")),
+                                    eval_metrics.get("macro_f1", float("nan")),
+                                    best_eval_haversine_km
+                                    if best_eval_haversine_km is not None
+                                    else float("nan"),
+                                )
 
                         if global_step % config.save_every == 0 and accelerator.is_main_process:
                             _save_json_atomically(
@@ -1247,7 +1328,7 @@ def integration_test(
         )
         best_eval_haversine_km: float | None = None
         best_eval_macro_f1: float | None = None
-        mean_eval_loss, best_eval_haversine_km, best_eval_macro_f1 = _run_evaluation(
+        mean_eval_loss, best_eval_haversine_km, best_eval_macro_f1, _eval_metrics = _run_evaluation(
             model=model,
             eval_loader=eval_loader,
             accelerator=accelerator,
@@ -1309,19 +1390,21 @@ def integration_test(
             "Non-finite reg_loss in coord-only integration path"
         )
 
-        mean_eval_loss2, best_eval_haversine_km2, best_eval_macro_f12 = _run_evaluation(
-            model=coord_only_model,
-            eval_loader=eval_loader,
-            accelerator=accelerator,
-            coord_stats=coord_stats,
-            config=config,
-            cls_loss_weight=1.0,
-            reg_loss_weight=0.5,
-            huber_delta=1.0,
-            global_step=2,
-            best_eval_haversine_km=best_eval_haversine_km,
-            best_eval_macro_f1=best_eval_macro_f1,
-            output_dir=output_dir,
+        mean_eval_loss2, best_eval_haversine_km2, best_eval_macro_f12, _eval_metrics2 = (
+            _run_evaluation(
+                model=coord_only_model,
+                eval_loader=eval_loader,
+                accelerator=accelerator,
+                coord_stats=coord_stats,
+                config=config,
+                cls_loss_weight=1.0,
+                reg_loss_weight=0.5,
+                huber_delta=1.0,
+                global_step=2,
+                best_eval_haversine_km=best_eval_haversine_km,
+                best_eval_macro_f1=best_eval_macro_f1,
+                output_dir=output_dir,
+            )
         )
         assert math.isfinite(mean_eval_loss2), "Coordinate-only eval produced non-finite mean loss"
         assert best_eval_haversine_km2 is not None, (
