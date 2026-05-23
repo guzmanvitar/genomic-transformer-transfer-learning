@@ -828,7 +828,13 @@ def run_jaguar_mtl_training(config_path: str | Path) -> MTLTrainResult:
 
     tokenizer = _load_tokenizer(config, backbone=backbone)
 
+    logger.info("Building fold dataloaders (fold %d/%d)...", config.fold_index, config.n_folds)
     train_loader, eval_loader, coord_stats = build_fold_dataloaders(config, tokenizer)
+    logger.info(
+        "Dataloaders ready (train=%d batches, eval=%d batches).",
+        len(train_loader) if hasattr(train_loader, "__len__") else -1,
+        len(eval_loader) if hasattr(eval_loader, "__len__") else -1,
+    )
 
     accelerator = Accelerator(
         mixed_precision="bf16",
@@ -844,11 +850,18 @@ def run_jaguar_mtl_training(config_path: str | Path) -> MTLTrainResult:
     )
 
     accelerator.init_trackers("jaguar_mtl_training")
+    logger.info("Computing baselines on eval split...")
     baseline_metrics = _compute_baselines(
         train_loader=train_loader,
         eval_loader=eval_loader,
         coord_stats=coord_stats,
         n_biomes=config.n_biomes,
+    )
+    logger.info(
+        "Baselines: macro_f1=%.4f, haversine_median=%.1f km, haversine_mean=%.1f km",
+        baseline_metrics["macro_f1"],
+        baseline_metrics["haversine_km_median"],
+        baseline_metrics["haversine_km_mean"],
     )
     accelerator.log(
         {
@@ -882,6 +895,7 @@ def run_jaguar_mtl_training(config_path: str | Path) -> MTLTrainResult:
         train_loader,
         eval_loader,
     )
+    logger.info("Accelerator ready (device=%s). Starting Phase 1 training.", accelerator.device)
 
     global_step = 0
     phase1_steps_completed = 0
@@ -1055,6 +1069,12 @@ def run_jaguar_mtl_training(config_path: str | Path) -> MTLTrainResult:
     # SAFE PROTOCOL: model is already wrapped; only the new optimizer and
     # scheduler go through ``accelerator.prepare``.
     phase2_optimizer, phase2_scheduler = accelerator.prepare(phase2_optimizer, phase2_scheduler)
+    logger.info(
+        "Starting Phase 2: unfroze %d layers (%d -> %d trainable params).",
+        config.unfreeze_layers,
+        before_trainable,
+        after_trainable,
+    )
 
     model.train()
     train_loss_sum = train_cls_loss_sum = train_reg_loss_sum = 0.0
