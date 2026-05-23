@@ -165,11 +165,11 @@ class JaguarMTLModel(nn.Module):
     ) -> Float[torch.Tensor, "batch hidden"]:
         """Return a single embedding per sequence from backbone outputs.
 
-        When ``pooling_strategy`` is ``"cls"`` (the default), preference is
-        given to ``pooler_output`` when available (common for BERT-style
-        models). If absent, the method falls back to using the first token's
-        hidden state (typically the ``[CLS]`` token) so that non-pooled
-        backbones remain usable.
+        When ``pooling_strategy`` is ``"cls"`` (the default), the first
+        token's hidden state (the ``[CLS]`` token) is used directly.
+        ``pooler_output`` is accepted for interface compatibility but
+        intentionally ignored — foundation MLM pre-training does not
+        train the pooler, so its weights are randomly initialized.
 
         When ``pooling_strategy`` is ``"mean"``, the method computes a masked
         mean over the sequence dimension using ``attention_mask`` when
@@ -179,8 +179,9 @@ class JaguarMTLModel(nn.Module):
         """
 
         if self.pooling_strategy == "cls":
-            if pooler_output is not None:
-                return pooler_output
+            # Always use the raw CLS hidden state rather than pooler_output.
+            # Foundation pre-training (MLM) does not train the pooler, so its
+            # weights are randomly initialized and would degrade the signal.
             return last_hidden_state[:, 0]
 
         # Mean pooling path.

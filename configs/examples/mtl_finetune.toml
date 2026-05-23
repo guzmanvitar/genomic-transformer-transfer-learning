@@ -83,7 +83,7 @@ weight_decay = 0.01
 # Logging, eval, and checkpoint frequency (in steps).
 log_every = 10
 eval_every = 100
-eval_max_steps = 200
+eval_max_steps = 1000
 save_every = 500
 
 # Early stopping patience (eval cycles without improvement).
