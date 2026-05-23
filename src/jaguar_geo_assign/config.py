@@ -1118,9 +1118,11 @@ class MtlFinetuneConfig:
         weight_decay: AdamW weight-decay coefficient.
         log_every: Logging frequency in steps.
         eval_every: Evaluation frequency in steps.
+        eval_max_steps: Maximum eval batches per evaluation pass (None = full eval set).
         save_every: Checkpoint save frequency in steps.
         tensorboard_subdir: Subdirectory under output_dir for TensorBoard logs.
         dropout: Dropout probability applied in the MTL heads.
+        patience: Eval cycles without improvement before early stopping (None = disabled).
     """
 
     backbone_path: Path
@@ -1150,9 +1152,11 @@ class MtlFinetuneConfig:
     weight_decay: float = 0.01
     log_every: int = 10
     eval_every: int = 100
+    eval_max_steps: int | None = None
     save_every: int = 500
     tensorboard_subdir: str = "tensorboard"
     dropout: float = 0.1
+    patience: int | None = None
 
 
 def load_mtl_finetune_config(path: str | Path) -> MtlFinetuneConfig:
@@ -1198,9 +1202,13 @@ def load_mtl_finetune_config(path: str | Path) -> MtlFinetuneConfig:
         weight_decay = float(training.get("weight_decay", 0.01))
         log_every = int(training.get("log_every", 10))
         eval_every = int(training.get("eval_every", 100))
+        eval_max_steps_raw = training.get("eval_max_steps")
+        eval_max_steps = int(eval_max_steps_raw) if eval_max_steps_raw is not None else None
         save_every = int(training.get("save_every", 500))
         tensorboard_subdir = str(training.get("tensorboard_subdir", "tensorboard"))
         dropout = float(training.get("dropout", 0.1))
+        patience_raw = training.get("patience")
+        patience = int(patience_raw) if patience_raw is not None else None
 
         # Loader contract enforcement
         if pooling_strategy not in {"cls", "mean"}:
@@ -1225,6 +1233,10 @@ def load_mtl_finetune_config(path: str | Path) -> MtlFinetuneConfig:
             raise ValueError("training.weight_decay must be non-negative")
         if gradient_clip < 0.0:
             raise ValueError("training.gradient_clip must be non-negative")
+        if eval_max_steps is not None and eval_max_steps <= 0:
+            raise ValueError("training.eval_max_steps must be positive")
+        if patience is not None and patience <= 0:
+            raise ValueError("training.patience must be positive")
 
     except KeyError as exc:
         msg = f"MTL fine-tune config is missing required field: {exc.args[0]}"
@@ -1258,7 +1270,9 @@ def load_mtl_finetune_config(path: str | Path) -> MtlFinetuneConfig:
         weight_decay=weight_decay,
         log_every=log_every,
         eval_every=eval_every,
+        eval_max_steps=eval_max_steps,
         save_every=save_every,
         tensorboard_subdir=tensorboard_subdir,
         dropout=dropout,
+        patience=patience,
     )

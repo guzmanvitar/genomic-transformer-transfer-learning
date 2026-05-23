@@ -224,19 +224,23 @@ DNABERT-2 Backbone (shared encoder, 117M parameters)
 
 Fine-tuning follows a two-phase schedule designed to prevent catastrophic forgetting of pre-trained representations:
 
-**Phase 1 — Heads-only warm-up (default: 1,000 steps):**
+**Phase 1 — Heads-only warm-up:**
 - The backbone is completely frozen (`requires_grad=False` on all backbone parameters).
 - Only the coordinate regression and biome classification heads are trained.
 - Learning rate for heads: 1e-4.
 - This phase allows the task heads to calibrate to the backbone's representation space before any backbone parameters change.
 
-**Phase 2 — Partial unfreezing (default: 3,000 steps):**
+**Phase 2 — Partial unfreezing:**
 - The last 2 transformer blocks of the backbone are unfrozen (configurable: 2 or 3 blocks).
 - The backbone's pooler layer is also unfrozen if present.
 - Task heads continue training.
 - **Differential learning rates:** The backbone uses a 10x lower learning rate (1e-5) than the heads (1e-4). This protects the deep pre-trained representations while allowing the top layers to adapt to the jaguar-specific task distribution.
 
 Both phases use AdamW with cosine-annealing learning rate schedules and linear warmup over 10% of total phase steps.
+
+**Early stopping:** Both phases support patience-based early stopping, matching the pre-training design. A patience counter tracks consecutive evaluation cycles without improvement in the primary metric (median Haversine distance). When the counter reaches the configured `patience` threshold, the phase ends early. The patience counter resets at the Phase 2 transition. Phase step limits (`phase1_steps`, `phase2_steps`) serve as safety ceilings — in practice, early stopping controls convergence.
+
+**Evaluation capping:** Each evaluation pass can be limited to `eval_max_steps` batches to prevent long stalls on large evaluation sets. When set, only a fixed number of eval batches are processed per cycle rather than the full evaluation split.
 
 ### Loss Functions and Task Weighting
 
@@ -424,10 +428,10 @@ output_dir     = "models/finetune"
 ```
 
 The fine-tuning trainer runs two phases:
-1. **Heads-only warm-up** (1,000 steps): backbone frozen, only task heads trained.
-2. **Joint training** (3,000 steps): last 2 transformer blocks and task heads trained with differential learning rates.
+1. **Heads-only warm-up**: backbone frozen, only task heads trained.
+2. **Joint training**: last 2 transformer blocks and task heads trained with differential learning rates.
 
-The best checkpoint is selected by median Haversine distance (lower is better) with macro F1 as tie-breaker.
+Both phases run until their step limit or until early stopping triggers (controlled by the `patience` parameter). The best checkpoint is selected by median Haversine distance (lower is better) with macro F1 as tie-breaker.
 
 ---
 

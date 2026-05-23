@@ -642,6 +642,7 @@ def _run_evaluation(
     best_eval_haversine_km: float | None,
     best_eval_macro_f1: float | None,
     output_dir: Path,
+    eval_max_steps: int | None = None,
 ) -> tuple[
     float,
     float | None,
@@ -659,7 +660,12 @@ def _run_evaluation(
     eval_steps = 0
 
     with torch.no_grad():
+        eval_batch_count = 0
         for eval_batch in eval_loader:
+            if eval_max_steps is not None and eval_batch_count >= eval_max_steps:
+                break
+            eval_batch_count += 1
+
             eval_batch = {
                 k: v.to(accelerator.device, non_blocking=True) for k, v in eval_batch.items()
             }
@@ -918,6 +924,8 @@ def run_jaguar_mtl_training(config_path: str | Path) -> MTLTrainResult:
     phase2_steps_completed = 0
     best_eval_haversine_km: float | None = None
     best_eval_macro_f1: float | None = None
+    patience_counter = 0
+    early_stopped = False
 
     nan_steps = 0
     skipped_steps = 0
@@ -929,9 +937,9 @@ def run_jaguar_mtl_training(config_path: str | Path) -> MTLTrainResult:
 
     model.train()
 
-    while phase1_steps_completed < config.phase1_steps:
+    while phase1_steps_completed < config.phase1_steps and not early_stopped:
         for batch in train_loader:
-            if phase1_steps_completed >= config.phase1_steps:
+            if phase1_steps_completed >= config.phase1_steps or early_stopped:
                 break
 
             batch = {k: v.to(accelerator.device, non_blocking=True) for k, v in batch.items()}
@@ -1020,6 +1028,7 @@ def run_jaguar_mtl_training(config_path: str | Path) -> MTLTrainResult:
                             skipped_steps = 0
 
                         if eval_loader is not None and global_step % config.eval_every == 0:
+                            prev_best_hav = best_eval_haversine_km
                             (
                                 mean_eval_loss,
                                 best_eval_haversine_km,
@@ -1038,11 +1047,17 @@ def run_jaguar_mtl_training(config_path: str | Path) -> MTLTrainResult:
                                 best_eval_haversine_km=best_eval_haversine_km,
                                 best_eval_macro_f1=best_eval_macro_f1,
                                 output_dir=output_dir,
+                                eval_max_steps=config.eval_max_steps,
                             )
+                            improved = best_eval_haversine_km != prev_best_hav
+                            if eval_metrics and improved:
+                                patience_counter = 0
+                            elif eval_metrics:
+                                patience_counter += 1
                             if accelerator.is_main_process:
                                 logger.info(
                                     "[Phase 1 | Eval @ step %d] loss=%.4f hav_median=%.1fkm"
-                                    " f1=%.4f best_hav=%.1fkm",
+                                    " f1=%.4f best_hav=%.1fkm patience=%d/%s",
                                     global_step,
                                     mean_eval_loss,
                                     eval_metrics.get("haversine_km_median", float("nan")),
@@ -1050,7 +1065,19 @@ def run_jaguar_mtl_training(config_path: str | Path) -> MTLTrainResult:
                                     best_eval_haversine_km
                                     if best_eval_haversine_km is not None
                                     else float("nan"),
+                                    patience_counter,
+                                    config.patience if config.patience is not None else "inf",
                                 )
+                            if config.patience is not None and patience_counter >= config.patience:
+                                if accelerator.is_main_process:
+                                    logger.info(
+                                        "Early stopping Phase 1 at step %d after %d eval "
+                                        "cycles without improvement.",
+                                        global_step,
+                                        patience_counter,
+                                    )
+                                early_stopped = True
+                                break
 
                         if global_step % config.save_every == 0 and accelerator.is_main_process:
                             _save_json_atomically(
@@ -1064,8 +1091,13 @@ def run_jaguar_mtl_training(config_path: str | Path) -> MTLTrainResult:
                             )
 
                     phase1_optimizer.zero_grad()
+            if early_stopped:
+                break
 
-    # Phase 2
+    # Phase 2 — reset patience; early_stopped carries across only if Phase 1
+    # exhausted patience, which means further training is unlikely to help.
+    patience_counter = 0
+    early_stopped = False
     inner_model = accelerator.unwrap_model(model)
     before_trainable = sum(1 for p in inner_model.parameters() if p.requires_grad)
     _unfreeze_last_n_layers(inner_model, config.unfreeze_layers)
@@ -1098,9 +1130,9 @@ def run_jaguar_mtl_training(config_path: str | Path) -> MTLTrainResult:
     nan_steps = 0
     skipped_steps = 0
 
-    while phase2_steps_completed < config.phase2_steps:
+    while phase2_steps_completed < config.phase2_steps and not early_stopped:
         for batch in train_loader:
-            if phase2_steps_completed >= config.phase2_steps:
+            if phase2_steps_completed >= config.phase2_steps or early_stopped:
                 break
 
             batch = {k: v.to(accelerator.device, non_blocking=True) for k, v in batch.items()}
@@ -1191,6 +1223,7 @@ def run_jaguar_mtl_training(config_path: str | Path) -> MTLTrainResult:
                             skipped_steps = 0
 
                         if eval_loader is not None and global_step % config.eval_every == 0:
+                            prev_best_hav = best_eval_haversine_km
                             (
                                 mean_eval_loss,
                                 best_eval_haversine_km,
@@ -1209,11 +1242,17 @@ def run_jaguar_mtl_training(config_path: str | Path) -> MTLTrainResult:
                                 best_eval_haversine_km=best_eval_haversine_km,
                                 best_eval_macro_f1=best_eval_macro_f1,
                                 output_dir=output_dir,
+                                eval_max_steps=config.eval_max_steps,
                             )
+                            improved = best_eval_haversine_km != prev_best_hav
+                            if eval_metrics and improved:
+                                patience_counter = 0
+                            elif eval_metrics:
+                                patience_counter += 1
                             if accelerator.is_main_process:
                                 logger.info(
                                     "[Phase 2 | Eval @ step %d] loss=%.4f hav_median=%.1fkm"
-                                    " f1=%.4f best_hav=%.1fkm",
+                                    " f1=%.4f best_hav=%.1fkm patience=%d/%s",
                                     global_step,
                                     mean_eval_loss,
                                     eval_metrics.get("haversine_km_median", float("nan")),
@@ -1221,7 +1260,19 @@ def run_jaguar_mtl_training(config_path: str | Path) -> MTLTrainResult:
                                     best_eval_haversine_km
                                     if best_eval_haversine_km is not None
                                     else float("nan"),
+                                    patience_counter,
+                                    config.patience if config.patience is not None else "inf",
                                 )
+                            if config.patience is not None and patience_counter >= config.patience:
+                                if accelerator.is_main_process:
+                                    logger.info(
+                                        "Early stopping Phase 2 at step %d after %d eval "
+                                        "cycles without improvement.",
+                                        global_step,
+                                        patience_counter,
+                                    )
+                                early_stopped = True
+                                break
 
                         if global_step % config.save_every == 0 and accelerator.is_main_process:
                             _save_json_atomically(
@@ -1235,6 +1286,8 @@ def run_jaguar_mtl_training(config_path: str | Path) -> MTLTrainResult:
                             )
 
                     phase2_optimizer.zero_grad()
+            if early_stopped:
+                break
 
     accelerator.end_training()
 
