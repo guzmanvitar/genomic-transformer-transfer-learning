@@ -17,8 +17,10 @@ writes) while remaining small enough for fast CPU-based tests.
 
 from __future__ import annotations
 
+import json
 import logging
 import math
+import shutil
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -28,15 +30,24 @@ import torch
 from accelerate import Accelerator
 from accelerate.utils import set_seed
 from beartype import beartype
+from huggingface_hub import hf_hub_download
 from jaxtyping import Float, Int, jaxtyped
 from torch import nn
 from torch.optim import AdamW
 from transformers import AutoModel, AutoTokenizer, get_cosine_schedule_with_warmup
 
 from jaguar_geo_assign.config import MtlFinetuneConfig, load_mtl_finetune_config
+from jaguar_geo_assign.data.pipeline_contract import (
+    DNABERT2_TOKENIZER_ID,
+    DNABERT2_TOKENIZER_REVISION,
+)
 from jaguar_geo_assign.fine_tune.dataset import BIOME_CLASSES, CoordStats, build_fold_dataloaders
 from jaguar_geo_assign.fine_tune.model import JaguarMTLModel
-from jaguar_geo_assign.pretrain.foundation_training import _save_json_atomically, atomic_dir_replace
+from jaguar_geo_assign.pretrain.foundation_training import (
+    _copy_custom_code,
+    _save_json_atomically,
+    atomic_dir_replace,
+)
 
 # Alias used only in jaxtyping shape annotations; kept out of runtime logic.
 batch = "batch"  # noqa: F841
@@ -44,6 +55,58 @@ batch = "batch"  # noqa: F841
 logger = logging.getLogger(__name__)
 
 Tensor = torch.Tensor
+
+
+def _ensure_custom_code(backbone_path: Path) -> None:
+    """Ensure custom Python files referenced by ``auto_map`` exist in the model directory.
+
+    Locally-saved checkpoints may be missing the custom ``.py`` files that
+    DNABERT-2 needs when loaded with ``trust_remote_code=True``.  If any are
+    absent we download them from the pinned Hub revision.
+    """
+    config_path = backbone_path / "config.json"
+    if not config_path.exists():
+        return
+
+    with open(config_path) as f:
+        cfg = json.load(f)
+
+    auto_map = cfg.get("auto_map", {})
+    if not auto_map:
+        return
+
+    py_files = {v.split(".")[0] + ".py" for v in auto_map.values()}
+    missing = [f for f in py_files if not (backbone_path / f).exists()]
+    if not missing:
+        return
+
+    for filename in missing:
+        try:
+            cached = hf_hub_download(
+                DNABERT2_TOKENIZER_ID,
+                filename,
+                revision=DNABERT2_TOKENIZER_REVISION,
+            )
+            shutil.copy2(cached, backbone_path / filename)
+            logger.info("Downloaded missing custom code file: %s", filename)
+        except Exception:
+            logger.warning("Could not download %s from Hub", filename, exc_info=True)
+
+    # bert_layers.py imports bert_padding.py and flash_attn_triton.py; ensure
+    # those are present too even if they aren't in auto_map directly.
+    for extra in ("bert_padding.py", "flash_attn_triton.py"):
+        if (backbone_path / extra).exists():
+            continue
+        try:
+            cached = hf_hub_download(
+                DNABERT2_TOKENIZER_ID,
+                extra,
+                revision=DNABERT2_TOKENIZER_REVISION,
+            )
+            shutil.copy2(cached, backbone_path / extra)
+            logger.info("Downloaded missing dependency file: %s", extra)
+        except Exception:
+            pass
 
 
 def _load_tokenizer(config: MtlFinetuneConfig, backbone: Any | None = None) -> AutoTokenizer:
@@ -675,6 +738,7 @@ def _run_evaluation(
             # Save backbone in HF format
             hf_dir = tmp_best / "hf_model"
             unwrapped.backbone.save_pretrained(str(hf_dir), safe_serialization=True)
+            _copy_custom_code(unwrapped.backbone, hf_dir)
 
             # Save heads
             heads_path = tmp_best / "heads.pt"
@@ -742,6 +806,7 @@ def run_jaguar_mtl_training(config_path: str | Path) -> MTLTrainResult:
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
 
+    _ensure_custom_code(config.backbone_path)
     backbone = AutoModel.from_pretrained(
         str(config.backbone_path),
         trust_remote_code=True,
