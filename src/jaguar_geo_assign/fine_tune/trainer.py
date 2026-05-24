@@ -17,8 +17,10 @@ writes) while remaining small enough for fast CPU-based tests.
 
 from __future__ import annotations
 
+import json
 import logging
 import math
+import shutil
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -28,15 +30,29 @@ import torch
 from accelerate import Accelerator
 from accelerate.utils import set_seed
 from beartype import beartype
+from huggingface_hub import hf_hub_download
 from jaxtyping import Float, Int, jaxtyped
 from torch import nn
 from torch.optim import AdamW
 from transformers import AutoModel, AutoTokenizer, get_cosine_schedule_with_warmup
 
 from jaguar_geo_assign.config import MtlFinetuneConfig, load_mtl_finetune_config
-from jaguar_geo_assign.fine_tune.dataset import BIOME_CLASSES, CoordStats, build_fold_dataloaders
+from jaguar_geo_assign.data.pipeline_contract import (
+    DNABERT2_TOKENIZER_ID,
+    DNABERT2_TOKENIZER_REVISION,
+)
+from jaguar_geo_assign.fine_tune.dataset import (
+    BIOME_CLASSES,
+    CoordStats,
+    JaguarMTLDataset,
+    build_fold_dataloaders,
+)
 from jaguar_geo_assign.fine_tune.model import JaguarMTLModel
-from jaguar_geo_assign.pretrain.foundation_training import _save_json_atomically, atomic_dir_replace
+from jaguar_geo_assign.pretrain.foundation_training import (
+    _copy_custom_code,
+    _save_json_atomically,
+    atomic_dir_replace,
+)
 
 # Alias used only in jaxtyping shape annotations; kept out of runtime logic.
 batch = "batch"  # noqa: F841
@@ -44,6 +60,58 @@ batch = "batch"  # noqa: F841
 logger = logging.getLogger(__name__)
 
 Tensor = torch.Tensor
+
+
+def _ensure_custom_code(backbone_path: Path) -> None:
+    """Ensure custom Python files referenced by ``auto_map`` exist in the model directory.
+
+    Locally-saved checkpoints may be missing the custom ``.py`` files that
+    DNABERT-2 needs when loaded with ``trust_remote_code=True``.  If any are
+    absent we download them from the pinned Hub revision.
+    """
+    config_path = backbone_path / "config.json"
+    if not config_path.exists():
+        return
+
+    with open(config_path) as f:
+        cfg = json.load(f)
+
+    auto_map = cfg.get("auto_map", {})
+    if not auto_map:
+        return
+
+    py_files = {v.split(".")[0] + ".py" for v in auto_map.values()}
+    missing = [f for f in py_files if not (backbone_path / f).exists()]
+    if not missing:
+        return
+
+    for filename in missing:
+        try:
+            cached = hf_hub_download(
+                DNABERT2_TOKENIZER_ID,
+                filename,
+                revision=DNABERT2_TOKENIZER_REVISION,
+            )
+            shutil.copy2(cached, backbone_path / filename)
+            logger.info("Downloaded missing custom code file: %s", filename)
+        except Exception:
+            logger.warning("Could not download %s from Hub", filename, exc_info=True)
+
+    # bert_layers.py imports bert_padding.py and flash_attn_triton.py; ensure
+    # those are present too even if they aren't in auto_map directly.
+    for extra in ("bert_padding.py", "flash_attn_triton.py"):
+        if (backbone_path / extra).exists():
+            continue
+        try:
+            cached = hf_hub_download(
+                DNABERT2_TOKENIZER_ID,
+                extra,
+                revision=DNABERT2_TOKENIZER_REVISION,
+            )
+            shutil.copy2(cached, backbone_path / extra)
+            logger.info("Downloaded missing dependency file: %s", extra)
+        except Exception:
+            pass
 
 
 def _load_tokenizer(config: MtlFinetuneConfig, backbone: Any | None = None) -> AutoTokenizer:
@@ -61,8 +129,10 @@ def _load_tokenizer(config: MtlFinetuneConfig, backbone: Any | None = None) -> A
        embedding matrix is resized so that model and tokenizer remain aligned.
     """
 
+    tokenizer_dir = config.backbone_path.parent / "tokenizer"
+    tokenizer_src = str(tokenizer_dir) if tokenizer_dir.is_dir() else str(config.backbone_path)
     tokenizer = AutoTokenizer.from_pretrained(
-        str(config.backbone_path),
+        tokenizer_src,
         trust_remote_code=True,
     )
 
@@ -478,15 +548,19 @@ def _collect_baseline_targets(source: Any) -> tuple[Tensor, Tensor]:
 
     Baseline metrics should reflect the true split contents rather than the
     stochastic behaviour of the training sampler. When a map-style dataset is
-    available, this helper iterates the dataset directly; otherwise it falls
-    back to consuming the provided iterable of already-collated batches.
+    available, this helper reads the raw records directly (avoiding the
+    per-sample tokenization cost of ``__getitem__``); otherwise it falls back
+    to consuming the provided iterable of already-collated batches.
     """
-
     biome_parts: list[Tensor] = []
     coord_parts: list[Tensor] = []
 
     dataset = getattr(source, "dataset", None)
-    if dataset is not None and hasattr(dataset, "__len__") and hasattr(dataset, "__getitem__"):
+    if isinstance(dataset, JaguarMTLDataset):
+        for biome_idx, lat_z, lon_z in dataset.iter_raw_targets():
+            biome_parts.append(torch.tensor(biome_idx, dtype=torch.long).reshape(1))
+            coord_parts.append(torch.tensor([lat_z, lon_z], dtype=torch.float32).reshape(1, 2))
+    elif dataset is not None and hasattr(dataset, "__len__") and hasattr(dataset, "__getitem__"):
         for index in range(len(dataset)):
             sample = dataset[index]
             biome_parts.append(torch.as_tensor(sample["biome_label"], dtype=torch.long).reshape(1))
@@ -561,6 +635,7 @@ def _run_evaluation(
     best_eval_haversine_km: float | None,
     best_eval_macro_f1: float | None,
     output_dir: Path,
+    eval_max_steps: int | None = None,
 ) -> tuple[
     float,
     float | None,
@@ -578,7 +653,12 @@ def _run_evaluation(
     eval_steps = 0
 
     with torch.no_grad():
+        eval_batch_count = 0
         for eval_batch in eval_loader:
+            if eval_max_steps is not None and eval_batch_count >= eval_max_steps:
+                break
+            eval_batch_count += 1
+
             eval_batch = {
                 k: v.to(accelerator.device, non_blocking=True) for k, v in eval_batch.items()
             }
@@ -675,6 +755,7 @@ def _run_evaluation(
             # Save backbone in HF format
             hf_dir = tmp_best / "hf_model"
             unwrapped.backbone.save_pretrained(str(hf_dir), safe_serialization=True)
+            _copy_custom_code(unwrapped.backbone, hf_dir)
 
             # Save heads
             heads_path = tmp_best / "heads.pt"
@@ -742,6 +823,7 @@ def run_jaguar_mtl_training(config_path: str | Path) -> MTLTrainResult:
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
 
+    _ensure_custom_code(config.backbone_path)
     backbone = AutoModel.from_pretrained(
         str(config.backbone_path),
         trust_remote_code=True,
@@ -761,7 +843,13 @@ def run_jaguar_mtl_training(config_path: str | Path) -> MTLTrainResult:
 
     tokenizer = _load_tokenizer(config, backbone=backbone)
 
+    logger.info("Building fold dataloaders (fold %d/%d)...", config.fold_index, config.n_folds)
     train_loader, eval_loader, coord_stats = build_fold_dataloaders(config, tokenizer)
+    logger.info(
+        "Dataloaders ready (train=%d batches, eval=%d batches).",
+        len(train_loader) if hasattr(train_loader, "__len__") else -1,
+        len(eval_loader) if hasattr(eval_loader, "__len__") else -1,
+    )
 
     accelerator = Accelerator(
         mixed_precision="bf16",
@@ -777,11 +865,18 @@ def run_jaguar_mtl_training(config_path: str | Path) -> MTLTrainResult:
     )
 
     accelerator.init_trackers("jaguar_mtl_training")
+    logger.info("Computing baselines on eval split...")
     baseline_metrics = _compute_baselines(
         train_loader=train_loader,
         eval_loader=eval_loader,
         coord_stats=coord_stats,
         n_biomes=config.n_biomes,
+    )
+    logger.info(
+        "Baselines: macro_f1=%.4f, haversine_median=%.1f km, haversine_mean=%.1f km",
+        baseline_metrics["macro_f1"],
+        baseline_metrics["haversine_km_median"],
+        baseline_metrics["haversine_km_mean"],
     )
     accelerator.log(
         {
@@ -815,12 +910,15 @@ def run_jaguar_mtl_training(config_path: str | Path) -> MTLTrainResult:
         train_loader,
         eval_loader,
     )
+    logger.info("Accelerator ready (device=%s). Starting Phase 1 training.", accelerator.device)
 
     global_step = 0
     phase1_steps_completed = 0
     phase2_steps_completed = 0
     best_eval_haversine_km: float | None = None
     best_eval_macro_f1: float | None = None
+    patience_counter = 0
+    early_stopped = False
 
     nan_steps = 0
     skipped_steps = 0
@@ -832,9 +930,9 @@ def run_jaguar_mtl_training(config_path: str | Path) -> MTLTrainResult:
 
     model.train()
 
-    while phase1_steps_completed < config.phase1_steps:
+    while phase1_steps_completed < config.phase1_steps and not early_stopped:
         for batch in train_loader:
-            if phase1_steps_completed >= config.phase1_steps:
+            if phase1_steps_completed >= config.phase1_steps or early_stopped:
                 break
 
             batch = {k: v.to(accelerator.device, non_blocking=True) for k, v in batch.items()}
@@ -923,6 +1021,7 @@ def run_jaguar_mtl_training(config_path: str | Path) -> MTLTrainResult:
                             skipped_steps = 0
 
                         if eval_loader is not None and global_step % config.eval_every == 0:
+                            prev_best_hav = best_eval_haversine_km
                             (
                                 mean_eval_loss,
                                 best_eval_haversine_km,
@@ -941,11 +1040,17 @@ def run_jaguar_mtl_training(config_path: str | Path) -> MTLTrainResult:
                                 best_eval_haversine_km=best_eval_haversine_km,
                                 best_eval_macro_f1=best_eval_macro_f1,
                                 output_dir=output_dir,
+                                eval_max_steps=config.eval_max_steps,
                             )
+                            improved = best_eval_haversine_km != prev_best_hav
+                            if eval_metrics and improved:
+                                patience_counter = 0
+                            elif eval_metrics:
+                                patience_counter += 1
                             if accelerator.is_main_process:
                                 logger.info(
                                     "[Phase 1 | Eval @ step %d] loss=%.4f hav_median=%.1fkm"
-                                    " f1=%.4f best_hav=%.1fkm",
+                                    " f1=%.4f best_hav=%.1fkm patience=%d/%s",
                                     global_step,
                                     mean_eval_loss,
                                     eval_metrics.get("haversine_km_median", float("nan")),
@@ -953,7 +1058,19 @@ def run_jaguar_mtl_training(config_path: str | Path) -> MTLTrainResult:
                                     best_eval_haversine_km
                                     if best_eval_haversine_km is not None
                                     else float("nan"),
+                                    patience_counter,
+                                    config.patience if config.patience is not None else "inf",
                                 )
+                            if config.patience is not None and patience_counter >= config.patience:
+                                if accelerator.is_main_process:
+                                    logger.info(
+                                        "Early stopping Phase 1 at step %d after %d eval "
+                                        "cycles without improvement.",
+                                        global_step,
+                                        patience_counter,
+                                    )
+                                early_stopped = True
+                                break
 
                         if global_step % config.save_every == 0 and accelerator.is_main_process:
                             _save_json_atomically(
@@ -967,8 +1084,13 @@ def run_jaguar_mtl_training(config_path: str | Path) -> MTLTrainResult:
                             )
 
                     phase1_optimizer.zero_grad()
+            if early_stopped:
+                break
 
-    # Phase 2
+    # Phase 2 — always reset patience and early_stopped; Phase 2 runs
+    # unconditionally regardless of how Phase 1 ended.
+    patience_counter = 0
+    early_stopped = False
     inner_model = accelerator.unwrap_model(model)
     before_trainable = sum(1 for p in inner_model.parameters() if p.requires_grad)
     _unfreeze_last_n_layers(inner_model, config.unfreeze_layers)
@@ -988,6 +1110,12 @@ def run_jaguar_mtl_training(config_path: str | Path) -> MTLTrainResult:
     # SAFE PROTOCOL: model is already wrapped; only the new optimizer and
     # scheduler go through ``accelerator.prepare``.
     phase2_optimizer, phase2_scheduler = accelerator.prepare(phase2_optimizer, phase2_scheduler)
+    logger.info(
+        "Starting Phase 2: unfroze %d layers (%d -> %d trainable params).",
+        config.unfreeze_layers,
+        before_trainable,
+        after_trainable,
+    )
 
     model.train()
     train_loss_sum = train_cls_loss_sum = train_reg_loss_sum = 0.0
@@ -995,9 +1123,9 @@ def run_jaguar_mtl_training(config_path: str | Path) -> MTLTrainResult:
     nan_steps = 0
     skipped_steps = 0
 
-    while phase2_steps_completed < config.phase2_steps:
+    while phase2_steps_completed < config.phase2_steps and not early_stopped:
         for batch in train_loader:
-            if phase2_steps_completed >= config.phase2_steps:
+            if phase2_steps_completed >= config.phase2_steps or early_stopped:
                 break
 
             batch = {k: v.to(accelerator.device, non_blocking=True) for k, v in batch.items()}
@@ -1088,6 +1216,7 @@ def run_jaguar_mtl_training(config_path: str | Path) -> MTLTrainResult:
                             skipped_steps = 0
 
                         if eval_loader is not None and global_step % config.eval_every == 0:
+                            prev_best_hav = best_eval_haversine_km
                             (
                                 mean_eval_loss,
                                 best_eval_haversine_km,
@@ -1106,11 +1235,17 @@ def run_jaguar_mtl_training(config_path: str | Path) -> MTLTrainResult:
                                 best_eval_haversine_km=best_eval_haversine_km,
                                 best_eval_macro_f1=best_eval_macro_f1,
                                 output_dir=output_dir,
+                                eval_max_steps=config.eval_max_steps,
                             )
+                            improved = best_eval_haversine_km != prev_best_hav
+                            if eval_metrics and improved:
+                                patience_counter = 0
+                            elif eval_metrics:
+                                patience_counter += 1
                             if accelerator.is_main_process:
                                 logger.info(
                                     "[Phase 2 | Eval @ step %d] loss=%.4f hav_median=%.1fkm"
-                                    " f1=%.4f best_hav=%.1fkm",
+                                    " f1=%.4f best_hav=%.1fkm patience=%d/%s",
                                     global_step,
                                     mean_eval_loss,
                                     eval_metrics.get("haversine_km_median", float("nan")),
@@ -1118,7 +1253,19 @@ def run_jaguar_mtl_training(config_path: str | Path) -> MTLTrainResult:
                                     best_eval_haversine_km
                                     if best_eval_haversine_km is not None
                                     else float("nan"),
+                                    patience_counter,
+                                    config.patience if config.patience is not None else "inf",
                                 )
+                            if config.patience is not None and patience_counter >= config.patience:
+                                if accelerator.is_main_process:
+                                    logger.info(
+                                        "Early stopping Phase 2 at step %d after %d eval "
+                                        "cycles without improvement.",
+                                        global_step,
+                                        patience_counter,
+                                    )
+                                early_stopped = True
+                                break
 
                         if global_step % config.save_every == 0 and accelerator.is_main_process:
                             _save_json_atomically(
@@ -1132,6 +1279,8 @@ def run_jaguar_mtl_training(config_path: str | Path) -> MTLTrainResult:
                             )
 
                     phase2_optimizer.zero_grad()
+            if early_stopped:
+                break
 
     accelerator.end_training()
 

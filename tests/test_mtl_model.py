@@ -95,24 +95,24 @@ def test_rejects_invalid_pooling_strategy() -> None:
         JaguarMTLModel(backbone, pooling_strategy="invalid")
 
 
-def test_cls_pooling_prefers_pooler_output_when_available() -> None:
-    """``pooling_strategy="cls"`` returns the backbone ``pooler_output``.
+def test_cls_pooling_uses_first_token_hidden_state() -> None:
+    """``pooling_strategy="cls"`` returns ``last_hidden_state[:, 0]``.
 
-    When a pooled representation is available from the backbone, the model
-    should use it directly instead of re-deriving a CLS token embedding from
-    ``last_hidden_state``.
+    The pooler_output is intentionally ignored because foundation MLM
+    pre-training does not train the pooler weights, so using them would
+    feed randomly-initialized features to the task heads.
     """
 
     backbone = _make_tiny_bert(hidden_size=4)
     model = JaguarMTLModel(backbone, pooling_strategy="cls")
 
     batch_size, seq_len, hidden = 2, 3, 4
-    last_hidden_state = torch.zeros(batch_size, seq_len, hidden, dtype=torch.float32)
+    last_hidden_state = torch.randn(batch_size, seq_len, hidden, dtype=torch.float32)
     pooler_output = torch.randn(batch_size, hidden, dtype=torch.float32)
     attention_mask = torch.ones(batch_size, seq_len, dtype=torch.long)
 
     pooled = model._pool(last_hidden_state, pooler_output, attention_mask)
-    assert torch.allclose(pooled, pooler_output)
+    assert torch.allclose(pooled, last_hidden_state[:, 0])
 
 
 def test_mean_pooling_respects_attention_mask() -> None:

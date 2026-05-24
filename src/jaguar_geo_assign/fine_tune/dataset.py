@@ -21,7 +21,7 @@ import csv
 import json
 import logging
 import math
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Iterator, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -173,6 +173,24 @@ class JaguarMTLDataset(Dataset):
                 raise ValueError(
                     f"Unknown biome_population_label {label!r}; expected one of {BIOME_CLASSES}"
                 )
+
+    def iter_raw_targets(self) -> Iterator[tuple[int, float, float]]:
+        """Yield ``(biome_idx, lat_z, lon_z)`` for every record without tokenisation.
+
+        This is the preferred alternative to reading private attributes directly;
+        it lets callers collect label and coordinate targets cheaply while keeping
+        ``_records``, ``_biome_to_idx``, and ``_coord_stats`` encapsulated.
+        """
+
+        for record in self._records:
+            biome_idx = self._biome_to_idx[record["biome_population_label"]]
+            lat_z = (
+                float(record["latitude"]) - self._coord_stats.lat_mean
+            ) / self._coord_stats.lat_std
+            lon_z = (
+                float(record["longitude"]) - self._coord_stats.lon_mean
+            ) / self._coord_stats.lon_std
+            yield biome_idx, lat_z, lon_z
 
     def __len__(self) -> int:  # noqa: D401
         """Return the number of joined window records."""

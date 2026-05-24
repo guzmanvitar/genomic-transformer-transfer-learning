@@ -19,6 +19,7 @@ CLI (--integration-test flag) and pytest, with configurable model source
 from __future__ import annotations
 
 import contextlib
+import inspect
 import json
 import logging
 import math
@@ -106,6 +107,32 @@ class TrainingRunResult:
     trainable_param_count: int = 0
     total_param_count: int = 0
     resolved_versions: dict[str, str] = field(default_factory=dict)
+
+
+def _copy_custom_code(model: Any, save_dir: str | Path) -> None:
+    """Copy custom Python modules from HF cache into a saved model directory.
+
+    ``save_pretrained`` only copies custom code when ``_auto_class`` is set on
+    the model, which is not the case for models loaded via
+    ``AutoModel.from_pretrained``.  Without the custom ``.py`` files the saved
+    directory cannot be reloaded with ``trust_remote_code=True``.
+    """
+    try:
+        src_file = inspect.getfile(model.__class__)
+    except (TypeError, OSError):
+        return
+    src_dir = Path(src_file).parent
+    dest = Path(save_dir)
+    copied = []
+    for py_file in src_dir.glob("*.py"):
+        if py_file.name == "__init__.py":
+            continue
+        target = dest / py_file.name
+        if not target.exists():
+            shutil.copy2(py_file, target)
+            copied.append(py_file.name)
+    if copied:
+        logger.info("Copied custom code files to checkpoint: %s", copied)
 
 
 def _get_resolved_versions() -> dict[str, str]:
@@ -1036,6 +1063,7 @@ def run_felid_foundation_training(
                                             str(tmp_model_dir),
                                             safe_serialization=False,
                                         )
+                                        _copy_custom_code(unwrapped_model, tmp_model_dir)
                                     with atomic_dir_replace(best_dir / "tokenizer") as tmp_tok_dir:
                                         tokenizer.save_pretrained(str(tmp_tok_dir))
                                 except Exception as e:

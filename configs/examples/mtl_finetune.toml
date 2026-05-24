@@ -39,11 +39,11 @@ pooling_strategy = "cls"
 # Number of biome classes (fixed by the jaguar dataset).
 n_biomes = 5
 
-# Phase 1: heads-only warm-up steps.
-phase1_steps = 1000
+# Phase 1: heads-only warm-up (cosine schedule spans this many steps).
+phase1_steps = 5000
 
-# Phase 2: joint training steps (backbone + heads).
-phase2_steps = 3000
+# Phase 2: joint training (cosine schedule spans this many steps).
+phase2_steps = 10000
 
 # Number of transformer blocks to unfreeze in Phase 2 (2 or 3).
 unfreeze_layers = 2
@@ -83,7 +83,11 @@ weight_decay = 0.01
 # Logging, eval, and checkpoint frequency (in steps).
 log_every = 10
 eval_every = 100
+eval_max_steps = 1000
 save_every = 500
+
+# Early stopping patience (eval cycles without improvement).
+patience = 10
 
 # TensorBoard subdirectory under output_dir.
 tensorboard_subdir = "tensorboard"
