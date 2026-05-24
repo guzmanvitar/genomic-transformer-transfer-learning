@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import os
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
@@ -125,6 +126,34 @@ class MILBagDataset(Dataset):
         """Return the number of jaguar bags in this split."""
 
         return len(self._individual_ids)
+
+    def iter_raw_targets(self) -> Iterator[tuple[int, float, float]]:
+        """Yield normalized targets from manifest metadata without loading shards.
+
+        Baseline computation only needs the per-individual biome label and
+        normalized coordinates, so this iterator stays on the manifest-backed
+        record cache instead of touching ``__getitem__`` and incurring full shard
+        reads for every evaluation individual.
+        """
+
+        for individual_id in self._individual_ids:
+            record = self._records_by_individual[individual_id]
+            biome_idx = -1
+            if self._biome_to_idx is not None:
+                biome_label = str(record["biome_population_label"])
+                if biome_label not in self._biome_to_idx:
+                    raise ValueError(
+                        f"Unknown biome_population_label {biome_label!r}; expected one of "
+                        f"{sorted(self._biome_to_idx)}"
+                    )
+                biome_idx = self._biome_to_idx[biome_label]
+            lat_z = (
+                float(record["latitude"]) - self._coord_stats.lat_mean
+            ) / self._coord_stats.lat_std
+            lon_z = (
+                float(record["longitude"]) - self._coord_stats.lon_mean
+            ) / self._coord_stats.lon_std
+            yield biome_idx, lat_z, lon_z
 
     @jaxtyped(typechecker=beartype)
     def __getitem__(self, idx: int) -> dict[str, Tensor]:
@@ -278,6 +307,7 @@ def build_mil_fold_dataloaders(
         batch_size=1,
         shuffle=True,
         num_workers=config.num_workers,
+        persistent_workers=config.num_workers > 0,
         collate_fn=mil_collate_fn,
         generator=generator,
     )
@@ -286,6 +316,7 @@ def build_mil_fold_dataloaders(
         batch_size=1,
         shuffle=False,
         num_workers=config.num_workers,
+        persistent_workers=config.num_workers > 0,
         collate_fn=mil_collate_fn,
     )
     return train_loader, eval_loader, coord_stats
