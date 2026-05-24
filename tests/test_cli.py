@@ -294,8 +294,49 @@ def test_fine_tune_integration_test_without_config_succeeds() -> None:
     mock_integration.assert_called_once_with(use_real_model=False)
 
 
+def test_mil_finetune_dispatches_to_runner(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """``mil-finetune`` should validate config, run MIL training, and print a summary."""
+
+    validated_paths: list[Path] = []
+    calls: list[Path] = []
+    fake_result = SimpleNamespace(
+        fold_index=1,
+        steps_completed=25,
+        best_eval_haversine_km=123.4,
+        best_eval_macro_f1=0.56,
+        output_dir="/tmp/mil_output",
+    )
+
+    def fake_validate(config_path: Path) -> object:
+        validated_paths.append(config_path)
+        return object()
+
+    def fake_runner(config_path: Path) -> object:
+        calls.append(config_path)
+        return fake_result
+
+    monkeypatch.setattr("jaguar_geo_assign.cli.load_mil_finetune_config", fake_validate)
+    monkeypatch.setattr(
+        "jaguar_geo_assign.fine_tune.mil_trainer.run_jaguar_mil_training",
+        fake_runner,
+    )
+
+    exit_code = main(["mil-finetune", "--config", "configs/examples/mil_finetune.toml"])
+
+    captured = capsys.readouterr()
+    assert exit_code == 0
+    assert validated_paths == [Path("configs/examples/mil_finetune.toml")]
+    assert calls == [Path("configs/examples/mil_finetune.toml")]
+    assert "Jaguar MIL fine-tuning completed." in captured.out
+    assert "Steps completed: 25" in captured.out
+    assert "Best eval haversine (km): 123.4" in captured.out
+
+
 def test_extract_embeddings_dispatches(monkeypatch: pytest.MonkeyPatch, capsys) -> None:
-    """``extract-embeddings`` should call the offline extraction entry point with the config."""
+    """``extract-embeddings`` should reuse the extraction module formatter output."""
 
     calls: list[Path] = []
     fake_result = SimpleNamespace(
@@ -313,6 +354,14 @@ def test_extract_embeddings_dispatches(monkeypatch: pytest.MonkeyPatch, capsys) 
         "jaguar_geo_assign.fine_tune.extract_embeddings.run_embedding_extraction",
         fake_runner,
     )
+    monkeypatch.setattr(
+        "jaguar_geo_assign.fine_tune.extract_embeddings.format_extraction_result",
+        lambda result: (
+            "shared extraction formatter"
+            if result is fake_result
+            else "unexpected extraction formatter input"
+        ),
+    )
 
     exit_code = main(
         ["extract-embeddings", "--config", "configs/examples/embedding_extraction.toml"]
@@ -321,8 +370,7 @@ def test_extract_embeddings_dispatches(monkeypatch: pytest.MonkeyPatch, capsys) 
     captured = capsys.readouterr()
     assert exit_code == 0
     assert calls == [Path("configs/examples/embedding_extraction.toml")]
-    assert "Embedding extraction complete." in captured.out
-    assert "Individuals processed: 2" in captured.out
+    assert captured.out.strip() == "shared extraction formatter"
 
 
 def test_extract_finetune_windows_dispatches(

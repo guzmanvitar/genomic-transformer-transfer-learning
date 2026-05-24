@@ -231,8 +231,9 @@ def test_run_embedding_extraction_writes_shards_manifest_and_contig_rank(
     assert not any(parameter.requires_grad for parameter in backbone.parameters())
 
     contig_rank = json.loads((output_dir / "contig_rank.json").read_text(encoding="utf-8"))
-    assert list(contig_rank) == ["chr1", "chr10", "chr2", "chrX"]
+    assert list(contig_rank) == ["chr1", "chr10", "chr2"]
     assert contig_rank["chr10"] > contig_rank["chr1"]
+    assert "chrX" not in contig_rank
 
     manifest_lines = (output_dir / "manifest.jsonl").read_text(encoding="utf-8").splitlines()
     manifest_records = [json.loads(line) for line in manifest_lines]
