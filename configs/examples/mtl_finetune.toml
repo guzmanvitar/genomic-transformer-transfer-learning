@@ -64,6 +64,7 @@ huber_delta = 1.0
 per_device_train_batch_size = 16
 per_device_eval_batch_size = 32
 gradient_accumulation_steps = 4
+mixed_precision = "bf16"
 
 # Warmup fraction of total steps for LR schedule.
 warmup_fraction = 0.1

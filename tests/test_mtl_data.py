@@ -1,8 +1,8 @@
-"""Tests for MtlFinetuneConfig and jaguar multi-task fine-tuning data path.
+"""Tests for fine-tune config loaders and jaguar multi-task data helpers.
 
-Covers config loading contracts, CoordStats JSON round-trip, dataset tensor
-contracts, and basic behaviour of build_fold_dataloaders (join, weighting,
-logging of dropped windows).
+Covers MTL/MIL config loading contracts, CoordStats JSON round-trip, dataset
+tensor contracts, and basic behaviour of build_fold_dataloaders (join,
+weighting, logging of dropped windows).
 """
 
 from __future__ import annotations
@@ -15,7 +15,12 @@ import pytest
 import torch
 
 import jaguar_geo_assign.fine_tune.dataset as mtl_dataset
-from jaguar_geo_assign.config import MtlFinetuneConfig, load_mtl_finetune_config
+from jaguar_geo_assign.config import (
+    MILFinetuneConfig,
+    MtlFinetuneConfig,
+    load_mil_finetune_config,
+    load_mtl_finetune_config,
+)
 from jaguar_geo_assign.fine_tune.dataset import CoordStats, JaguarMTLDataset, build_fold_dataloaders
 
 
@@ -64,8 +69,49 @@ output_dir = "artifacts/mtl"
     assert isinstance(config, MtlFinetuneConfig)
     assert config.pooling_strategy in {"cls", "mean"}
     assert config.n_biomes == 5
+    assert config.mixed_precision == "bf16"
     assert 0 <= config.fold_index < config.n_folds
     assert config.phase1_steps > 0 and config.phase2_steps > 0
+
+
+def test_load_mil_finetune_config_happy_path(tmp_path: Path) -> None:
+    """MIL loader must preserve the default mixed-precision contract on happy path."""
+
+    config_file = tmp_path / "mil.toml"
+    config_file.write_text(
+        """
+[training]
+embeddings_dir = "artifacts/embeddings"
+metadata_csv = "metadata.csv"
+output_dir = "artifacts/mil"
+""",
+        encoding="utf-8",
+    )
+
+    config = load_mil_finetune_config(config_file)
+
+    assert isinstance(config, MILFinetuneConfig)
+    assert config.mixed_precision == "bf16"
+    assert config.mil_steps > 0
+
+
+def test_load_mil_finetune_config_rejects_invalid_mixed_precision(tmp_path: Path) -> None:
+    """MIL loader must fail loudly on mixed-precision aliases unsupported by Accelerate."""
+
+    config_file = tmp_path / "mil_bad_precision.toml"
+    config_file.write_text(
+        """
+[training]
+embeddings_dir = "artifacts/embeddings"
+metadata_csv = "metadata.csv"
+output_dir = "artifacts/mil"
+mixed_precision = "float16"
+""",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match=r"training\.mixed_precision"):
+        load_mil_finetune_config(config_file)
 
 
 def test_load_mtl_finetune_config_rejects_bad_pooling(tmp_path: Path) -> None:
