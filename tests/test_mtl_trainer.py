@@ -191,6 +191,7 @@ def test_run_jaguar_mtl_training_skips_backward_on_non_finite_loss(tmp_path: Pat
         backbone_path=tmp_path / "backbone",
         gradient_accumulation_steps=1,
         tensorboard_subdir="tb",
+        n_folds=2,
         n_biomes=2,
         dropout=0.1,
         lr_heads_phase1=1e-3,

@@ -294,6 +294,37 @@ def test_fine_tune_integration_test_without_config_succeeds() -> None:
     mock_integration.assert_called_once_with(use_real_model=False)
 
 
+def test_extract_embeddings_dispatches(monkeypatch: pytest.MonkeyPatch, capsys) -> None:
+    """``extract-embeddings`` should call the offline extraction entry point with the config."""
+
+    calls: list[Path] = []
+    fake_result = SimpleNamespace(
+        n_individuals=2,
+        n_windows_extracted=3,
+        n_windows_dropped=1,
+        manifest_path=Path("/tmp/manifest.jsonl"),
+    )
+
+    def fake_runner(config_path: Path) -> object:
+        calls.append(config_path)
+        return fake_result
+
+    monkeypatch.setattr(
+        "jaguar_geo_assign.fine_tune.extract_embeddings.run_embedding_extraction",
+        fake_runner,
+    )
+
+    exit_code = main(
+        ["extract-embeddings", "--config", "configs/examples/embedding_extraction.toml"]
+    )
+
+    captured = capsys.readouterr()
+    assert exit_code == 0
+    assert calls == [Path("configs/examples/embedding_extraction.toml")]
+    assert "Embedding extraction complete." in captured.out
+    assert "Individuals processed: 2" in captured.out
+
+
 def test_extract_finetune_windows_dispatches(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],

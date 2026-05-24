@@ -53,12 +53,30 @@ def format_mtl_train_result(result: object) -> str:
     return "\n".join(lines)
 
 
+def format_embedding_extraction_result(result: object) -> str:
+    """Format an ExtractionResult for human-readable CLI output.
+
+    Uses duck-typed attribute access to avoid importing torch-heavy modules at
+    CLI import time.
+    """
+
+    lines = [
+        "Embedding extraction complete.",
+        f"  Individuals processed: {result.n_individuals}",
+        f"  Windows extracted: {result.n_windows_extracted}",
+        f"  Windows dropped: {result.n_windows_dropped}",
+        f"  Manifest: {result.manifest_path}",
+    ]
+    return "\n".join(lines)
+
+
 def build_parser() -> argparse.ArgumentParser:
     """Construct the top-level argument parser with all sub-commands.
 
     The parser exposes the following sub-commands:
 
     * ``fine-tune`` – run DNABERT-2 jaguar multi-task fine-tuning.
+    * ``extract-embeddings`` – materialize frozen DNABERT-2 window embeddings.
     * ``extract-finetune-windows`` – extract 512 bp locus-centered windows from jaguar VCFs.
     * ``evaluate``, ``baseline-evaluate``, ``report`` –
       scaffold placeholders for later pipeline stages.
@@ -98,6 +116,17 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         default=False,
         help="Run integration test mode (synthetic data, no real backbone needed).",
+    )
+
+    extract_embeddings = subparsers.add_parser(
+        "extract-embeddings",
+        help="Materialize frozen DNABERT-2 embeddings for jaguar fine-tune windows.",
+    )
+    extract_embeddings.add_argument(
+        "--config",
+        type=Path,
+        required=True,
+        help="Path to the embedding-extraction TOML config.",
     )
 
     validate = subparsers.add_parser("validate-config", help="Validate a bootstrap TOML config.")
@@ -320,6 +349,17 @@ def main(argv: Sequence[str] | None = None) -> int:
             else:
                 result = run_jaguar_mtl_training(args.config)
                 print(format_mtl_train_result(result))
+        except (RuntimeError, ValueError) as error:
+            print(str(error))
+            return 1
+        return 0
+
+    if args.command == "extract-embeddings":
+        from .fine_tune.extract_embeddings import run_embedding_extraction
+
+        try:
+            result = run_embedding_extraction(args.config)
+            print(format_embedding_extraction_result(result))
         except (RuntimeError, ValueError) as error:
             print(str(error))
             return 1

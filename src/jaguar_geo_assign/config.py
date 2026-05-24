@@ -1276,3 +1276,88 @@ def load_mtl_finetune_config(path: str | Path) -> MtlFinetuneConfig:
         dropout=dropout,
         patience=patience,
     )
+
+
+@dataclass(frozen=True)
+class EmbeddingExtractionConfig:
+    """Immutable configuration for offline DNABERT-2 embedding materialization.
+
+    Attributes:
+        backbone_path: Local path to a pretrained DNABERT-2 checkpoint.
+        windows_jsonl: JSONL of
+            :class:`~jaguar_geo_assign.data.finetune_windows.FinetuneWindow`
+            records produced by the window-extraction stage.
+        metadata_csv: CSV containing jaguar-level metadata keyed by
+            ``sample_id``.
+        output_dir: Directory where per-individual embedding shards and
+            metadata artefacts are written.
+        pooling_strategy: Sequence pooling strategy (``"cls"`` or ``"mean"``).
+        extraction_batch_size: Number of windows encoded per frozen backbone
+            forward pass.
+        device: Execution device request (``"auto"``, ``"cpu"``, or
+            ``"cuda"``).
+        dtype_str: On-disk embedding dtype. The current contract stores
+            embeddings as ``float32`` only so downstream MIL training never
+            inherits silent precision loss from mixed-precision extraction.
+    """
+
+    backbone_path: Path
+    windows_jsonl: Path
+    metadata_csv: Path
+    output_dir: Path
+    pooling_strategy: str = "cls"
+    extraction_batch_size: int = 128
+    device: str = "auto"
+    dtype_str: str = "float32"
+
+
+def load_embedding_extraction_config(path: str | Path) -> EmbeddingExtractionConfig:
+    """Load and validate an offline embedding-extraction TOML config.
+
+    The extraction stage uses a dedicated ``[extraction]`` section so its
+    runtime contract is decoupled from both foundation pretraining and MTL
+    fine-tuning configs.
+
+    Raises:
+        ValueError: If any contract check fails or a required field is missing.
+    """
+
+    raw = tomllib.loads(Path(path).read_text(encoding="utf-8"))
+    try:
+        extraction = raw["extraction"]
+
+        backbone_path = Path(extraction["backbone_path"])
+        windows_jsonl = Path(extraction["windows_jsonl"])
+        metadata_csv = Path(extraction["metadata_csv"])
+        output_dir = Path(extraction["output_dir"])
+
+        pooling_strategy = str(extraction.get("pooling_strategy", "cls"))
+        extraction_batch_size = int(extraction.get("extraction_batch_size", 128))
+        device = str(extraction.get("device", "auto"))
+        dtype_str = str(extraction.get("dtype_str", "float32"))
+
+        if pooling_strategy not in {"cls", "mean"}:
+            raise ValueError("extraction.pooling_strategy must be 'cls' or 'mean'")
+        if extraction_batch_size <= 0:
+            raise ValueError("extraction.extraction_batch_size must be positive")
+        if device not in {"auto", "cpu", "cuda"}:
+            raise ValueError("extraction.device must be 'auto', 'cpu', or 'cuda'")
+        if dtype_str != "float32":
+            raise ValueError(
+                "extraction.dtype_str must be 'float32'; other output dtypes are not supported"
+            )
+
+    except KeyError as exc:
+        msg = f"Embedding extraction config is missing required field: {exc.args[0]}"
+        raise ValueError(msg) from exc
+
+    return EmbeddingExtractionConfig(
+        backbone_path=backbone_path,
+        windows_jsonl=windows_jsonl,
+        metadata_csv=metadata_csv,
+        output_dir=output_dir,
+        pooling_strategy=pooling_strategy,
+        extraction_batch_size=extraction_batch_size,
+        device=device,
+        dtype_str=dtype_str,
+    )
