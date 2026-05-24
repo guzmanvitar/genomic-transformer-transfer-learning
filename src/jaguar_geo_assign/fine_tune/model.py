@@ -106,6 +106,11 @@ class JaguarMTLOutput:
 class JaguarMTLModel(nn.Module):
     """DNABERT-2-based multi-task model for jaguar downstream tasks.
 
+    This class belongs to the original per-window fine-tuning design and is
+    retained only as reference code. That design is flawed for geographic
+    assignment because it predicts from isolated windows instead of aggregating
+    multi-locus evidence across the full individual.
+
     The model wraps a transformer backbone (e.g. DNABERT-2) and attaches two
     small heads:
 
