@@ -536,3 +536,93 @@ def test_run_mil_evaluation_handles_coordinate_only_batches(tmp_path: Path) -> N
     assert math.isnan(metrics["accuracy"])
     assert math.isnan(metrics["macro_f1"])
     assert math.isfinite(metrics["haversine_km_median"])
+
+
+def test_run_mil_evaluation_skips_non_finite_batches_in_metric_aggregation(tmp_path: Path) -> None:
+    """Non-finite eval batches must not contaminate concatenated metric tensors."""
+
+    eval_loader = [
+        {
+            "embeddings": torch.ones(3, 4, dtype=torch.float32),
+            "bp_positions": torch.tensor([1.0, 2.0, 3.0], dtype=torch.float32),
+            "coord_target": torch.tensor([0.1, 0.2], dtype=torch.float32),
+            "biome_label": torch.tensor(1, dtype=torch.long),
+        },
+        {
+            "embeddings": torch.full((3, 4), 2.0, dtype=torch.float32),
+            "bp_positions": torch.tensor([4.0, 5.0, 6.0], dtype=torch.float32),
+            "coord_target": torch.tensor([0.3, 0.4], dtype=torch.float32),
+            "biome_label": torch.tensor(0, dtype=torch.long),
+        },
+    ]
+    model = MagicMock()
+    model.side_effect = [
+        JaguarMTLOutput(
+            coordinate=torch.tensor([0.5, 0.6], dtype=torch.float32),
+            biome_logits=torch.tensor([0.1, 0.9], dtype=torch.float32),
+        ),
+        JaguarMTLOutput(
+            coordinate=torch.tensor([float("nan"), float("nan")], dtype=torch.float32),
+            biome_logits=torch.tensor([float("nan"), float("nan")], dtype=torch.float32),
+        ),
+    ]
+
+    def _assert_clean_metric_inputs(
+        cls_pred: torch.Tensor,
+        coord_pred: torch.Tensor,
+        biome_true: torch.Tensor,
+        coord_true: torch.Tensor,
+        _coord_stats: CoordStats,
+        *,
+        n_biomes: int,
+    ) -> dict[str, float]:
+        """Verify metric aggregation only sees the finite-loss batch."""
+
+        assert n_biomes == 2
+        assert coord_pred.shape == (1, 2)
+        assert coord_true.shape == (1, 2)
+        assert biome_true.shape == (1,)
+        assert cls_pred.shape == (1, 2)
+        assert torch.isfinite(coord_pred).all()
+        assert torch.isfinite(coord_true).all()
+        assert torch.isfinite(biome_true).all()
+        assert torch.isfinite(cls_pred).all()
+        return {
+            "accuracy": 1.0,
+            "macro_f1": 1.0,
+            "mae_lat_deg": 0.0,
+            "mae_lon_deg": 0.0,
+            "haversine_km_mean": 0.0,
+            "haversine_km_median": 0.0,
+        }
+
+    with (
+        patch(
+            "jaguar_geo_assign.fine_tune.mil_trainer._compute_mtl_loss",
+            side_effect=[
+                (torch.tensor(1.0), torch.tensor(0.4), torch.tensor(0.6)),
+                (torch.tensor(float("nan")), torch.tensor(0.0), torch.tensor(0.0)),
+            ],
+        ),
+        patch(
+            "jaguar_geo_assign.fine_tune.mil_trainer.compute_eval_metrics",
+            side_effect=_assert_clean_metric_inputs,
+        ),
+    ):
+        mean_eval_loss, _best_eval_hav, _best_eval_f1, metrics = _run_mil_evaluation(
+            model=model,
+            eval_loader=eval_loader,
+            accelerator=_FakeAccelerator(),
+            coord_stats=CoordStats(lat_mean=0.0, lat_std=1.0, lon_mean=0.0, lon_std=1.0),
+            config=SimpleNamespace(n_biomes=2, fold_index=0),
+            cls_loss_weight=1.0,
+            reg_loss_weight=1.0,
+            huber_delta=1.0,
+            global_step=1,
+            best_eval_haversine_km=None,
+            best_eval_macro_f1=None,
+            output_dir=tmp_path / "out",
+        )
+
+    assert mean_eval_loss == 1.0
+    assert metrics["haversine_km_median"] == 0.0

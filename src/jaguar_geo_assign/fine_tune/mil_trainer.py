@@ -181,13 +181,12 @@ def _run_mil_evaluation(
             if torch.isfinite(eval_loss_detached).all():
                 eval_total_loss += float(eval_loss_detached.mean().item())
                 eval_steps += 1
-
-            coord_pred_list.append(outputs.coordinate.unsqueeze(0).detach().cpu())
-            coord_tgt_list.append(batch["coord_target"].unsqueeze(0).detach().cpu())
-            if "biome_label" in batch:
-                biome_list.append(batch["biome_label"].reshape(1).detach().cpu())
-            if outputs.biome_logits is not None:
-                cls_list.append(outputs.biome_logits.unsqueeze(0).detach().cpu())
+                coord_pred_list.append(outputs.coordinate.unsqueeze(0).detach().cpu())
+                coord_tgt_list.append(batch["coord_target"].unsqueeze(0).detach().cpu())
+                if "biome_label" in batch:
+                    biome_list.append(batch["biome_label"].reshape(1).detach().cpu())
+                if outputs.biome_logits is not None:
+                    cls_list.append(outputs.biome_logits.unsqueeze(0).detach().cpu())
 
     if not coord_pred_list or eval_steps == 0:
         mean_eval_loss = eval_total_loss / max(eval_steps, 1) if eval_steps > 0 else float("nan")
