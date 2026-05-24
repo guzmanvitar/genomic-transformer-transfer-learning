@@ -260,7 +260,7 @@ def run_embedding_extraction(config_path: str | Path) -> ExtractionResult:
     windows, joined_records, dropped_windows = _join_windows_with_metadata(
         Path(config.windows_jsonl), Path(config.metadata_csv)
     )
-    contig_to_rank = _build_contig_rank(windows)
+    contig_to_rank = _build_contig_rank(joined_records)
     contig_rank_path = output_dir / "contig_rank.json"
     contig_rank_path.write_text(
         json.dumps(contig_to_rank, indent=2, sort_keys=True),
