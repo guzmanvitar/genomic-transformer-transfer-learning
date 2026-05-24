@@ -1094,8 +1094,8 @@ def run_jaguar_mtl_training(config_path: str | Path) -> MTLTrainResult:
             if early_stopped:
                 break
 
-    # Phase 2 — reset patience; early_stopped carries across only if Phase 1
-    # exhausted patience, which means further training is unlikely to help.
+    # Phase 2 — always reset patience and early_stopped; Phase 2 runs
+    # unconditionally regardless of how Phase 1 ended.
     patience_counter = 0
     early_stopped = False
     inner_model = accelerator.unwrap_model(model)
