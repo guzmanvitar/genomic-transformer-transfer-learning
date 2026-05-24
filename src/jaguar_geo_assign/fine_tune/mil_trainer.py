@@ -239,32 +239,33 @@ def _run_mil_evaluation(
         ):
             is_better = True
 
-    if is_better and accelerator.is_main_process:
+    if is_better:
         best_eval_haversine_km = float(current_hav)
         best_eval_macro_f1 = float(current_f1)
-        best_dir = output_dir / "best"
-        unwrapped = accelerator.unwrap_model(model)
-        with atomic_dir_replace(best_dir) as tmp_best:
-            torch.save(unwrapped.state_dict(), tmp_best / "mil_model.pt")
-            _save_json_atomically(
-                tmp_best / "coord_norm.json",
-                {
-                    "lat_mean": float(coord_stats.lat_mean),
-                    "lat_std": float(coord_stats.lat_std),
-                    "lon_mean": float(coord_stats.lon_mean),
-                    "lon_std": float(coord_stats.lon_std),
-                },
-            )
-            _save_json_atomically(
-                tmp_best / "metrics.json",
-                {
-                    "haversine_km_median": current_hav,
-                    "macro_f1": current_f1,
-                    "fold_index": int(config.fold_index),
-                    "step": int(global_step),
-                },
-            )
-            _save_json_atomically(tmp_best / "config.json", _serialize_mil_config(config))
+        if accelerator.is_main_process:
+            best_dir = output_dir / "best"
+            unwrapped = accelerator.unwrap_model(model)
+            with atomic_dir_replace(best_dir) as tmp_best:
+                torch.save(unwrapped.state_dict(), tmp_best / "mil_model.pt")
+                _save_json_atomically(
+                    tmp_best / "coord_norm.json",
+                    {
+                        "lat_mean": float(coord_stats.lat_mean),
+                        "lat_std": float(coord_stats.lat_std),
+                        "lon_mean": float(coord_stats.lon_mean),
+                        "lon_std": float(coord_stats.lon_std),
+                    },
+                )
+                _save_json_atomically(
+                    tmp_best / "metrics.json",
+                    {
+                        "haversine_km_median": current_hav,
+                        "macro_f1": current_f1,
+                        "fold_index": int(config.fold_index),
+                        "step": int(global_step),
+                    },
+                )
+                _save_json_atomically(tmp_best / "config.json", _serialize_mil_config(config))
 
     model.train()
     return mean_eval_loss, best_eval_haversine_km, best_eval_macro_f1, metrics

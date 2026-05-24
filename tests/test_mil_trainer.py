@@ -531,8 +531,10 @@ def test_run_mil_evaluation_handles_coordinate_only_batches(tmp_path: Path) -> N
     )
 
     assert math.isfinite(mean_eval_loss)
-    assert best_eval_haversine_km is None
-    assert best_eval_macro_f1 is None
+    assert best_eval_haversine_km is not None
+    assert math.isfinite(best_eval_haversine_km)
+    assert best_eval_macro_f1 is not None
+    assert math.isnan(best_eval_macro_f1)
     assert math.isnan(metrics["accuracy"])
     assert math.isnan(metrics["macro_f1"])
     assert math.isfinite(metrics["haversine_km_median"])
@@ -626,3 +628,61 @@ def test_run_mil_evaluation_skips_non_finite_batches_in_metric_aggregation(tmp_p
 
     assert mean_eval_loss == 1.0
     assert metrics["haversine_km_median"] == 0.0
+
+
+def test_run_mil_evaluation_updates_best_metrics_on_non_main_process(tmp_path: Path) -> None:
+    """Non-main ranks must update local best metrics even when they do not write files."""
+
+    eval_loader = [
+        {
+            "embeddings": torch.ones(3, 4, dtype=torch.float32),
+            "bp_positions": torch.tensor([1.0, 2.0, 3.0], dtype=torch.float32),
+            "coord_target": torch.tensor([0.1, 0.2], dtype=torch.float32),
+            "biome_label": torch.tensor(1, dtype=torch.long),
+        }
+    ]
+    accelerator = _FakeAccelerator()
+    model = _FakeMILModel()
+
+    with (
+        patch(
+            "jaguar_geo_assign.fine_tune.mil_trainer._compute_mtl_loss",
+            return_value=(torch.tensor(1.0), torch.tensor(0.4), torch.tensor(0.6)),
+        ),
+        patch(
+            "jaguar_geo_assign.fine_tune.mil_trainer.compute_eval_metrics",
+            return_value={
+                "accuracy": 1.0,
+                "macro_f1": 0.7,
+                "mae_lat_deg": 0.0,
+                "mae_lon_deg": 0.0,
+                "haversine_km_mean": 12.0,
+                "haversine_km_median": 10.0,
+            },
+        ),
+        patch("jaguar_geo_assign.fine_tune.mil_trainer.torch.save") as save_mock,
+        patch("jaguar_geo_assign.fine_tune.mil_trainer._save_json_atomically") as save_json_mock,
+        patch("jaguar_geo_assign.fine_tune.mil_trainer.atomic_dir_replace") as atomic_replace_mock,
+    ):
+        mean_eval_loss, best_eval_haversine_km, best_eval_macro_f1, metrics = _run_mil_evaluation(
+            model=model,
+            eval_loader=eval_loader,
+            accelerator=accelerator,
+            coord_stats=CoordStats(lat_mean=0.0, lat_std=1.0, lon_mean=0.0, lon_std=1.0),
+            config=SimpleNamespace(n_biomes=2, fold_index=0),
+            cls_loss_weight=1.0,
+            reg_loss_weight=1.0,
+            huber_delta=1.0,
+            global_step=1,
+            best_eval_haversine_km=None,
+            best_eval_macro_f1=None,
+            output_dir=tmp_path / "out",
+        )
+
+    assert mean_eval_loss == 1.0
+    assert best_eval_haversine_km == 10.0
+    assert best_eval_macro_f1 == 0.7
+    assert metrics["haversine_km_median"] == 10.0
+    save_mock.assert_not_called()
+    save_json_mock.assert_not_called()
+    atomic_replace_mock.assert_not_called()
