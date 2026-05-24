@@ -36,24 +36,6 @@ from .pretrain import (
 )
 
 
-def format_mtl_train_result(result: object) -> str:
-    """Format an MTLTrainResult for human-readable CLI output.
-
-    Uses duck-typed attribute access to avoid importing torch at module
-    level.
-    """
-    lines = [
-        "Jaguar MTL fine-tuning completed.",
-        f"  Fold index: {result.fold_index}",
-        f"  Phase 1 steps: {result.phase1_steps_completed}",
-        f"  Phase 2 steps: {result.phase2_steps_completed}",
-        f"  Best eval haversine (km): {result.best_eval_haversine_km}",
-        f"  Best eval macro F1: {result.best_eval_macro_f1}",
-        f"  Output directory: {result.output_dir}",
-    ]
-    return "\n".join(lines)
-
-
 def format_mil_train_result(result: object) -> str:
     """Format an MILTrainResult for human-readable CLI output.
 
@@ -77,7 +59,6 @@ def build_parser() -> argparse.ArgumentParser:
 
     The parser exposes the following sub-commands:
 
-    * ``fine-tune`` – run DNABERT-2 jaguar multi-task fine-tuning.
     * ``mil-finetune`` – run positional MIL fine-tuning over offline embeddings.
     * ``extract-embeddings`` – materialize frozen DNABERT-2 window embeddings.
     * ``extract-finetune-windows`` – extract 512 bp locus-centered windows from jaguar VCFs.
@@ -102,24 +83,6 @@ def build_parser() -> argparse.ArgumentParser:
     for command in ("evaluate", "baseline-evaluate", "report"):
         stage = subparsers.add_parser(command, help=f"Scaffold the {command} stage.")
         stage.add_argument("--config", type=Path, help="Optional path to a TOML config.")
-
-    fine_tune = subparsers.add_parser(
-        "fine-tune",
-        help="Run DNABERT-2 jaguar multi-task fine-tuning.",
-    )
-    fine_tune.add_argument(
-        "--config",
-        type=Path,
-        required=False,
-        default=None,
-        help="Path to the MTL fine-tuning TOML config. Required unless --integration-test is set.",
-    )
-    fine_tune.add_argument(
-        "--integration-test",
-        action="store_true",
-        default=False,
-        help="Run integration test mode (synthetic data, no real backbone needed).",
-    )
 
     mil_finetune = subparsers.add_parser(
         "mil-finetune",
@@ -345,26 +308,6 @@ def main(argv: Sequence[str] | None = None) -> int:
                 run_felid_foundation_training(args.config)
         except (RuntimeError, ValueError):
             traceback.print_exc()
-            return 1
-        return 0
-
-    if args.command == "fine-tune":
-        if not args.integration_test and args.config is None:
-            print("error: --config is required unless --integration-test is set.")
-            return 1
-
-        from .fine_tune.trainer import integration_test as mtl_integration_test
-        from .fine_tune.trainer import run_jaguar_mtl_training
-
-        try:
-            if args.integration_test:
-                mtl_integration_test(use_real_model=False)
-                print("Fine-tune integration test passed.")
-            else:
-                result = run_jaguar_mtl_training(args.config)
-                print(format_mtl_train_result(result))
-        except (RuntimeError, ValueError) as error:
-            print(str(error))
             return 1
         return 0
 

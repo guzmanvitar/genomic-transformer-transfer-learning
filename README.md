@@ -68,7 +68,7 @@ The first stage builds a multi-species felid genomic corpus and trains DNABERT-2
 
 ### Stage 2: Jaguar Positional MIL Fine-tuning
 
-The original per-window fine-tuning path failed to converge for geographic assignment (macro F1 = 0.0, median Haversine ≈ 972 km) because it asked the model to infer origin from isolated 512 bp windows. Geographic assignment is a multi-locus signal spread across an individual's full genome, so the primary jaguar stage now freezes DNABERT-2, extracts offline embeddings, and trains a full-bag Positional Gated Attention MIL model over approximately 84,000 windows per individual.
+The jaguar stage freezes DNABERT-2, extracts offline embeddings, and trains a full-bag Positional Gated Attention MIL model over approximately 84,000 windows per individual so geographic assignment is learned from distributed multi-locus signal across the genome.
 
 **Pipeline flow:**
 
@@ -211,11 +211,11 @@ Frozen DNABERT-2 window embeddings (~84k loci / jaguar)
   → coordinate regression head + biome classification head
 ```
 
-**Why MIL:** The per-window formulation produced macro F1 = 0.0 and median Haversine ≈ 972 km because no single 512 bp window carries enough information to localize an individual. The MIL aggregator sees all loci jointly, which matches the biological reality that population structure emerges from distributed multi-locus patterns.
+**Why MIL:** The MIL aggregator sees all loci jointly, which matches the biological reality that population structure emerges from distributed multi-locus patterns.
 
 **Positional conditioning:** Each window embedding is augmented with a continuous 1D sinusoidal encoding derived from its absolute base-pair position. This gives the attention mechanism genomic context without unfreezing or modifying the DNABERT-2 backbone.
 
-**Head design:** The MIL aggregator produces one pooled bag representation per jaguar. The existing coordinate regression head and biome classification head are then reused unchanged on top of that pooled representation, so the objective remains joint regression + classification while the upstream architecture shifts from per-window to per-bag reasoning.
+**Head design:** The MIL aggregator produces one pooled bag representation per jaguar. The existing coordinate regression head and biome classification head are then reused unchanged on top of that pooled representation, so the objective remains joint regression + classification while the upstream architecture operates on full per-individual bags.
 
 **Biome classes:** The five target biomes are alphabetically sorted for determinism: Amazon, Atlantic Forest, Caatinga, Cerrado, Pantanal. Any sample with an unrecognized biome label is rejected at dataset construction time.
 
@@ -234,7 +234,7 @@ The jaguar path now uses two operational stages instead of a frozen-then-unfreez
 - Train a single-phase positional MIL model with locus dropout regularization and O(N) bag aggregation.
 - Optimize only the MIL module plus the coordinate/biome heads; the DNABERT-2 backbone remains offline and frozen throughout.
 
-The MIL trainer still uses AdamW, cosine decay with linear warmup, patience-based early stopping on median Haversine distance, and optional evaluation capping via `eval_max_steps`. The key difference is that optimization happens over full bags rather than per-window mini-batches.
+The MIL trainer still uses AdamW, cosine decay with linear warmup, patience-based early stopping on median Haversine distance, and optional evaluation capping via `eval_max_steps`.
 
 ### Loss Functions and Task Weighting
 
@@ -439,7 +439,7 @@ metadata_csv   = "data/raw/jaguar_location.csv"
 output_dir     = "models/jaguar_mil"
 ```
 
-This is the primary jaguar training path because the earlier per-window formulation reached macro F1 = 0.0 with median Haversine ≈ 972 km. `mil-finetune` instead trains on complete bags of approximately 84,000 windows, uses locus dropout as bag-level regularization, and selects the best checkpoint by median Haversine distance with macro F1 as tie-breaker.
+`mil-finetune` trains on complete bags of approximately 84,000 windows, uses locus dropout as bag-level regularization, and selects the best checkpoint by median Haversine distance with macro F1 as tie-breaker.
 
 ---
 
@@ -466,13 +466,12 @@ src/jaguar_geo_assign/
 │   ├── foundation_training.py        # DNABERT-2 continued MLM pre-training
 │   └── _shared.py                    # Cross-pipeline helpers
 ├── fine_tune/
-│   ├── dataset.py                  # Legacy per-window MTL dataset and shared constants
 │   ├── extract_embeddings.py       # Offline DNABERT-2 embedding materialization
 │   ├── mil_dataset.py              # Per-individual bag dataset for embedding shards
 │   ├── mil_trainer.py              # Positional MIL training loop over full bags
 │   ├── model.py                    # Shared coordinate/biome heads
 │   ├── positional_mil.py           # Continuous positional encoding + gated attention MIL
-│   └── trainer.py                  # Legacy two-phase MTL trainer retained as rollback path
+│   └── dataset.py                  # Jaguar training data helpers and shared constants
 ├── baselines/                      # Baseline evaluation constants
 ├── evaluation/                     # Evaluation module (scaffold)
 └── reporting/                      # Report generation (scaffold)
@@ -482,7 +481,6 @@ configs/examples/
 ├── felid_foundation_train.toml     # Foundation training hyperparameters
 ├── fine_tune.toml                  # Fine-tuning experiment bootstrap config
 ├── embedding_extraction.toml       # Offline jaguar embedding extraction config
-├── mtl_finetune.toml               # Legacy per-window MTL fine-tuning config
 ├── mil_finetune.toml               # Positional MIL fine-tuning config
 └── regression_transfer.toml        # Full transfer-learning pipeline config
 
