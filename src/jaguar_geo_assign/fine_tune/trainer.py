@@ -557,15 +557,8 @@ def _collect_baseline_targets(source: Any) -> tuple[Tensor, Tensor]:
 
     dataset = getattr(source, "dataset", None)
     if isinstance(dataset, JaguarMTLDataset):
-        for record in dataset._records:
-            biome_idx = dataset._biome_to_idx[record["biome_population_label"]]
+        for biome_idx, lat_z, lon_z in dataset.iter_raw_targets():
             biome_parts.append(torch.tensor(biome_idx, dtype=torch.long).reshape(1))
-            lat_z = (
-                float(record["latitude"]) - dataset._coord_stats.lat_mean
-            ) / dataset._coord_stats.lat_std
-            lon_z = (
-                float(record["longitude"]) - dataset._coord_stats.lon_mean
-            ) / dataset._coord_stats.lon_std
             coord_parts.append(torch.tensor([lat_z, lon_z], dtype=torch.float32).reshape(1, 2))
     elif dataset is not None and hasattr(dataset, "__len__") and hasattr(dataset, "__getitem__"):
         for index in range(len(dataset)):
