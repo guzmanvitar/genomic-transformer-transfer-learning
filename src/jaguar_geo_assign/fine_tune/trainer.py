@@ -1,5 +1,5 @@
 # ruff: noqa: F722  # jaxtyping shape annotations use string-based dimensions
-"""Two-phase DNABERT-2 jaguar multi-task fine-tuning with Accelerate.
+"""Legacy two-phase DNABERT-2 jaguar multi-task fine-tuning with Accelerate.
 
 This module implements the high-level training loop for the jaguar multi-task
 learning (MTL) model.  It wires together the DNABERT-2 backbone, the
@@ -13,6 +13,12 @@ and :mod:`accelerate` to run a two-phase schedule:
 The design mirrors :mod:`jaguar_geo_assign.pretrain.foundation_training` where
 possible (bf16 mixed precision, gradient accumulation, atomic best-checkpoint
 writes) while remaining small enough for fast CPU-based tests.
+
+This path is retained only as code reference. Its per-window training design is
+flawed for geographic assignment because it treats isolated genomic windows as
+independent supervision targets instead of modeling the multi-locus signal that
+emerges across an individual's full genome. The supported user-facing jaguar
+training flow is the offline-embedding + positional MIL pipeline.
 """
 
 from __future__ import annotations
@@ -41,12 +47,7 @@ from jaguar_geo_assign.data.pipeline_contract import (
     DNABERT2_TOKENIZER_ID,
     DNABERT2_TOKENIZER_REVISION,
 )
-from jaguar_geo_assign.fine_tune.dataset import (
-    BIOME_CLASSES,
-    CoordStats,
-    JaguarMTLDataset,
-    build_fold_dataloaders,
-)
+from jaguar_geo_assign.fine_tune.dataset import BIOME_CLASSES, CoordStats, build_fold_dataloaders
 from jaguar_geo_assign.fine_tune.model import JaguarMTLModel
 from jaguar_geo_assign.pretrain.foundation_training import (
     _copy_custom_code,
@@ -548,15 +549,16 @@ def _collect_baseline_targets(source: Any) -> tuple[Tensor, Tensor]:
 
     Baseline metrics should reflect the true split contents rather than the
     stochastic behaviour of the training sampler. When a map-style dataset is
-    available, this helper reads the raw records directly (avoiding the
-    per-sample tokenization cost of ``__getitem__``); otherwise it falls back
-    to consuming the provided iterable of already-collated batches.
+    exposes ``iter_raw_targets()``, this helper reads the raw records directly
+    (avoiding ``__getitem__`` costs such as tokenization or MIL shard loads);
+    otherwise it falls back to consuming the provided iterable of already-
+    collated batches.
     """
     biome_parts: list[Tensor] = []
     coord_parts: list[Tensor] = []
 
     dataset = getattr(source, "dataset", None)
-    if isinstance(dataset, JaguarMTLDataset):
+    if dataset is not None and hasattr(dataset, "iter_raw_targets"):
         for biome_idx, lat_z, lon_z in dataset.iter_raw_targets():
             biome_parts.append(torch.tensor(biome_idx, dtype=torch.long).reshape(1))
             coord_parts.append(torch.tensor([lat_z, lon_z], dtype=torch.float32).reshape(1, 2))
@@ -796,7 +798,13 @@ def _run_evaluation(
 
 
 def run_jaguar_mtl_training(config_path: str | Path) -> MTLTrainResult:
-    """Run two-phase jaguar MTL fine-tuning for a single cross-validation fold.
+    """Run the legacy two-phase jaguar MTL training loop for reference only.
+
+    This implementation is intentionally kept in-tree for auditability and
+    historical comparisons, but it is no longer the supported jaguar training
+    path. The per-window formulation is flawed by design for geographic
+    assignment because it cannot aggregate multi-locus evidence across an
+    individual before prediction.
 
     The implementation is intentionally conservative with respect to checkpoint
     resume: it writes best-model snapshots and a rolling ``latest/train_state``

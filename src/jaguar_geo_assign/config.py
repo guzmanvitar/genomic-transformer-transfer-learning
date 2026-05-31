@@ -49,6 +49,22 @@ from .data.pipeline_contract import (
 )
 
 REQUIRED_STAGES = ("evaluate", BASELINE_EVALUATION_STAGE, "report")
+ALLOWED_MIXED_PRECISION_MODES = ("no", "fp16", "bf16", "fp8")
+
+
+def _load_mixed_precision(training: dict[str, object]) -> str:
+    """Validate the Accelerate mixed-precision mode shared by fine-tune loaders.
+
+    The fine-tuning entry points delegate device and autocast policy to
+    ``accelerate.Accelerator``. Centralizing the validation here keeps the MTL
+    and MIL loaders aligned so hardware compatibility overrides do not drift
+    between the two config contracts.
+    """
+
+    mixed_precision = str(training.get("mixed_precision", "bf16"))
+    if mixed_precision not in ALLOWED_MIXED_PRECISION_MODES:
+        raise ValueError("training.mixed_precision must be one of {'no', 'fp16', 'bf16', 'fp8'}")
+    return mixed_precision
 
 
 def _find_project_root(start: Path) -> Path:
@@ -1111,6 +1127,8 @@ class MtlFinetuneConfig:
         per_device_train_batch_size: Training batch size per device.
         per_device_eval_batch_size: Evaluation batch size per device.
         gradient_accumulation_steps: Gradient accumulation steps before an optimiser step.
+        mixed_precision: Accelerate mixed-precision mode (``"no"``, ``"fp16"``,
+            ``"bf16"``, or ``"fp8"``).
         warmup_fraction: Fraction of total steps used for linear LR warmup.
         gradient_clip: Maximum gradient norm (0 disables clipping).
         seed: Random seed for reproducibility.
@@ -1145,6 +1163,7 @@ class MtlFinetuneConfig:
     per_device_train_batch_size: int = 16
     per_device_eval_batch_size: int = 32
     gradient_accumulation_steps: int = 4
+    mixed_precision: str = "bf16"
     warmup_fraction: float = 0.1
     gradient_clip: float = 1.0
     seed: int = 42
@@ -1195,6 +1214,7 @@ def load_mtl_finetune_config(path: str | Path) -> MtlFinetuneConfig:
         per_device_train_batch_size = int(training.get("per_device_train_batch_size", 16))
         per_device_eval_batch_size = int(training.get("per_device_eval_batch_size", 32))
         gradient_accumulation_steps = int(training.get("gradient_accumulation_steps", 4))
+        mixed_precision = _load_mixed_precision(training)
         warmup_fraction = float(training.get("warmup_fraction", 0.1))
         gradient_clip = float(training.get("gradient_clip", 1.0))
         seed = int(training.get("seed", 42))
@@ -1263,11 +1283,300 @@ def load_mtl_finetune_config(path: str | Path) -> MtlFinetuneConfig:
         per_device_train_batch_size=per_device_train_batch_size,
         per_device_eval_batch_size=per_device_eval_batch_size,
         gradient_accumulation_steps=gradient_accumulation_steps,
+        mixed_precision=mixed_precision,
         warmup_fraction=warmup_fraction,
         gradient_clip=gradient_clip,
         seed=seed,
         num_workers=num_workers,
         weight_decay=weight_decay,
+        log_every=log_every,
+        eval_every=eval_every,
+        eval_max_steps=eval_max_steps,
+        save_every=save_every,
+        tensorboard_subdir=tensorboard_subdir,
+        dropout=dropout,
+        patience=patience,
+    )
+
+
+@dataclass(frozen=True)
+class EmbeddingExtractionConfig:
+    """Immutable configuration for offline DNABERT-2 embedding materialization.
+
+    Attributes:
+        backbone_path: Local path to a pretrained DNABERT-2 checkpoint.
+        windows_jsonl: JSONL of
+            :class:`~jaguar_geo_assign.data.finetune_windows.FinetuneWindow`
+            records produced by the window-extraction stage.
+        metadata_csv: CSV containing jaguar-level metadata keyed by
+            ``sample_id``.
+        output_dir: Directory where per-individual embedding shards and
+            metadata artefacts are written.
+        pooling_strategy: Sequence pooling strategy (``"cls"`` or ``"mean"``).
+        extraction_batch_size: Number of windows encoded per frozen backbone
+            forward pass.
+        device: Execution device request (``"auto"``, ``"cpu"``, or
+            ``"cuda"``).
+        dtype_str: On-disk embedding dtype. The current contract stores
+            embeddings as ``float32`` only so downstream MIL training never
+            inherits silent precision loss from mixed-precision extraction.
+    """
+
+    backbone_path: Path
+    windows_jsonl: Path
+    metadata_csv: Path
+    output_dir: Path
+    pooling_strategy: str = "cls"
+    extraction_batch_size: int = 128
+    device: str = "auto"
+    dtype_str: str = "float32"
+
+
+def load_embedding_extraction_config(path: str | Path) -> EmbeddingExtractionConfig:
+    """Load and validate an offline embedding-extraction TOML config.
+
+    The extraction stage uses a dedicated ``[extraction]`` section so its
+    runtime contract is decoupled from both foundation pretraining and MTL
+    fine-tuning configs.
+
+    Raises:
+        ValueError: If any contract check fails or a required field is missing.
+    """
+
+    raw = tomllib.loads(Path(path).read_text(encoding="utf-8"))
+    try:
+        extraction = raw["extraction"]
+
+        backbone_path = Path(extraction["backbone_path"])
+        windows_jsonl = Path(extraction["windows_jsonl"])
+        metadata_csv = Path(extraction["metadata_csv"])
+        output_dir = Path(extraction["output_dir"])
+
+        pooling_strategy = str(extraction.get("pooling_strategy", "cls"))
+        extraction_batch_size = int(extraction.get("extraction_batch_size", 128))
+        device = str(extraction.get("device", "auto"))
+        dtype_str = str(extraction.get("dtype_str", "float32"))
+
+        if pooling_strategy not in {"cls", "mean"}:
+            raise ValueError("extraction.pooling_strategy must be 'cls' or 'mean'")
+        if extraction_batch_size <= 0:
+            raise ValueError("extraction.extraction_batch_size must be positive")
+        if device not in {"auto", "cpu", "cuda"}:
+            raise ValueError("extraction.device must be 'auto', 'cpu', or 'cuda'")
+        if dtype_str != "float32":
+            raise ValueError(
+                "extraction.dtype_str must be 'float32'; other output dtypes are not supported"
+            )
+
+    except KeyError as exc:
+        msg = f"Embedding extraction config is missing required field: {exc.args[0]}"
+        raise ValueError(msg) from exc
+
+    return EmbeddingExtractionConfig(
+        backbone_path=backbone_path,
+        windows_jsonl=windows_jsonl,
+        metadata_csv=metadata_csv,
+        output_dir=output_dir,
+        pooling_strategy=pooling_strategy,
+        extraction_batch_size=extraction_batch_size,
+        device=device,
+        dtype_str=dtype_str,
+    )
+
+
+@dataclass(frozen=True)
+class MILFinetuneConfig:
+    """Configuration for positional MIL training on offline jaguar embeddings.
+
+    Attributes:
+        embeddings_dir: Directory containing per-individual ``.pt`` shards plus
+            ``manifest.jsonl`` from the offline extraction stage.
+        metadata_csv: Jaguar metadata CSV used to validate fold splits and labels.
+        output_dir: Root directory for checkpoints and TensorBoard logs.
+        embedding_dim: Dimensionality of the stored DNABERT-2 embeddings.
+        hidden_dim: Internal gated-attention projection size.
+        locus_dropout: Per-locus attention-logit masking probability.
+        genome_scale: Divisor applied before sinusoidal position encoding.
+        mil_steps: Total optimizer steps in the single-phase MIL loop.
+        lr_mil: AdamW learning rate for all MIL parameters.
+        n_folds: Number of ``StratifiedGroupKFold`` splits.
+        fold_index: Zero-based active fold index.
+        n_biomes: Number of biome classes drawn from ``BIOME_CLASSES``.
+        weight_decay: AdamW weight-decay coefficient.
+        cls_loss_weight: Weight applied to cross-entropy loss.
+        reg_loss_weight: Weight applied to Huber regression loss.
+        huber_delta: Delta parameter for ``nn.HuberLoss``.
+        gradient_accumulation_steps: Optimizer accumulation factor.
+        mixed_precision: Accelerate mixed-precision mode (``"no"``, ``"fp16"``,
+            ``"bf16"``, or ``"fp8"``).
+        warmup_fraction: Fraction of ``mil_steps`` used for LR warmup.
+        gradient_clip: Maximum gradient norm; zero disables clipping.
+        seed: Random seed for reproducibility.
+        num_workers: DataLoader worker count.
+        log_every: Scalar logging cadence in optimizer steps.
+        eval_every: Evaluation cadence in optimizer steps.
+        eval_max_steps: Optional cap on evaluation individuals per pass.
+        save_every: Checkpoint-sidecar save cadence in optimizer steps.
+        tensorboard_subdir: Subdirectory under ``output_dir`` for tracker files.
+        dropout: Dropout probability passed through to the task heads.
+        patience: Optional early-stopping patience measured in eval cycles.
+    """
+
+    embeddings_dir: Path
+    metadata_csv: Path
+    output_dir: Path
+    embedding_dim: int = 768
+    hidden_dim: int = 256
+    locus_dropout: float = 0.1
+    genome_scale: float = 1e8
+    mil_steps: int = 5000
+    lr_mil: float = 1e-4
+    n_folds: int = 5
+    fold_index: int = 0
+    n_biomes: int = 5
+    weight_decay: float = 0.01
+    cls_loss_weight: float = 0.1
+    reg_loss_weight: float = 1.0
+    huber_delta: float = 1.0
+    gradient_accumulation_steps: int = 4
+    mixed_precision: str = "bf16"
+    warmup_fraction: float = 0.1
+    gradient_clip: float = 1.0
+    seed: int = 42
+    num_workers: int = 0
+    log_every: int = 10
+    eval_every: int = 100
+    eval_max_steps: int | None = None
+    save_every: int = 500
+    tensorboard_subdir: str = "tensorboard"
+    dropout: float = 0.1
+    patience: int | None = None
+
+
+def load_mil_finetune_config(path: str | Path) -> MILFinetuneConfig:
+    """Load and validate a positional MIL fine-tuning TOML config.
+
+    The MIL path intentionally reads a dedicated ``[training]`` section rather
+    than reusing the two-phase MTL schema because the backbone is already frozen
+    offline and the loop optimizes only the MIL aggregator plus the task heads.
+
+    Raises:
+        ValueError: If required fields are missing or any contract check fails.
+    """
+
+    raw = tomllib.loads(Path(path).read_text(encoding="utf-8"))
+    try:
+        training = raw["training"]
+
+        embeddings_dir = Path(training["embeddings_dir"])
+        metadata_csv = Path(training["metadata_csv"])
+        output_dir = Path(training["output_dir"])
+
+        embedding_dim = int(training.get("embedding_dim", 768))
+        hidden_dim = int(training.get("hidden_dim", 256))
+        locus_dropout = float(training.get("locus_dropout", 0.1))
+        genome_scale = float(training.get("genome_scale", 1e8))
+        mil_steps = int(training.get("mil_steps", 5000))
+        lr_mil = float(training.get("lr_mil", 1e-4))
+        n_folds = int(training.get("n_folds", 5))
+        fold_index = int(training.get("fold_index", 0))
+        n_biomes = int(training.get("n_biomes", 5))
+        weight_decay = float(training.get("weight_decay", 0.01))
+        cls_loss_weight = float(training.get("cls_loss_weight", 0.1))
+        reg_loss_weight = float(training.get("reg_loss_weight", 1.0))
+        huber_delta = float(training.get("huber_delta", 1.0))
+        gradient_accumulation_steps = int(training.get("gradient_accumulation_steps", 4))
+        mixed_precision = _load_mixed_precision(training)
+        warmup_fraction = float(training.get("warmup_fraction", 0.1))
+        gradient_clip = float(training.get("gradient_clip", 1.0))
+        seed = int(training.get("seed", 42))
+        num_workers = int(training.get("num_workers", 0))
+        log_every = int(training.get("log_every", 10))
+        eval_every = int(training.get("eval_every", 100))
+        eval_max_steps_raw = training.get("eval_max_steps")
+        eval_max_steps = int(eval_max_steps_raw) if eval_max_steps_raw is not None else None
+        save_every = int(training.get("save_every", 500))
+        tensorboard_subdir = str(training.get("tensorboard_subdir", "tensorboard"))
+        dropout = float(training.get("dropout", 0.1))
+        patience_raw = training.get("patience")
+        patience = int(patience_raw) if patience_raw is not None else None
+
+        if embedding_dim <= 0:
+            raise ValueError("training.embedding_dim must be positive")
+        if hidden_dim <= 0:
+            raise ValueError("training.hidden_dim must be positive")
+        if not 0.0 <= locus_dropout < 1.0:
+            raise ValueError("training.locus_dropout must be in the half-open interval [0, 1)")
+        if genome_scale <= 0.0:
+            raise ValueError("training.genome_scale must be positive")
+        if mil_steps <= 0:
+            raise ValueError("training.mil_steps must be positive")
+        if lr_mil <= 0.0:
+            raise ValueError("training.lr_mil must be positive")
+        if n_folds < 2:
+            raise ValueError("training.n_folds must be at least 2")
+        if not 0 <= fold_index < n_folds:
+            raise ValueError("training.fold_index must satisfy 0 <= fold_index < n_folds")
+        if not 1 <= n_biomes <= 5:
+            raise ValueError("training.n_biomes must be between 1 and 5 inclusive")
+        if weight_decay < 0.0:
+            raise ValueError("training.weight_decay must be non-negative")
+        if cls_loss_weight <= 0.0:
+            raise ValueError("training.cls_loss_weight must be positive")
+        if reg_loss_weight <= 0.0:
+            raise ValueError("training.reg_loss_weight must be positive")
+        if huber_delta <= 0.0:
+            raise ValueError("training.huber_delta must be positive")
+        if gradient_accumulation_steps <= 0:
+            raise ValueError("training.gradient_accumulation_steps must be positive")
+        if not 0.0 < warmup_fraction < 1.0:
+            raise ValueError("training.warmup_fraction must be in the open interval (0, 1)")
+        if gradient_clip < 0.0:
+            raise ValueError("training.gradient_clip must be non-negative")
+        if num_workers < 0:
+            raise ValueError("training.num_workers must be non-negative")
+        if log_every <= 0:
+            raise ValueError("training.log_every must be positive")
+        if eval_every <= 0:
+            raise ValueError("training.eval_every must be positive")
+        if eval_max_steps is not None and eval_max_steps <= 0:
+            raise ValueError("training.eval_max_steps must be positive")
+        if save_every <= 0:
+            raise ValueError("training.save_every must be positive")
+        if not tensorboard_subdir:
+            raise ValueError("training.tensorboard_subdir must be non-empty")
+        if not 0.0 <= dropout < 1.0:
+            raise ValueError("training.dropout must be in the half-open interval [0, 1)")
+        if patience is not None and patience <= 0:
+            raise ValueError("training.patience must be positive")
+
+    except KeyError as exc:
+        msg = f"MIL fine-tune config is missing required field: {exc.args[0]}"
+        raise ValueError(msg) from exc
+
+    return MILFinetuneConfig(
+        embeddings_dir=embeddings_dir,
+        metadata_csv=metadata_csv,
+        output_dir=output_dir,
+        embedding_dim=embedding_dim,
+        hidden_dim=hidden_dim,
+        locus_dropout=locus_dropout,
+        genome_scale=genome_scale,
+        mil_steps=mil_steps,
+        lr_mil=lr_mil,
+        n_folds=n_folds,
+        fold_index=fold_index,
+        n_biomes=n_biomes,
+        weight_decay=weight_decay,
+        cls_loss_weight=cls_loss_weight,
+        reg_loss_weight=reg_loss_weight,
+        huber_delta=huber_delta,
+        gradient_accumulation_steps=gradient_accumulation_steps,
+        mixed_precision=mixed_precision,
+        warmup_fraction=warmup_fraction,
+        gradient_clip=gradient_clip,
+        seed=seed,
+        num_workers=num_workers,
         log_every=log_every,
         eval_every=eval_every,
         eval_max_steps=eval_max_steps,

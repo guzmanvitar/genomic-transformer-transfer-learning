@@ -27,6 +27,7 @@ from .config import (
     describe_felid_foundation_config,
     load_experiment_config,
     load_felid_foundation_pipeline_config,
+    load_mil_finetune_config,
 )
 from .pretrain import (
     acquire_felid_foundation_assemblies,
@@ -35,17 +36,17 @@ from .pretrain import (
 )
 
 
-def format_mtl_train_result(result: object) -> str:
-    """Format an MTLTrainResult for human-readable CLI output.
+def format_mil_train_result(result: object) -> str:
+    """Format an MILTrainResult for human-readable CLI output.
 
-    Uses duck-typed attribute access to avoid importing torch at module
-    level.
+    Uses duck-typed attribute access so the CLI can summarize MIL results
+    without importing torch-heavy training modules during startup.
     """
+
     lines = [
-        "Jaguar MTL fine-tuning completed.",
+        "Jaguar MIL fine-tuning completed.",
         f"  Fold index: {result.fold_index}",
-        f"  Phase 1 steps: {result.phase1_steps_completed}",
-        f"  Phase 2 steps: {result.phase2_steps_completed}",
+        f"  Steps completed: {result.steps_completed}",
         f"  Best eval haversine (km): {result.best_eval_haversine_km}",
         f"  Best eval macro F1: {result.best_eval_macro_f1}",
         f"  Output directory: {result.output_dir}",
@@ -58,7 +59,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     The parser exposes the following sub-commands:
 
-    * ``fine-tune`` – run DNABERT-2 jaguar multi-task fine-tuning.
+    * ``mil-finetune`` – run positional MIL fine-tuning over offline embeddings.
+    * ``extract-embeddings`` – materialize frozen DNABERT-2 window embeddings.
     * ``extract-finetune-windows`` – extract 512 bp locus-centered windows from jaguar VCFs.
     * ``evaluate``, ``baseline-evaluate``, ``report`` –
       scaffold placeholders for later pipeline stages.
@@ -82,22 +84,26 @@ def build_parser() -> argparse.ArgumentParser:
         stage = subparsers.add_parser(command, help=f"Scaffold the {command} stage.")
         stage.add_argument("--config", type=Path, help="Optional path to a TOML config.")
 
-    fine_tune = subparsers.add_parser(
-        "fine-tune",
-        help="Run DNABERT-2 jaguar multi-task fine-tuning.",
+    mil_finetune = subparsers.add_parser(
+        "mil-finetune",
+        help="Run positional MIL fine-tuning over offline embeddings.",
     )
-    fine_tune.add_argument(
+    mil_finetune.add_argument(
         "--config",
         type=Path,
-        required=False,
-        default=None,
-        help="Path to the MTL fine-tuning TOML config. Required unless --integration-test is set.",
+        required=True,
+        help="Path to the MIL fine-tuning TOML config.",
     )
-    fine_tune.add_argument(
-        "--integration-test",
-        action="store_true",
-        default=False,
-        help="Run integration test mode (synthetic data, no real backbone needed).",
+
+    extract_embeddings = subparsers.add_parser(
+        "extract-embeddings",
+        help="Materialize frozen DNABERT-2 embeddings for jaguar fine-tune windows.",
+    )
+    extract_embeddings.add_argument(
+        "--config",
+        type=Path,
+        required=True,
+        help="Path to the embedding-extraction TOML config.",
     )
 
     validate = subparsers.add_parser("validate-config", help="Validate a bootstrap TOML config.")
@@ -305,21 +311,24 @@ def main(argv: Sequence[str] | None = None) -> int:
             return 1
         return 0
 
-    if args.command == "fine-tune":
-        if not args.integration_test and args.config is None:
-            print("error: --config is required unless --integration-test is set.")
-            return 1
-
-        from .fine_tune.trainer import integration_test as mtl_integration_test
-        from .fine_tune.trainer import run_jaguar_mtl_training
+    if args.command == "mil-finetune":
+        from .fine_tune.mil_trainer import run_jaguar_mil_training
 
         try:
-            if args.integration_test:
-                mtl_integration_test(use_real_model=False)
-                print("Fine-tune integration test passed.")
-            else:
-                result = run_jaguar_mtl_training(args.config)
-                print(format_mtl_train_result(result))
+            load_mil_finetune_config(args.config)
+            result = run_jaguar_mil_training(args.config)
+            print(format_mil_train_result(result))
+        except (RuntimeError, ValueError) as error:
+            print(str(error))
+            return 1
+        return 0
+
+    if args.command == "extract-embeddings":
+        from .fine_tune.extract_embeddings import format_extraction_result, run_embedding_extraction
+
+        try:
+            result = run_embedding_extraction(args.config)
+            print(format_extraction_result(result))
         except (RuntimeError, ValueError) as error:
             print(str(error))
             return 1

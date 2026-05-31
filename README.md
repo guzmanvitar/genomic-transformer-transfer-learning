@@ -1,6 +1,6 @@
 # Jaguar Geographic Assignment via DNABERT-2 Transfer Learning
 
-A two-stage transfer-learning pipeline for geographic assignment of jaguars (*Panthera onca*) from whole-genome sequencing data. The system pre-trains DNABERT-2 on multi-species felid reference genomes, then fine-tunes a multi-task model that jointly predicts geographic coordinates and biome-population labels from jaguar variant data.
+A two-stage transfer-learning pipeline for geographic assignment of jaguars (*Panthera onca*) from whole-genome sequencing data. The system pre-trains DNABERT-2 on multi-species felid reference genomes, then freezes the backbone, materializes offline window embeddings, and trains a positional gated-attention MIL model that predicts geographic coordinates and biome-population labels from full per-individual bags.
 
 This work addresses a core challenge in conservation genomics: endangered species that most need precise forensic tools have the least genetic data available for model development. By pre-training on abundant felid genomic resources and transferring that knowledge to jaguar-specific tasks, the pipeline can extract informative geographic signal from limited sample sizes across fragmented populations in Brazilian biomes.
 
@@ -11,18 +11,18 @@ This work addresses a core challenge in conservation genomics: endangered specie
 1. [Research Context](#research-context)
 2. [Methodology Overview](#methodology-overview)
    - [Stage 1: Felid Foundation Pre-training](#stage-1-felid-foundation-pre-training)
-   - [Stage 2: Jaguar Multi-Task Fine-tuning](#stage-2-jaguar-multi-task-fine-tuning)
+   - [Stage 2: Jaguar Positional MIL Fine-tuning](#stage-2-jaguar-positional-mil-fine-tuning)
 3. [Data Decisions](#data-decisions)
    - [Pre-training Corpus: Species Selection and Rationale](#pre-training-corpus-species-selection-and-rationale)
    - [Sequence Windowing and Tokenization](#sequence-windowing-and-tokenization)
    - [Locus-Safe Train/Validation Splitting](#locus-safe-trainvalidation-splitting)
    - [Jaguar Variant Processing](#jaguar-variant-processing)
-   - [Coordinate Normalization and Sample Weighting](#coordinate-normalization-and-sample-weighting)
+   - [Coordinate Normalization and Full-Bag Sampling](#coordinate-normalization-and-full-bag-sampling)
 4. [Modeling Decisions](#modeling-decisions)
    - [Foundation Model Selection: DNABERT-2](#foundation-model-selection-dnabert-2)
    - [Pre-training Objective and Hyperparameters](#pre-training-objective-and-hyperparameters)
-   - [Multi-Task Architecture](#multi-task-architecture)
-   - [Two-Phase Fine-tuning Schedule](#two-phase-fine-tuning-schedule)
+   - [Positional Gated Attention MIL Architecture](#positional-gated-attention-mil-architecture)
+   - [Offline Extraction and MIL Training Schedule](#offline-extraction-and-mil-training-schedule)
    - [Loss Functions and Task Weighting](#loss-functions-and-task-weighting)
    - [Evaluation Metrics](#evaluation-metrics)
 5. [Reproducibility and Integrity Guarantees](#reproducibility-and-integrity-guarantees)
@@ -33,7 +33,8 @@ This work addresses a core challenge in conservation genomics: endangered specie
    - [Step 3: Run Foundation Pre-training](#step-3-run-foundation-pre-training)
    - [Step 4: Acquire Jaguar Raw Data](#step-4-acquire-jaguar-raw-data)
    - [Step 5: Prepare Jaguar Fine-tuning Data](#step-5-prepare-jaguar-fine-tuning-data)
-   - [Step 6: Run Multi-Task Fine-tuning](#step-6-run-multi-task-fine-tuning)
+   - [Step 6: Extract Offline Embeddings](#step-6-extract-offline-embeddings)
+   - [Step 7: Run Positional MIL Fine-tuning](#step-7-run-positional-mil-fine-tuning)
 8. [Repository Layout](#repository-layout)
 9. [Development](#development)
 
@@ -45,7 +46,7 @@ The jaguar occupies approximately 46% of its historical range, with an estimated
 
 Traditional approaches to geographic assignment (SCAT, SPASIBA, STRUCTURE, KLFDAPC) require substantial sample sizes per population and either produce only coarse population-level assignments or demand dense spatial sampling for continuous predictions. Machine learning methods such as Locator (Battey et al., 2020) achieve high-resolution continuous geographic assignment via deep neural networks, but still require large training datasets.
 
-This project applies transfer learning to overcome the data scarcity challenge. A DNABERT-2 genomic language model is pre-trained from scratch on six felid reference assemblies to learn the general "grammar" of felid DNA, then fine-tuned on jaguar whole-genome variants from five Brazilian biomes (Amazon, Atlantic Forest, Caatinga, Cerrado, Pantanal). The transfer-learning approach enables the extraction of informative patterns even from populations with very few sampled individuals.
+This project applies transfer learning to overcome the data scarcity challenge. A DNABERT-2 genomic language model is pre-trained from scratch on six felid reference assemblies to learn the general "grammar" of felid DNA, then transferred to jaguar whole-genome variants from five Brazilian biomes (Amazon, Atlantic Forest, Caatinga, Cerrado, Pantanal) through offline embedding extraction plus full-bag MIL training. The transfer-learning approach enables the extraction of informative multi-locus geographic signal from limited sample sizes across fragmented populations.
 
 ## Methodology Overview
 
@@ -65,18 +66,20 @@ The first stage builds a multi-species felid genomic corpus and trains DNABERT-2
 - `artifacts/felid_foundation_pretrain/felid_foundation_pretrain_run_summary.json` — Corpus summary
 - `models/foundation_felid/best/` — Best checkpoint (lowest validation loss)
 
-### Stage 2: Jaguar Multi-Task Fine-tuning
+### Stage 2: Jaguar Positional MIL Fine-tuning
 
-The second stage fine-tunes the pre-trained DNABERT-2 backbone on jaguar variant data for two simultaneous tasks:
+The jaguar stage freezes DNABERT-2, extracts offline embeddings, and trains a full-bag Positional Gated Attention MIL model over approximately 84,000 windows per individual so geographic assignment is learned from distributed multi-locus signal across the genome.
 
-- **Coordinate regression**: Predict latitude and longitude of geographic origin.
-- **Biome-population classification**: Assign individuals to one of five Brazilian biomes.
+**Pipeline flow:**
 
-This stage processes jaguar VCF files against the DNA Zoo *Panthera onca* reference to extract 512 bp locus-centered windows around variant sites, then trains a multi-task model with task-specific heads attached to the shared backbone.
+1. **Extract jaguar windows** — Produce 512 bp locus-centered `FinetuneWindow` records from the VCF.
+2. **Run `extract-embeddings`** — Encode every window with the frozen DNABERT-2 backbone and write one `.pt` shard per individual plus a manifest.
+3. **Run `mil-finetune`** — Train the positional MIL aggregator and downstream coordinate/biome heads on the full per-individual bags.
 
 **Key outputs:**
-- JSONL of per-locus 512 bp windows with allele annotations
-- `models/finetune/best/` — Best checkpoint, including backbone, task heads, and coordinate normalization parameters
+- `data/processed/finetune/windows.jsonl` — Per-locus 512 bp windows with allele annotations
+- `data/processed/finetune/embeddings/` — Per-individual embedding shards, `manifest.jsonl`, and `contig_rank.json`
+- `models/jaguar_mil/best/` — Best MIL checkpoint, coordinate normalization stats, and eval metrics
 
 ---
 
@@ -144,11 +147,11 @@ Jaguar fine-tuning data is derived from VCF files aligned to the DNA Zoo *Panthe
 
 **Reference validation:** The pipeline enforces that the FASTA reference matches the DNA Zoo jaguar assembly by checking for positive contig tokens (`HiC_scaffold_1`, `Panthera_onca_HiC`) and rejecting NCBI-specific tokens (`NC_083295.1`, `GCF_028533385.1`) that indicate a RefSeq repackaging with altered contig names. Every VCF REF allele is verified against the actual FASTA base at that position.
 
-### Coordinate Normalization and Sample Weighting
+### Coordinate Normalization and Full-Bag Sampling
 
-**Coordinate normalization:** Latitude and longitude targets are z-score normalized using per-individual mean and standard deviation computed from the training split. Normalization is computed at the individual level (not per-window) because the training sampler equalizes window contributions per individual — computing statistics per-window would bias the normalization toward individuals with more windows. Standard deviations are clamped to a minimum of 1e-6 to guard against division by zero. Normalization parameters are serialized to JSON alongside the best checkpoint for inference-time denormalization.
+**Coordinate normalization:** Latitude and longitude targets are z-score normalized using per-individual mean and standard deviation computed from the training split. Normalization is fit at the individual level because the MIL trainer consumes one full bag per jaguar, not a stream of independent windows. Standard deviations are clamped to a minimum of 1e-6 to guard against division by zero. Normalization parameters are serialized to JSON alongside the best checkpoint for inference-time denormalization.
 
-**Per-individual weighting:** Each training window receives a sampling weight inversely proportional to the number of windows from its individual: `weight = 1 / windows_per_individual`. A `WeightedRandomSampler` with replacement ensures that each individual contributes equally to each epoch regardless of how many variant sites they carry, preventing individuals with more variants from dominating training.
+**Full-bag sampling:** Each training example is one individual's entire embedding bag (approximately 84,000 windows) loaded from a pre-extracted shard. The DataLoader therefore runs with `batch_size=1`, and gradient accumulation simulates a larger effective batch without breaking the full-bag contract. This avoids the signal collapse observed when the old pipeline treated windows as independent samples.
 
 **Cross-validation:** `StratifiedGroupKFold` from scikit-learn stratifies on biome-population label and groups by individual identity. This guarantees:
 - All biomes are represented in every fold.
@@ -196,55 +199,46 @@ The foundation model is trained with **masked language modeling (MLM)**: 15% of 
 
 **Pad token handling:** DNABERT-2 ships without an explicit pad token. A three-tier fallback assigns a pad token: (1) reuse `eos_token` if available (preferred), (2) reuse `unk_token`, (3) inject a new `[PAD]` token and resize embeddings.
 
-### Multi-Task Architecture
+### Positional Gated Attention MIL Architecture
 
-The fine-tuning model wraps the pre-trained DNABERT-2 backbone with two lightweight task-specific heads:
+The primary jaguar model no longer predicts from one window at a time. Instead, it consumes a full per-individual bag of frozen DNABERT-2 embeddings and aggregates them with positional gated attention:
 
 ```
-DNABERT-2 Backbone (shared encoder, 117M parameters)
-  │
-  ├── Pooling (CLS token or masked mean)
-  │
-  ├─→ Coordinate Regression Head
-  │     Dropout(0.1) → Linear(hidden → hidden) → GELU → Dropout(0.1) → Linear(hidden → 2)
-  │     Output: (latitude, longitude) predictions
-  │
-  └─→ Biome Classification Head
-        Dropout(0.1) → Linear(hidden → hidden) → GELU → Dropout(0.1) → Linear(hidden → 5)
-        Output: unnormalized logits over 5 biome classes
+Frozen DNABERT-2 window embeddings (~84k loci / jaguar)
+  + continuous sinusoidal base-pair positional encoding
+  → gated attention MIL aggregator (tanh gate ⊙ sigmoid gate)
+  → weighted full-bag pooling
+  → coordinate regression head + biome classification head
 ```
 
-**Pooling strategy:** By default, CLS-token pooling is used (the backbone's `pooler_output` or the first-token hidden state). An alternative mean-pooling strategy computes a masked average over the sequence dimension using the attention mask, with denominators clamped to at least 1 to prevent division by zero.
+**Why MIL:** The MIL aggregator sees all loci jointly, which matches the biological reality that population structure emerges from distributed multi-locus patterns.
 
-**Head design:** Both heads use identical two-layer MLP architectures with GELU activation. This design keeps the majority of model capacity in the shared backbone while providing sufficient representational power for each task. The heads emit raw predictions: coordinate values in normalized space, and unnormalized logits for classification. Loss computation is delegated to the trainer, keeping the model reusable across different training regimes.
+**Positional conditioning:** Each window embedding is augmented with a continuous 1D sinusoidal encoding derived from its absolute base-pair position. This gives the attention mechanism genomic context without unfreezing or modifying the DNABERT-2 backbone.
+
+**Head design:** The MIL aggregator produces one pooled bag representation per jaguar. The existing coordinate regression head and biome classification head are then reused unchanged on top of that pooled representation, so the objective remains joint regression + classification while the upstream architecture operates on full per-individual bags.
 
 **Biome classes:** The five target biomes are alphabetically sorted for determinism: Amazon, Atlantic Forest, Caatinga, Cerrado, Pantanal. Any sample with an unrecognized biome label is rejected at dataset construction time.
 
-### Two-Phase Fine-tuning Schedule
+### Offline Extraction and MIL Training Schedule
 
-Fine-tuning follows a two-phase schedule designed to prevent catastrophic forgetting of pre-trained representations:
+The jaguar path now uses two operational stages instead of a frozen-then-unfreeze backbone schedule:
 
-**Phase 1 — Heads-only warm-up:**
-- The backbone is completely frozen (`requires_grad=False` on all backbone parameters).
-- Only the coordinate regression and biome classification heads are trained.
-- Learning rate for heads: 1e-4.
-- This phase allows the task heads to calibrate to the backbone's representation space before any backbone parameters change.
+**Stage A — `extract-embeddings`:**
+- Load the pretrained DNABERT-2 checkpoint in eval mode and freeze all backbone parameters.
+- Encode every jaguar window once and materialize float32 embeddings to disk.
+- Store base-pair positions and contig metadata beside each per-individual shard.
+- Purpose: prevent catastrophic forgetting and keep VRAM bounded before any full-bag learning starts.
 
-**Phase 2 — Partial unfreezing:**
-- The last 2 transformer blocks of the backbone are unfrozen (configurable: 2 or 3 blocks).
-- The backbone's pooler layer is also unfrozen if present.
-- Task heads continue training.
-- **Differential learning rates:** The backbone uses a 10x lower learning rate (1e-5) than the heads (1e-4). This protects the deep pre-trained representations while allowing the top layers to adapt to the jaguar-specific task distribution.
+**Stage B — `mil-finetune`:**
+- Load one full embedding bag per individual from the offline shards.
+- Train a single-phase positional MIL model with locus dropout regularization and O(N) bag aggregation.
+- Optimize only the MIL module plus the coordinate/biome heads; the DNABERT-2 backbone remains offline and frozen throughout.
 
-Both phases use AdamW with cosine-annealing learning rate schedules and linear warmup over 10% of total phase steps.
-
-**Early stopping:** Both phases support patience-based early stopping, matching the pre-training design. A patience counter tracks consecutive evaluation cycles without improvement in the primary metric (median Haversine distance). When the counter reaches the configured `patience` threshold, the phase ends early. The patience counter resets at the Phase 2 transition. Phase step limits (`phase1_steps`, `phase2_steps`) serve as safety ceilings — in practice, early stopping controls convergence.
-
-**Evaluation capping:** Each evaluation pass can be limited to `eval_max_steps` batches to prevent long stalls on large evaluation sets. When set, only a fixed number of eval batches are processed per cycle rather than the full evaluation split.
+The MIL trainer still uses AdamW, cosine decay with linear warmup, patience-based early stopping on median Haversine distance, and optional evaluation capping via `eval_max_steps`.
 
 ### Loss Functions and Task Weighting
 
-The total training loss is a weighted sum of classification and regression components:
+The MIL training loss is a weighted sum of classification and regression components:
 
 ```
 total_loss = cls_loss_weight × CrossEntropy(biome_logits, biome_label)
@@ -256,7 +250,7 @@ total_loss = cls_loss_weight × CrossEntropy(biome_logits, biome_label)
 | Regression | Huber loss (delta=1.0) | 1.0 | The primary task and research contribution; more robust than MSE to outlier mispredictions — Huber transitions from L2 to L1 behavior beyond delta, limiting the influence of large geographic errors |
 | Classification | Cross-entropy | 0.1 | Serves primarily as an auxiliary regularizer that encourages the shared backbone to learn population-structure-aware representations, indirectly benefiting regression |
 
-The 1:10 weighting (regression-dominant) reflects two observations: (1) continuous geographic assignment is the hard task and the novel contribution of this work — it needs the majority of gradient budget from step 1; (2) biome classification saturates early, and a high classification weight would spend gradient budget sharpening already-correct logits rather than reducing geographic error. At 0.1 weight the classification head still converges to high accuracy (the task is easy enough), while the regression head receives first-class optimization throughout training. Both losses are computed in float32 regardless of mixed-precision settings to ensure numerical stability.
+The 1:10 weighting (regression-dominant) reflects two observations: (1) continuous geographic assignment is the hard task and the novel contribution of this work — it needs the majority of gradient budget from step 1; (2) biome classification saturates early, and a high classification weight would spend gradient budget sharpening already-correct logits rather than reducing geographic error. At 0.1 weight the classification head still converges to high accuracy, while the regression head receives first-class optimization throughout training. Both losses are computed in float32 regardless of mixed-precision settings to ensure numerical stability, and both operate on the pooled bag representation produced by the MIL aggregator rather than a single-window backbone output.
 
 **Gradient management:**
 - Gradient accumulation: 4 steps by default (effective batch size = per_device_batch × 4 × world_size).
@@ -406,32 +400,46 @@ uv run python -m jaguar_geo_assign.cli extract-finetune-windows \
 
 The window extraction produces a JSONL file of `FinetuneWindow` records. Each record contains the 512 bp sequence, allele annotations, genotype, and genomic coordinates.
 
-### Step 6: Run Multi-Task Fine-tuning
+### Step 6: Extract Offline Embeddings
 
 ```bash
-uv run python -m jaguar_geo_assign.cli fine-tune \
-  --config configs/examples/mtl_finetune.toml
-
-# Quick smoke test with synthetic data (no pretrained backbone needed)
-uv run python -m jaguar_geo_assign.cli fine-tune \
-  --config configs/examples/mtl_finetune.toml --integration-test
+uv run python -m jaguar_geo_assign.cli extract-embeddings \
+  --config configs/examples/embedding_extraction.toml
 ```
 
-The fine-tuning trainer requires a `MtlFinetuneConfig` TOML with the following fields:
+This stage freezes the pretrained DNABERT-2 checkpoint, encodes every jaguar window once, and writes per-individual embedding shards for downstream MIL training.
+
+The extraction config is defined in `EmbeddingExtractionConfig` and minimally requires:
+
+```toml
+[extraction]
+backbone_path = "models/foundation_felid/best/hf_model"
+windows_jsonl = "data/processed/finetune/windows.jsonl"
+metadata_csv  = "data/raw/jaguar_location.csv"
+output_dir    = "data/processed/finetune/embeddings"
+```
+
+Outputs include one `{individual_id}.pt` shard per jaguar plus `manifest.jsonl` and `contig_rank.json`. This keeps the DNABERT-2 backbone out of the full-bag training loop and preserves the pretrained representation.
+
+### Step 7: Run Positional MIL Fine-tuning
+
+```bash
+uv run python -m jaguar_geo_assign.cli mil-finetune \
+  --config configs/examples/mil_finetune.toml
+```
+
+The MIL trainer loads the offline shards, applies positional gated attention over each full bag, and predicts both coordinates and biome labels from the pooled bag embedding.
+
+The `MILFinetuneConfig` TOML minimally requires:
 
 ```toml
 [training]
-backbone_path = "models/foundation_felid/best/hf_model"
-windows_jsonl  = "<path to extracted windows JSONL>"
-metadata_csv   = "<path to jaguar metadata CSV>"
-output_dir     = "models/finetune"
+embeddings_dir = "data/processed/finetune/embeddings"
+metadata_csv   = "data/raw/jaguar_location.csv"
+output_dir     = "models/jaguar_mil"
 ```
 
-The fine-tuning trainer runs two phases:
-1. **Heads-only warm-up**: backbone frozen, only task heads trained.
-2. **Joint training**: last 2 transformer blocks and task heads trained with differential learning rates.
-
-Both phases run until their step limit or until early stopping triggers (controlled by the `patience` parameter). The best checkpoint is selected by median Haversine distance (lower is better) with macro F1 as tie-breaker.
+`mil-finetune` trains on complete bags of approximately 84,000 windows, uses locus dropout as bag-level regularization, and selects the best checkpoint by median Haversine distance with macro F1 as tie-breaker.
 
 ---
 
@@ -458,9 +466,12 @@ src/jaguar_geo_assign/
 │   ├── foundation_training.py        # DNABERT-2 continued MLM pre-training
 │   └── _shared.py                    # Cross-pipeline helpers
 ├── fine_tune/
-│   ├── dataset.py                  # Fold-aware dataset with per-individual weighting
-│   ├── model.py                    # DNABERT-2 backbone + MTL heads
-│   └── trainer.py                  # Two-phase training with Accelerate
+│   ├── extract_embeddings.py       # Offline DNABERT-2 embedding materialization
+│   ├── mil_dataset.py              # Per-individual bag dataset for embedding shards
+│   ├── mil_trainer.py              # Positional MIL training loop over full bags
+│   ├── model.py                    # Shared coordinate/biome heads
+│   ├── positional_mil.py           # Continuous positional encoding + gated attention MIL
+│   └── dataset.py                  # Jaguar training data helpers and shared constants
 ├── baselines/                      # Baseline evaluation constants
 ├── evaluation/                     # Evaluation module (scaffold)
 └── reporting/                      # Report generation (scaffold)
@@ -469,6 +480,8 @@ configs/examples/
 ├── felid_foundation_pretrain.toml  # Corpus construction configuration
 ├── felid_foundation_train.toml     # Foundation training hyperparameters
 ├── fine_tune.toml                  # Fine-tuning experiment bootstrap config
+├── embedding_extraction.toml       # Offline jaguar embedding extraction config
+├── mil_finetune.toml               # Positional MIL fine-tuning config
 └── regression_transfer.toml        # Full transfer-learning pipeline config
 
 tests/
