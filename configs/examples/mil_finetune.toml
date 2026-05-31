@@ -5,8 +5,8 @@
 
 [training]
 # Required paths.
-embeddings_dir = "artifacts/jaguar_embeddings"
-metadata_csv = "data/jaguar/metadata.csv"
+embeddings_dir = "data/processed/finetune/embeddings"
+metadata_csv = "data/raw/jaguar_location.csv"
 output_dir = "models/jaguar_mil"
 
 # MIL architecture.
