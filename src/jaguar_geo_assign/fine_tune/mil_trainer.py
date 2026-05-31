@@ -225,6 +225,16 @@ def _run_mil_evaluation(
         },
         step=global_step,
     )
+    if accelerator.is_main_process:
+        logger.info(
+            "[Eval @ step %d] haversine_km_median=%.2f haversine_km_mean=%.2f "
+            "macro_f1=%.4f eval_loss=%.4f",
+            global_step,
+            metrics["haversine_km_median"],
+            metrics["haversine_km_mean"],
+            metrics["macro_f1"],
+            mean_eval_loss,
+        )
 
     current_hav = metrics["haversine_km_median"]
     current_f1 = metrics["macro_f1"]
@@ -243,6 +253,12 @@ def _run_mil_evaluation(
         best_eval_haversine_km = float(current_hav)
         best_eval_macro_f1 = float(current_f1)
         if accelerator.is_main_process:
+            logger.info(
+                "New best checkpoint at step %d: haversine_km_median=%.2f macro_f1=%.4f",
+                global_step,
+                best_eval_haversine_km,
+                best_eval_macro_f1,
+            )
             best_dir = output_dir / "best"
             unwrapped = accelerator.unwrap_model(model)
             with atomic_dir_replace(best_dir) as tmp_best:
@@ -289,7 +305,9 @@ def run_jaguar_mil_training(config_path: str | Path) -> MILTrainResult:
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
 
+    logger.info("Building MIL dataloaders...")
     train_loader, eval_loader, coord_stats = build_mil_fold_dataloaders(config)
+    logger.info("Dataloaders ready.")
     accelerator = Accelerator(
         mixed_precision=config.mixed_precision,
         gradient_accumulation_steps=config.gradient_accumulation_steps,
@@ -313,11 +331,17 @@ def run_jaguar_mil_training(config_path: str | Path) -> MILTrainResult:
     )
     accelerator.init_trackers("jaguar_mil_training")
 
+    logger.info("Computing baselines (iterating train+eval sets)...")
     baseline_metrics = _compute_baselines(
         train_loader=train_loader,
         eval_loader=eval_loader,
         coord_stats=coord_stats,
         n_biomes=config.n_biomes,
+    )
+    logger.info(
+        "Baselines: haversine_km_median=%.2f macro_f1=%.4f",
+        baseline_metrics["haversine_km_median"],
+        baseline_metrics["macro_f1"],
     )
     accelerator.log(
         {
@@ -350,6 +374,12 @@ def run_jaguar_mil_training(config_path: str | Path) -> MILTrainResult:
     last_eval_haversine: float | None = None
     plateau_window: deque[float] = deque(maxlen=1000)
 
+    logger.info(
+        "Starting MIL training: %d steps, log_every=%d, eval_every=%d",
+        config.mil_steps,
+        config.log_every,
+        config.eval_every,
+    )
     model.train()
     while mil_steps_completed < config.mil_steps and not early_stopped:
         for batch in train_loader:
@@ -416,6 +446,19 @@ def run_jaguar_mil_training(config_path: str | Path) -> MILTrainResult:
                                 },
                                 step=mil_steps_completed,
                             )
+                            if accelerator.is_main_process:
+                                logger.info(
+                                    "[Step %d/%d] loss=%.4f cls_loss=%.4f reg_loss=%.4f "
+                                    "grad_norm=%.4f lr=%.2e skipped=%d",
+                                    mil_steps_completed,
+                                    config.mil_steps,
+                                    train_loss_sum / denom,
+                                    train_cls_loss_sum / denom,
+                                    train_reg_loss_sum / denom,
+                                    grad_norm_value,
+                                    scheduler.get_last_lr()[0],
+                                    skipped_steps,
+                                )
                             train_loss_sum = 0.0
                             train_cls_loss_sum = 0.0
                             train_reg_loss_sum = 0.0
@@ -449,6 +492,13 @@ def run_jaguar_mil_training(config_path: str | Path) -> MILTrainResult:
                                 patience_counter = 0
                             elif eval_metrics:
                                 patience_counter += 1
+                                if accelerator.is_main_process:
+                                    logger.info(
+                                        "No improvement at step %d (patience %d/%s).",
+                                        mil_steps_completed,
+                                        patience_counter,
+                                        config.patience if config.patience is not None else "inf",
+                                    )
 
                             current_hav = eval_metrics.get("haversine_km_median", float("nan"))
                             plateau_detected = 0.0
@@ -469,6 +519,13 @@ def run_jaguar_mil_training(config_path: str | Path) -> MILTrainResult:
                             )
 
                             if config.patience is not None and patience_counter >= config.patience:
+                                if accelerator.is_main_process:
+                                    logger.info(
+                                        "Early stopping triggered at step %d after %d eval cycles "
+                                        "without improvement.",
+                                        mil_steps_completed,
+                                        patience_counter,
+                                    )
                                 early_stopped = True
                                 break
 
@@ -489,6 +546,12 @@ def run_jaguar_mil_training(config_path: str | Path) -> MILTrainResult:
             if early_stopped:
                 break
 
+    logger.info(
+        "MIL training complete: steps=%d best_haversine_km=%.2f best_macro_f1=%.4f",
+        mil_steps_completed,
+        best_eval_haversine_km if best_eval_haversine_km is not None else float("nan"),
+        best_eval_macro_f1 if best_eval_macro_f1 is not None else float("nan"),
+    )
     accelerator.end_training()
     return MILTrainResult(
         fold_index=int(config.fold_index),
