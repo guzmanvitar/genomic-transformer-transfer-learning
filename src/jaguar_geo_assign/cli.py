@@ -95,6 +95,17 @@ def build_parser() -> argparse.ArgumentParser:
         help="Path to the MIL fine-tuning TOML config.",
     )
 
+    genotype_finetune = subparsers.add_parser(
+        "genotype-finetune",
+        help="Train genotype MLP with VES-based transfer learning (Option A).",
+    )
+    genotype_finetune.add_argument(
+        "--config",
+        type=Path,
+        required=True,
+        help="Path to the genotype fine-tuning TOML config.",
+    )
+
     extract_embeddings = subparsers.add_parser(
         "extract-embeddings",
         help="Materialize frozen DNABERT-2 embeddings for jaguar fine-tune windows.",
@@ -318,6 +329,17 @@ def main(argv: Sequence[str] | None = None) -> int:
             load_mil_finetune_config(args.config)
             result = run_jaguar_mil_training(args.config)
             print(format_mil_train_result(result))
+        except (RuntimeError, ValueError) as error:
+            print(str(error))
+            return 1
+        return 0
+
+    if args.command == "genotype-finetune":
+        from .fine_tune.genotype_trainer import format_genotype_train_result, run_genotype_training
+
+        try:
+            result = run_genotype_training(args.config)
+            print(format_genotype_train_result(result))
         except (RuntimeError, ValueError) as error:
             print(str(error))
             return 1
