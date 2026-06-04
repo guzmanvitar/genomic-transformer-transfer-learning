@@ -1,0 +1,54 @@
+# Jaguar Genotype MLP Fine-tuning Configuration
+#
+# This config trains a Locator/GeoGenIE-style MLP on genotype matrices
+# with DNABERT-2 Variant Effect Scoring (VES) for transfer-learning-guided
+# SNP selection. The genotype matrix encodes allele counts (0/1/2) directly
+# from the VCF — no DNABERT-2 embeddings involved at training time.
+
+[training]
+# Required paths.
+vcf_path = "data/raw/jaguar.57samples.allChr.snps.hardFilter.bi.maf.ld.masked.hwe.recode.vcf"
+reference_fasta = "data/raw/felid_foundation/reference/DNAZOO_Panthera_onca_HiC.fna.gz"
+metadata_csv = "data/raw/jaguar_location.csv"
+backbone_path = "models/foundation_felid/best/hf_model"
+output_dir = "models/jaguar_genotype"
+
+# Genotype matrix caching (built once, reused across experiments).
+genotype_cache_dir = "data/processed/genotype_matrix"
+
+# VES configuration.
+compute_ves = true
+ves_batch_size = 128
+
+# VES integration mode: "weighted", "selection", or "none".
+# "selection" keeps the top-K loci ranked by |VES|.
+ves_mode = "selection"
+ves_top_k = 3500
+
+# Model architecture (defaults; overridden by Optuna when use_optuna=true).
+n_biomes = 5
+n_hidden_layers = 2
+hidden_dim = 256
+dropout = 0.2
+
+# Training (defaults; overridden by Optuna when use_optuna=true).
+max_epochs = 500
+learning_rate = 0.001
+weight_decay = 0.01
+coord_loss_weight = 1.0
+cls_loss_weight = 1.0
+huber_delta = 1.0
+
+# Cross-validation.
+cv_strategy = "loocv"
+n_folds = 5
+seed = 42
+
+# Hyperparameter optimization.
+use_optuna = true
+optuna_n_trials = 100
+optuna_study_name = "jaguar_genotype_ves"
+
+# Runtime.
+device = "auto"
+tensorboard_subdir = "tensorboard"
