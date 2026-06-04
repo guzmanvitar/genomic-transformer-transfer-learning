@@ -9,6 +9,7 @@ dependencies = [
     "beartype>=0.22.9",
     "einops>=0.8.2",
     "jaxtyping>=0.3.9",
+    "optuna>=4.9.0",
     "pyarrow>=16,<20",
     "scikit-learn>=1.8.0",
     "tensorboard>=2.20.0",
