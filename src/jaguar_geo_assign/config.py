@@ -1585,3 +1585,191 @@ def load_mil_finetune_config(path: str | Path) -> MILFinetuneConfig:
         dropout=dropout,
         patience=patience,
     )
+
+
+@dataclass(frozen=True)
+class GenotypeFinetuneConfig:
+    """Configuration for genotype MLP training with VES-based transfer learning.
+
+    This config drives the VCF -> genotype matrix -> DNABERT-2
+    variant effect scoring -> Locator/GeoGenIE-style MLP with LOOCV evaluation
+    pipeline.
+
+    Attributes:
+        vcf_path: Path to the jaguar VCF file (biallelic SNPs).
+        reference_fasta: Path to the DNA Zoo jaguar reference FASTA.
+        metadata_csv: Jaguar metadata CSV (sample_id, individual_id, biome, lat, lon).
+        backbone_path: Path to the felid-pretrained DNABERT-2 checkpoint.
+        output_dir: Root directory for results, checkpoints, and logs.
+        genotype_cache_dir: Directory for caching the genotype matrix on disk.
+        compute_ves: Whether to compute VES scores (requires backbone + FASTA).
+        ves_batch_size: Batch size for VES forward passes through DNABERT-2.
+        ves_mode: VES integration strategy: ``"weighted"``, ``"selection"``,
+            or ``"none"``.
+        ves_top_k: Number of top loci to retain in ``"selection"`` mode.
+        n_biomes: Number of biome classes.
+        n_hidden_layers: MLP hidden layer count (overridden by Optuna).
+        hidden_dim: MLP hidden layer width (overridden by Optuna).
+        dropout: Dropout probability (overridden by Optuna).
+        max_epochs: Maximum training epochs per LOOCV fold.
+        learning_rate: AdamW learning rate.
+        weight_decay: AdamW weight decay.
+        coord_loss_weight: Weight on Huber coordinate loss.
+        cls_loss_weight: Weight on cross-entropy biome loss.
+        cv_strategy: Cross-validation strategy: ``"loocv"`` or
+            ``"stratified_kfold"``.
+        n_folds: Fold count when ``cv_strategy`` is ``"stratified_kfold"``.
+        seed: Random seed for reproducibility.
+        optuna_n_trials: Number of Optuna trials.
+        optuna_study_name: Optuna study name.
+        device: Compute device: ``"auto"``, ``"cuda"``, or ``"cpu"``.
+        tensorboard_subdir: Subdirectory under ``output_dir`` for tracker files.
+    """
+
+    vcf_path: Path
+    reference_fasta: Path
+    metadata_csv: Path
+    backbone_path: Path
+    output_dir: Path
+    genotype_cache_dir: Path | None = None
+    compute_ves: bool = True
+    ves_batch_size: int = 128
+    ves_mode: str = "selection"
+    ves_top_k: int | None = 459
+    n_biomes: int = 5
+    n_hidden_layers: int = 2
+    hidden_dim: int = 256
+    dropout: float = 0.2
+    max_epochs: int = 500
+    learning_rate: float = 1e-3
+    weight_decay: float = 0.01
+    coord_loss_weight: float = 1.0
+    cls_loss_weight: float = 1.0
+    cv_strategy: str = "loocv"
+    n_folds: int = 5
+    seed: int = 42
+    optuna_n_trials: int = 100
+    optuna_study_name: str = "jaguar_genotype_ves"
+    device: str = "auto"
+    tensorboard_subdir: str = "tensorboard"
+
+
+def load_genotype_finetune_config(path: str | Path) -> GenotypeFinetuneConfig:
+    """Load and validate a genotype fine-tuning TOML config.
+
+    Raises:
+        ValueError: If required fields are missing or contract checks fail.
+    """
+
+    raw = tomllib.loads(Path(path).read_text(encoding="utf-8"))
+    try:
+        training = raw["training"]
+
+        vcf_path = Path(training["vcf_path"])
+        reference_fasta = Path(training["reference_fasta"])
+        metadata_csv = Path(training["metadata_csv"])
+        backbone_path = Path(training["backbone_path"])
+        output_dir = Path(training["output_dir"])
+
+        genotype_cache_raw = training.get("genotype_cache_dir")
+        genotype_cache_dir = Path(genotype_cache_raw) if genotype_cache_raw is not None else None
+
+        compute_ves = training.get("compute_ves", True)
+        if type(compute_ves) is not bool:
+            raise ValueError("training.compute_ves must be a TOML boolean (true/false)")
+        ves_batch_size = int(training.get("ves_batch_size", 128))
+        ves_mode = str(training.get("ves_mode", "selection"))
+        ves_top_k_raw = training.get("ves_top_k")
+        ves_top_k = int(ves_top_k_raw) if ves_top_k_raw is not None else None
+
+        n_biomes = int(training.get("n_biomes", 5))
+        n_hidden_layers = int(training.get("n_hidden_layers", 2))
+        hidden_dim = int(training.get("hidden_dim", 256))
+        dropout = float(training.get("dropout", 0.2))
+        max_epochs = int(training.get("max_epochs", 500))
+        learning_rate = float(training.get("learning_rate", 1e-3))
+        weight_decay = float(training.get("weight_decay", 0.01))
+        coord_loss_weight = float(training.get("coord_loss_weight", 1.0))
+        cls_loss_weight = float(training.get("cls_loss_weight", 1.0))
+
+        cv_strategy = str(training.get("cv_strategy", "loocv"))
+        n_folds = int(training.get("n_folds", 5))
+        seed = int(training.get("seed", 42))
+
+        optuna_n_trials = int(training.get("optuna_n_trials", 100))
+        optuna_study_name = str(training.get("optuna_study_name", "jaguar_genotype_ves"))
+
+        device = str(training.get("device", "auto"))
+        tensorboard_subdir = str(training.get("tensorboard_subdir", "tensorboard"))
+
+        if ves_batch_size <= 0:
+            raise ValueError("training.ves_batch_size must be positive")
+        if ves_mode not in ("weighted", "selection", "none"):
+            raise ValueError(
+                f"training.ves_mode must be 'weighted', 'selection', or 'none'; got {ves_mode!r}"
+            )
+        if ves_mode == "selection" and ves_top_k is not None and ves_top_k <= 0:
+            raise ValueError("training.ves_top_k must be positive when ves_mode is 'selection'")
+        if not 1 <= n_biomes <= 5:
+            raise ValueError("training.n_biomes must be between 1 and 5 inclusive")
+        if n_hidden_layers <= 0:
+            raise ValueError("training.n_hidden_layers must be positive")
+        if hidden_dim <= 0:
+            raise ValueError("training.hidden_dim must be positive")
+        if not 0.0 <= dropout < 1.0:
+            raise ValueError("training.dropout must be in [0, 1)")
+        if max_epochs <= 0:
+            raise ValueError("training.max_epochs must be positive")
+        if learning_rate <= 0.0:
+            raise ValueError("training.learning_rate must be positive")
+        if weight_decay < 0.0:
+            raise ValueError("training.weight_decay must be non-negative")
+        if coord_loss_weight <= 0.0:
+            raise ValueError("training.coord_loss_weight must be positive")
+        if cls_loss_weight <= 0.0:
+            raise ValueError("training.cls_loss_weight must be positive")
+        if cv_strategy not in ("loocv", "stratified_kfold"):
+            raise ValueError(
+                f"training.cv_strategy must be 'loocv' or 'stratified_kfold'; got {cv_strategy!r}"
+            )
+        if cv_strategy == "stratified_kfold" and n_folds < 2:
+            raise ValueError("training.n_folds must be >= 2 for stratified_kfold")
+        if optuna_n_trials <= 0:
+            raise ValueError("training.optuna_n_trials must be positive")
+        if device not in ("auto", "cuda", "cpu"):
+            raise ValueError(f"training.device must be 'auto', 'cuda', or 'cpu'; got {device!r}")
+        if not tensorboard_subdir:
+            raise ValueError("training.tensorboard_subdir must be non-empty")
+
+    except KeyError as exc:
+        msg = f"Genotype fine-tune config is missing required field: {exc.args[0]}"
+        raise ValueError(msg) from exc
+
+    return GenotypeFinetuneConfig(
+        vcf_path=vcf_path,
+        reference_fasta=reference_fasta,
+        metadata_csv=metadata_csv,
+        backbone_path=backbone_path,
+        output_dir=output_dir,
+        genotype_cache_dir=genotype_cache_dir,
+        compute_ves=compute_ves,
+        ves_batch_size=ves_batch_size,
+        ves_mode=ves_mode,
+        ves_top_k=ves_top_k,
+        n_biomes=n_biomes,
+        n_hidden_layers=n_hidden_layers,
+        hidden_dim=hidden_dim,
+        dropout=dropout,
+        max_epochs=max_epochs,
+        learning_rate=learning_rate,
+        weight_decay=weight_decay,
+        coord_loss_weight=coord_loss_weight,
+        cls_loss_weight=cls_loss_weight,
+        cv_strategy=cv_strategy,
+        n_folds=n_folds,
+        seed=seed,
+        optuna_n_trials=optuna_n_trials,
+        optuna_study_name=optuna_study_name,
+        device=device,
+        tensorboard_subdir=tensorboard_subdir,
+    )

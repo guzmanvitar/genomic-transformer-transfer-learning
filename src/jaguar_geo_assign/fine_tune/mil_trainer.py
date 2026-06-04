@@ -1,6 +1,17 @@
 # ruff: noqa: F722  # jaxtyping shape annotations use string-based dimensions
 """Single-phase MIL fine-tuning on offline jaguar embedding bags.
 
+.. deprecated::
+    This module implements the DNABERT-2 embedding + positional MIL approach,
+    which produces results indistinguishable from a random baseline for
+    geographic assignment (macro_f1 stuck at 0.0857, haversine barely
+    improves). See ``dev_docs/pipeline_diagnosis_and_plan.md`` for the full
+    root-cause analysis.
+
+    The module is preserved as reference code and for the E5 negative-result
+    comparison experiment. For production geographic assignment, use the
+    genotype MLP pipeline (``genotype_trainer.py``).
+
 This module keeps the original per-window MTL trainer intact as a rollback path
 while introducing a dedicated full-bag trainer that consumes the offline
 embedding shards and the positional MIL model.
@@ -213,6 +224,46 @@ def _run_mil_evaluation(
         n_biomes=config.n_biomes,
     )
     mean_eval_loss = eval_total_loss / max(eval_steps, 1) if eval_steps > 0 else float("nan")
+
+    # --- Diagnostic logging (Issue 10 fix) ---
+    diag_log: dict[str, float] = {}
+    if all_cls.numel() > 0:
+        pred_classes = all_cls.argmax(dim=1).cpu()
+        for biome_idx, biome_name in enumerate(BIOME_CLASSES[: config.n_biomes]):
+            count = int((pred_classes == biome_idx).sum().item())
+            diag_log[f"diag/pred_count_{biome_name}"] = float(count)
+
+    if all_cls.numel() > 0 and all_coord_pred.numel() > 0:
+        for biome_idx, biome_name in enumerate(BIOME_CLASSES[: config.n_biomes]):
+            mask = all_biome.cpu() == biome_idx
+            if mask.sum() > 0:
+                biome_pred = all_coord_pred[mask].cpu()
+                biome_tgt = all_coord_tgt[mask].cpu()
+                biome_pred_deg = torch.stack(
+                    [
+                        biome_pred[:, 0] * coord_stats.lat_std + coord_stats.lat_mean,
+                        biome_pred[:, 1] * coord_stats.lon_std + coord_stats.lon_mean,
+                    ],
+                    dim=-1,
+                )
+                biome_tgt_deg = torch.stack(
+                    [
+                        biome_tgt[:, 0] * coord_stats.lat_std + coord_stats.lat_mean,
+                        biome_tgt[:, 1] * coord_stats.lon_std + coord_stats.lon_mean,
+                    ],
+                    dim=-1,
+                )
+                from jaguar_geo_assign.fine_tune.trainer import haversine_distance_km
+
+                biome_hav = haversine_distance_km(biome_pred_deg, biome_tgt_deg)
+                diag_log[f"diag/haversine_{biome_name}"] = float(biome_hav.median().item())
+
+    if all_coord_pred.shape[0] > 1:
+        pooled_norms = torch.nn.functional.normalize(all_coord_pred.cpu().float(), dim=1)
+        cos_sim = (pooled_norms @ pooled_norms.T).fill_diagonal_(0.0)
+        n_pairs = all_coord_pred.shape[0] * (all_coord_pred.shape[0] - 1)
+        diag_log["diag/coord_pred_cos_sim_mean"] = float(cos_sim.sum().item() / max(n_pairs, 1))
+
     accelerator.log(
         {
             "eval/total_loss": mean_eval_loss,
@@ -222,6 +273,7 @@ def _run_mil_evaluation(
             "eval/mae_lon_deg": metrics["mae_lon_deg"],
             "eval/haversine_km_mean": metrics["haversine_km_mean"],
             "eval/haversine_km_median": metrics["haversine_km_median"],
+            **diag_log,
         },
         step=global_step,
     )

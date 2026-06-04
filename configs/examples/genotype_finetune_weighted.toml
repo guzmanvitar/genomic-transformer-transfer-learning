@@ -1,0 +1,36 @@
+# Jaguar Genotype MLP Fine-tuning Configuration — VES-weighted mode
+#
+# Uses all ~83k loci, with each genotype value multiplied by |VES| so that
+# functionally constrained positions contribute more. Compared to "selection"
+# mode which discards ~80k loci entirely.
+
+[training]
+# Required paths.
+vcf_path = "data/raw/jaguar.57samples.allChr.snps.hardFilter.bi.maf.ld.masked.hwe.recode.vcf"
+reference_fasta = "data/raw/felid_foundation/reference/DNAZOO_Panthera_onca_HiC.fna.gz"
+metadata_csv = "data/raw/jaguar_location.csv"
+backbone_path = "models/foundation_felid/best/hf_model"
+output_dir = "models/jaguar_genotype_weighted"
+
+# Genotype matrix caching (shared with selection run).
+genotype_cache_dir = "data/processed/genotype_matrix"
+
+# VES configuration.
+compute_ves = true
+ves_batch_size = 128
+
+# VES integration mode: all loci retained, weighted by |VES|.
+ves_mode = "weighted"
+
+# Cross-validation.
+cv_strategy = "loocv"
+n_folds = 5
+seed = 42
+
+# Hyperparameter optimization.
+optuna_n_trials = 100
+optuna_study_name = "jaguar_genotype_ves_weighted"
+
+# Runtime.
+device = "auto"
+tensorboard_subdir = "tensorboard"

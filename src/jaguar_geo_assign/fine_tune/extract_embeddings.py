@@ -1,5 +1,16 @@
 """Offline DNABERT-2 embedding extraction for jaguar MIL training.
 
+.. deprecated::
+    This module produces per-window CLS embeddings consumed by the MIL
+    pipeline (``mil_trainer.py``), which was found to produce results
+    indistinguishable from a random baseline for geographic assignment.
+    See ``dev_docs/pipeline_diagnosis_and_plan.md`` for the root-cause
+    analysis.
+
+    The module is preserved for the E5 comparison experiment and as
+    reference code. The ``_load_tokenizer`` and ``_disable_flash_attention``
+    helpers are still imported by ``variant_scoring.py`` for VES computation.
+
 This module freezes a pretrained DNABERT-2 backbone, encodes all window
 sequences for each jaguar individual, and writes per-individual embedding
 shards to disk. The output contract is intentionally simple and torch-native:
