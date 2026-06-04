@@ -1621,7 +1621,6 @@ class GenotypeFinetuneConfig:
             ``"stratified_kfold"``.
         n_folds: Fold count when ``cv_strategy`` is ``"stratified_kfold"``.
         seed: Random seed for reproducibility.
-        use_optuna: Whether to run Optuna hyperparameter optimization.
         optuna_n_trials: Number of Optuna trials.
         optuna_study_name: Optuna study name.
         device: Compute device: ``"auto"``, ``"cuda"``, or ``"cpu"``.
@@ -1651,7 +1650,6 @@ class GenotypeFinetuneConfig:
     cv_strategy: str = "loocv"
     n_folds: int = 5
     seed: int = 42
-    use_optuna: bool = True
     optuna_n_trials: int = 100
     optuna_study_name: str = "jaguar_genotype_ves"
     device: str = "auto"
@@ -1701,9 +1699,6 @@ def load_genotype_finetune_config(path: str | Path) -> GenotypeFinetuneConfig:
         n_folds = int(training.get("n_folds", 5))
         seed = int(training.get("seed", 42))
 
-        use_optuna = training.get("use_optuna", True)
-        if type(use_optuna) is not bool:
-            raise ValueError("training.use_optuna must be a TOML boolean (true/false)")
         optuna_n_trials = int(training.get("optuna_n_trials", 100))
         optuna_study_name = str(training.get("optuna_study_name", "jaguar_genotype_ves"))
 
@@ -1779,7 +1774,6 @@ def load_genotype_finetune_config(path: str | Path) -> GenotypeFinetuneConfig:
         cv_strategy=cv_strategy,
         n_folds=n_folds,
         seed=seed,
-        use_optuna=use_optuna,
         optuna_n_trials=optuna_n_trials,
         optuna_study_name=optuna_study_name,
         device=device,
