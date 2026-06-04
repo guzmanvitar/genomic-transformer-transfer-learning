@@ -1616,7 +1616,6 @@ class GenotypeFinetuneConfig:
         weight_decay: AdamW weight decay.
         coord_loss_weight: Weight on Huber coordinate loss.
         cls_loss_weight: Weight on cross-entropy biome loss.
-        huber_delta: Huber loss delta parameter.
         cv_strategy: Cross-validation strategy: ``"loocv"`` or
             ``"stratified_kfold"``.
         n_folds: Fold count when ``cv_strategy`` is ``"stratified_kfold"``.
@@ -1646,7 +1645,6 @@ class GenotypeFinetuneConfig:
     weight_decay: float = 0.01
     coord_loss_weight: float = 1.0
     cls_loss_weight: float = 1.0
-    huber_delta: float = 1.0
     cv_strategy: str = "loocv"
     n_folds: int = 5
     seed: int = 42
@@ -1693,7 +1691,6 @@ def load_genotype_finetune_config(path: str | Path) -> GenotypeFinetuneConfig:
         weight_decay = float(training.get("weight_decay", 0.01))
         coord_loss_weight = float(training.get("coord_loss_weight", 1.0))
         cls_loss_weight = float(training.get("cls_loss_weight", 1.0))
-        huber_delta = float(training.get("huber_delta", 1.0))
 
         cv_strategy = str(training.get("cv_strategy", "loocv"))
         n_folds = int(training.get("n_folds", 5))
@@ -1731,8 +1728,6 @@ def load_genotype_finetune_config(path: str | Path) -> GenotypeFinetuneConfig:
             raise ValueError("training.coord_loss_weight must be positive")
         if cls_loss_weight <= 0.0:
             raise ValueError("training.cls_loss_weight must be positive")
-        if huber_delta <= 0.0:
-            raise ValueError("training.huber_delta must be positive")
         if cv_strategy not in ("loocv", "stratified_kfold"):
             raise ValueError(
                 f"training.cv_strategy must be 'loocv' or 'stratified_kfold'; got {cv_strategy!r}"
@@ -1770,7 +1765,6 @@ def load_genotype_finetune_config(path: str | Path) -> GenotypeFinetuneConfig:
         weight_decay=weight_decay,
         coord_loss_weight=coord_loss_weight,
         cls_loss_weight=cls_loss_weight,
-        huber_delta=huber_delta,
         cv_strategy=cv_strategy,
         n_folds=n_folds,
         seed=seed,
