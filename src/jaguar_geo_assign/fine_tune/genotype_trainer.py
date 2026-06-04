@@ -872,8 +872,9 @@ def run_genotype_training(config_path: str | Path) -> GenotypeTrainResult:
     )
 
     # Ensemble: average predictions from the top-K trials.
-    ensemble_k = min(5, len(study.trials))
-    top_trials = sorted(study.trials, key=lambda t: t.value)[:ensemble_k]
+    completed_trials = [t for t in study.trials if t.value is not None]
+    ensemble_k = min(5, len(completed_trials))
+    top_trials = sorted(completed_trials, key=lambda t: t.value)[:ensemble_k]
     top_trial_dirs = [output_dir / f"trial_{t.number:04d}" for t in top_trials]
 
     ensemble_result = _build_ensemble_predictions(
