@@ -1,8 +1,8 @@
 # Jaguar Geographic Assignment via DNABERT-2 Transfer Learning
 
-A two-stage transfer-learning pipeline for geographic assignment of jaguars (*Panthera onca*) from whole-genome sequencing data. The system pre-trains DNABERT-2 on multi-species felid reference genomes, then freezes the backbone, materializes offline window embeddings, and trains a positional gated-attention MIL model that predicts geographic coordinates and biome-population labels from full per-individual bags.
+A transfer-learning pipeline for geographic assignment of jaguars (*Panthera onca*) from whole-genome sequencing data. The system pre-trains DNABERT-2 on multi-species felid reference genomes, uses the pre-trained model to score variant functional importance (Variant Effect Scoring), then trains a genotype-matrix-based MLP that predicts geographic coordinates and biome labels from allele counts weighted by those scores.
 
-This work addresses a core challenge in conservation genomics: endangered species that most need precise forensic tools have the least genetic data available for model development. By pre-training on abundant felid genomic resources and transferring that knowledge to jaguar-specific tasks, the pipeline can extract informative geographic signal from limited sample sizes across fragmented populations in Brazilian biomes.
+This work addresses a core challenge in conservation genomics: endangered species that most need precise forensic tools have the least genetic data available for model development. By using felid-pretrained DNABERT-2 to identify functionally constrained SNPs — a label-free alternative to FST-based marker selection — the pipeline transfers cross-species genomic knowledge into a geographic assignment model that works with just 55 jaguar samples.
 
 ---
 
@@ -11,18 +11,20 @@ This work addresses a core challenge in conservation genomics: endangered specie
 1. [Research Context](#research-context)
 2. [Methodology Overview](#methodology-overview)
    - [Stage 1: Felid Foundation Pre-training](#stage-1-felid-foundation-pre-training)
-   - [Stage 2: Jaguar Positional MIL Fine-tuning](#stage-2-jaguar-positional-mil-fine-tuning)
+   - [Stage 2: Variant Effect Scoring](#stage-2-variant-effect-scoring)
+   - [Stage 3: Genotype MLP Training](#stage-3-genotype-mlp-training)
 3. [Data Decisions](#data-decisions)
    - [Pre-training Corpus: Species Selection and Rationale](#pre-training-corpus-species-selection-and-rationale)
    - [Sequence Windowing and Tokenization](#sequence-windowing-and-tokenization)
    - [Locus-Safe Train/Validation Splitting](#locus-safe-trainvalidation-splitting)
-   - [Jaguar Variant Processing](#jaguar-variant-processing)
-   - [Coordinate Normalization and Full-Bag Sampling](#coordinate-normalization-and-full-bag-sampling)
+   - [Genotype Matrix Construction](#genotype-matrix-construction)
+   - [Variant Effect Scoring](#variant-effect-scoring)
+   - [Coordinate Normalization](#coordinate-normalization)
 4. [Modeling Decisions](#modeling-decisions)
    - [Foundation Model Selection: DNABERT-2](#foundation-model-selection-dnabert-2)
    - [Pre-training Objective and Hyperparameters](#pre-training-objective-and-hyperparameters)
-   - [Positional Gated Attention MIL Architecture](#positional-gated-attention-mil-architecture)
-   - [Offline Extraction and MIL Training Schedule](#offline-extraction-and-mil-training-schedule)
+   - [Genotype MLP Architecture](#genotype-mlp-architecture)
+   - [VES Integration Strategies](#ves-integration-strategies)
    - [Loss Functions and Task Weighting](#loss-functions-and-task-weighting)
    - [Evaluation Metrics](#evaluation-metrics)
 5. [Reproducibility and Integrity Guarantees](#reproducibility-and-integrity-guarantees)
@@ -32,9 +34,7 @@ This work addresses a core challenge in conservation genomics: endangered specie
    - [Step 2: Build the Tokenized Corpus](#step-2-build-the-tokenized-corpus)
    - [Step 3: Run Foundation Pre-training](#step-3-run-foundation-pre-training)
    - [Step 4: Acquire Jaguar Raw Data](#step-4-acquire-jaguar-raw-data)
-   - [Step 5: Prepare Jaguar Fine-tuning Data](#step-5-prepare-jaguar-fine-tuning-data)
-   - [Step 6: Extract Offline Embeddings](#step-6-extract-offline-embeddings)
-   - [Step 7: Run Positional MIL Fine-tuning](#step-7-run-positional-mil-fine-tuning)
+   - [Step 5: Train the Genotype MLP](#step-5-train-the-genotype-mlp)
 8. [Repository Layout](#repository-layout)
 9. [Development](#development)
 
@@ -46,13 +46,19 @@ The jaguar occupies approximately 46% of its historical range, with an estimated
 
 Traditional approaches to geographic assignment (SCAT, SPASIBA, STRUCTURE, KLFDAPC) require substantial sample sizes per population and either produce only coarse population-level assignments or demand dense spatial sampling for continuous predictions. Machine learning methods such as Locator (Battey et al., 2020) achieve high-resolution continuous geographic assignment via deep neural networks, but still require large training datasets.
 
-This project applies transfer learning to overcome the data scarcity challenge. A DNABERT-2 genomic language model is pre-trained from scratch on six felid reference assemblies to learn the general "grammar" of felid DNA, then transferred to jaguar whole-genome variants from five Brazilian biomes (Amazon, Atlantic Forest, Caatinga, Cerrado, Pantanal) through offline embedding extraction plus full-bag MIL training. The transfer-learning approach enables the extraction of informative multi-locus geographic signal from limited sample sizes across fragmented populations.
+This project addresses a deeper challenge: not just data scarcity, but the feature-to-sample ratio. With 55 individuals and ~83,000 candidate SNPs, training on all loci produces ~1,500 features per individual — too sparse for any classifier. The standard alternative, FST-based locus selection, estimates allele frequency differences between populations — but with only 5–18 individuals per biome, these estimates have high sampling variance, and the selected loci may partly reflect noise rather than true geographic signal.
+
+A DNABERT-2 genomic language model is pre-trained on six felid reference assemblies to learn the genomic grammar conserved across ~10 million years of felid evolution. This model is then used to score each of the 83k jaguar SNPs: positions where the alternate allele is biologically "surprising" in the felid context are more likely to be under functional constraint — and consequently more likely to carry biome-specific selective signal.
+
+Because the constraint signal is derived from cross-species evolutionary history rather than from the small jaguar sample itself, VES-based selection does not degrade with small population sizes. Selecting the top ~3,000–3,500 loci by this score reduces the feature space to a size the available data can support. The resulting genotype matrix is then used to train a Locator/GeoGenIE-style MLP that predicts geographic coordinates and biome labels from 55 individuals across five Brazilian biomes.
+
+Beyond jaguar-specific geographic assignment, the felid foundation model is a reusable asset: the same pretrained checkpoint can compute VES scores for any felid species with a VCF, enabling label-free locus selection for other small-sample conservation genomics studies across the Felidae family.
 
 ## Methodology Overview
 
 ### Stage 1: Felid Foundation Pre-training
 
-The first stage builds a multi-species felid genomic corpus and trains DNABERT-2 via continued masked language modeling (MLM). This stage operates exclusively on reference assembly FASTA files and does not involve any VCF processing.
+The first stage builds a multi-species felid genomic corpus and trains DNABERT-2 via continued masked language modeling (MLM). This stage operates exclusively on reference assembly FASTA files.
 
 **Pipeline flow:**
 
@@ -61,25 +67,41 @@ The first stage builds a multi-species felid genomic corpus and trains DNABERT-2
 3. **Run continued pre-training** — Load the tokenized corpus and train DNABERT-2 with masked language modeling.
 
 **Key outputs:**
-- `data/raw/felid_foundation/reference/` — Downloaded FASTAs
-- `data/processed/felid_foundation_pretrain/felid_foundation_tokens/` — Tokenized Parquet corpus
-- `artifacts/felid_foundation_pretrain/felid_foundation_pretrain_run_summary.json` — Corpus summary
 - `models/foundation_felid/best/` — Best checkpoint (lowest validation loss)
 
-### Stage 2: Jaguar Positional MIL Fine-tuning
+### Stage 2: Variant Effect Scoring
 
-The jaguar stage freezes DNABERT-2, extracts offline embeddings, and trains a full-bag Positional Gated Attention MIL model over approximately 84,000 windows per individual so geographic assignment is learned from distributed multi-locus signal across the genome.
+The second stage uses the felid-pretrained DNABERT-2 to compute a functional importance score for each SNP in the jaguar VCF. This is the transfer learning mechanism — cross-species genomic context informs which variants are in constrained vs. neutral regions.
 
-**Pipeline flow:**
+**Algorithm:** For each biallelic SNP locus:
 
-1. **Extract jaguar windows** — Produce 512 bp locus-centered `FinetuneWindow` records from the VCF.
-2. **Run `extract-embeddings`** — Encode every window with the frozen DNABERT-2 backbone and write one `.pt` shard per individual plus a manifest.
-3. **Run `mil-finetune`** — Train the positional MIL aggregator and downstream coordinate/biome heads on the full per-individual bags.
+1. Extract a 512 bp window centered on the locus from the reference FASTA
+2. Tokenize and mask the center token (the variant position)
+3. Forward pass through the frozen DNABERT-2 backbone (using `AutoModelForMaskedLM`)
+4. Extract predicted probabilities for the reference and alternate alleles
+5. Compute: `VES = log P(alt | context) - log P(ref | context)`
+
+**Interpretation:**
+- **VES ≈ 0:** Both alleles equally likely — unconstrained region, probably neutral
+- **VES << 0:** Alternate allele is very surprising — constrained region, variant likely under purifying selection
+- **VES >> 0:** Alternate is more expected than reference — possibly the reference carries the derived allele
+
+**Key output:**
+- `ves_scores.pt` — One scalar per SNP locus (~83k scores)
+
+### Stage 3: Genotype MLP Training
+
+The third stage trains a Locator/GeoGenIE-style MLP on the genotype matrix (individuals × loci, values 0/1/2), filtered or weighted by VES scores.
+
+**Input representation:** A dense genotype matrix is constructed directly from the VCF. All genotypes are retained — including homozygous reference (0/0), which carries critical population-level information (the absence of a variant is as diagnostic as its presence).
+
+**Architecture:** BatchNorm → [Linear → ELU → Dropout] × L → dual-head output (2 coordinates + 5 biome logits).
+
+**Evaluation:** Leave-one-out cross-validation (55 folds) with optional Optuna Bayesian hyperparameter optimization.
 
 **Key outputs:**
-- `data/processed/finetune/windows.jsonl` — Per-locus 512 bp windows with allele annotations
-- `data/processed/finetune/embeddings/` — Per-individual embedding shards, `manifest.jsonl`, and `contig_rank.json`
-- `models/jaguar_mil/best/` — Best MIL checkpoint, coordinate normalization stats, and eval metrics
+- `models/jaguar_genotype/predictions.json` — Per-individual coordinate predictions and biome classifications
+- `models/jaguar_genotype/best_hyperparams.json` — Optuna best trial parameters (if used)
 
 ---
 
@@ -87,7 +109,7 @@ The jaguar stage freezes DNABERT-2, extracts offline embeddings, and trains a fu
 
 ### Pre-training Corpus: Species Selection and Rationale
 
-The foundation corpus uses six felid reference assemblies spanning four genera across the Felidae family. The selection maximizes phylogenetic coverage within Felidae while focusing on species with high-quality publicly available reference genomes:
+The foundation corpus uses six felid reference assemblies spanning four genera across the Felidae family:
 
 | Species | Common Name | Assembly | Source |
 |---------|-------------|----------|--------|
@@ -98,65 +120,52 @@ The foundation corpus uses six felid reference assemblies spanning four genera a
 | *Puma concolor* | Puma | PumCon1.0 | NCBI RefSeq (GCF_003327715.1) |
 | *Panthera pardus* | Leopard | PanPar1.0 | NCBI RefSeq (GCF_001857705.1) |
 
-Including the jaguar reference itself in the pre-training corpus ensures the model sees the target species' genome-wide context before fine-tuning. The domestic cat (*Felis catus*) provides the best-annotated felid genome. The three other *Panthera* species (lion, tiger, leopard) represent the closest phylogenetic relatives to the jaguar. Puma adds an outgroup within the Felidae family.
-
-The species list is closed and pinned in code. Adding a species requires a code and test change, preventing the foundation corpus from becoming an untracked mixture.
+The species list is closed and pinned in code. Adding a species requires a code and test change.
 
 ### Sequence Windowing and Tokenization
 
-**Windowing parameters:**
-
 | Parameter | Value | Rationale |
 |-----------|-------|-----------|
-| Context window | 512 bp | Matches DNABERT-2's maximum position embedding length, maximizing the sequence context visible to the model per forward pass |
-| Window overlap | 128 bp | Stride of 384 bp provides sufficient coverage of boundary regions while controlling corpus size |
-| Max ambiguous fraction | 5% | Windows with more than 5% N bases are discarded; these carry minimal informative signal and introduce noise |
-| Short sequence filter | Enabled | Sequences shorter than 512 bp are dropped to ensure uniform window dimensions |
+| Context window | 512 bp | Matches DNABERT-2's maximum position embedding length |
+| Window overlap | 128 bp | Stride of 384 bp provides coverage of boundary regions while controlling corpus size |
+| Max ambiguous fraction | 5% | Windows with >5% N bases carry minimal informative signal |
+| Locus block size | 50 kb | Exceeds autocorrelation length of most local genomic features; ensures split safety |
 
-**Locus block alignment:** Before windowing, each contig is partitioned into 50 kb (50,000 bp) blocks. Windows are then aligned within blocks, ensuring that no window ever spans a block boundary. This is critical for split safety — the train/validation split operates at the block level, so block alignment guarantees that overlapping windows from adjacent genomic positions land in the same split. The 50 kb block size is chosen to exceed the autocorrelation length of most local genomic features (GC content, repeat elements, recombination rate), ensuring that windows near the boundary of a training block and windows near the boundary of an adjacent validation block are separated by enough genomic distance to be statistically independent. A smaller block size would create frequent split boundaries where nearly identical genomic contexts appear in both splits, inflating validation performance.
-
-**Tokenization:** Sequences are tokenized using the DNABERT-2 BPE tokenizer (`zhihan1996/DNABERT-2-117M`), pinned to a specific Git revision for exact reproducibility. The BPE scheme reduces redundancy compared to fixed k-mer tokenization, producing more compact representations while naturally handling variable motif lengths. The allowed alphabet is strictly {A, C, G, T, N}; sequences containing out-of-alphabet symbols are rejected.
+Tokenization uses the DNABERT-2 BPE tokenizer (`zhihan1996/DNABERT-2-117M`), pinned to a specific Git revision for exact reproducibility. Allowed alphabet: {A, C, G, T, N}.
 
 ### Locus-Safe Train/Validation Splitting
 
-A locus-block-based splitting strategy prevents data leakage between train and validation sets. Because overlapping windows from nearby genomic positions share most of their sequence content, a naive random split would leak training signal into evaluation.
+Each 50 kb genomic block is assigned deterministically to train (80%) or validation (20%) via SHA-256 hash of its locus identifier. All windows within a block inherit its split assignment, preventing data leakage from overlapping windows.
 
-**Strategy:** Each 50 kb genomic block is assigned deterministically to either train (80%) or validation (20%) via a SHA-256 hash of its locus identifier (`contig:block_start-block_end`). All windows within a block inherit its split assignment. This ensures:
+### Genotype Matrix Construction
 
-- No window in the validation set overlaps with any training window.
-- The split is deterministic across runs (same locus identifiers always hash to the same split).
-- The evaluation target is "unseen loci" — the validation set tests the model's ability to generalize to novel genomic regions, not memorize training regions.
+The genotype matrix is built directly from the VCF, representing each individual as a vector of allele counts at all biallelic SNP loci:
 
-### Jaguar Variant Processing
+| Genotype | Encoding | Meaning |
+|----------|----------|---------|
+| 0/0 | 0 | Homozygous reference — retained (critical for population-level comparisons) |
+| 0/1 | 1 | Heterozygous |
+| 1/1 | 2 | Homozygous alternate |
+| ./. | -1 | Missing data (imputed per-fold using training allele frequencies) |
 
-Jaguar fine-tuning data is derived from VCF files aligned to the DNA Zoo *Panthera onca* HiC assembly. The window extraction module produces 512 bp locus-centered windows around each variant site:
+**VCF filtering:** Only PASS or "." filter-status records are retained. Multi-allelic sites, indels, and spanning deletions are excluded. REF and ALT must each be a single nucleotide in {A, C, G, T}.
 
-**Window geometry:**
-- 256 bp upstream + 1 bp center locus + 255 bp downstream = 512 bp total
-- Windows that would extend beyond contig boundaries are discarded (no padding)
+**Missing data imputation:** For each locus with missing data, the alternate allele frequency is computed from the training fold's non-missing individuals. Two Bernoulli draws at that frequency are summed to produce the imputed genotype (0, 1, or 2). This matches Locator's imputation contract and prevents data leakage across folds.
 
-**VCF filtering:**
-- Only PASS or "." filter-status records are retained.
-- Multi-allelic sites, indels, and spanning deletions are excluded; only biallelic single-nucleotide substitutions are processed.
-- The nucleotide alphabet is restricted to {A, C, G, T, N} — IUPAC ambiguity codes are rejected.
+**Output:** `Int8Tensor` of shape `(n_individuals, n_loci)` — 55 rows × ~83,000 columns.
 
-**Genotype handling:**
-- **Homozygous reference (0/0):** Dropped entirely. These loci carry no allelic signal relative to the reference and would dilute the training corpus.
-- **Homozygous alternate (1/1):** One window emitted with the alternate allele placed at the center position.
-- **Heterozygous (0/1):** Doubled into two windows — one with the reference allele and one with the alternate allele at the center. Both carry an `is_heterozygous` flag. This design preserves both haplotype contributions rather than losing the locus to ambiguity masking.
+### Variant Effect Scoring
 
-**Reference validation:** The pipeline enforces that the FASTA reference matches the DNA Zoo jaguar assembly by checking for positive contig tokens (`HiC_scaffold_1`, `Panthera_onca_HiC`) and rejecting NCBI-specific tokens (`NC_083295.1`, `GCF_028533385.1`) that indicate a RefSeq repackaging with altered contig names. Every VCF REF allele is verified against the actual FASTA base at that position.
+VES scores are computed once and cached. The computation requires:
+- The felid-pretrained DNABERT-2 checkpoint (from Stage 1)
+- The DNA Zoo jaguar reference FASTA
+- The locus list from the genotype matrix (contig, position, ref/alt alleles)
 
-### Coordinate Normalization and Full-Bag Sampling
+The scoring uses `AutoModelForMaskedLM` (not `AutoModel`) to access the MLM logits head. The center token is identified via the tokenizer's offset mapping, masked, and the log-likelihood ratio between alternate and reference alleles is computed from the softmax output.
 
-**Coordinate normalization:** Latitude and longitude targets are z-score normalized using per-individual mean and standard deviation computed from the training split. Normalization is fit at the individual level because the MIL trainer consumes one full bag per jaguar, not a stream of independent windows. Standard deviations are clamped to a minimum of 1e-6 to guard against division by zero. Normalization parameters are serialized to JSON alongside the best checkpoint for inference-time denormalization.
+### Coordinate Normalization
 
-**Full-bag sampling:** Each training example is one individual's entire embedding bag (approximately 84,000 windows) loaded from a pre-extracted shard. The DataLoader therefore runs with `batch_size=1`, and gradient accumulation simulates a larger effective batch without breaking the full-bag contract. This avoids the signal collapse observed when the old pipeline treated windows as independent samples.
-
-**Cross-validation:** `StratifiedGroupKFold` from scikit-learn stratifies on biome-population label and groups by individual identity. This guarantees:
-- All biomes are represented in every fold.
-- No individual appears in both training and evaluation within the same fold.
-- Each biome must have at least `n_folds` unique individuals (validated at construction time).
+Latitude and longitude are z-score normalized per LOOCV fold using statistics from the training individuals only. Standard deviations are clamped to 1e-6. Normalization parameters are saved alongside predictions for denormalization.
 
 ---
 
@@ -164,14 +173,12 @@ Jaguar fine-tuning data is derived from VCF files aligned to the DNA Zoo *Panthe
 
 ### Foundation Model Selection: DNABERT-2
 
-DNABERT-2 (Zhou et al., 2024) is a transformer-based genomic language model with 117M parameters, designed for multi-species genome understanding. It was selected for several architectural features:
+DNABERT-2 (Zhou et al., 2024) is a 117M-parameter transformer-based genomic language model. Key architectural features:
 
-- **Byte-pair encoding (BPE) tokenization** over traditional fixed k-mer approaches, reducing vocabulary redundancy and enabling more compact sequence representations.
-- **Attention with Linear Biases (ALiBi)** for positional encoding, which allows the model to extrapolate to sequence lengths beyond those seen during training, unlike learned positional embeddings.
-- **Flash Attention** integration for memory-efficient and computationally fast self-attention computation.
-- **Multi-species pre-training capability**, making it suitable for learning generalizable genomic patterns from the felid foundation corpus.
-
-The tokenizer and model are pinned to a specific HuggingFace revision (`7bce263b15377fc15361f52cfab88f8b586abda0`) to ensure exact reproducibility.
+- **Byte-pair encoding (BPE) tokenization** over fixed k-mer approaches
+- **Attention with Linear Biases (ALiBi)** for positional encoding
+- **Flash Attention** for memory-efficient self-attention
+- Pinned to HuggingFace revision `7bce263b15377fc15361f52cfab88f8b586abda0`
 
 ### Pre-training Objective and Hyperparameters
 
@@ -199,93 +206,71 @@ The foundation model is trained with **masked language modeling (MLM)**: 15% of 
 
 **Pad token handling:** DNABERT-2 ships without an explicit pad token. A three-tier fallback assigns a pad token: (1) reuse `eos_token` if available (preferred), (2) reuse `unk_token`, (3) inject a new `[PAD]` token and resize embeddings.
 
-### Positional Gated Attention MIL Architecture
+### Genotype MLP Architecture
 
-The primary jaguar model no longer predicts from one window at a time. Instead, it consumes a full per-individual bag of frozen DNABERT-2 embeddings and aggregates them with positional gated attention:
+The geographic assignment model is a GeoGenIE-style MLP operating on genotype vectors:
 
 ```
-Frozen DNABERT-2 window embeddings (~84k loci / jaguar)
-  + continuous sinusoidal base-pair positional encoding
-  → gated attention MIL aggregator (tanh gate ⊙ sigmoid gate)
-  → weighted full-bag pooling
-  → coordinate regression head + biome classification head
+Input: genotype vector (n_loci,) values in {0, 1, 2}
+  → VES-based locus selection (top-K by |VES|)
+  → BatchNorm1d
+  → [Linear → ELU → Dropout] × L hidden layers
+  → Coordinate head: Linear(hidden_dim, 2) → (lat_z, lon_z)
+  → Biome head: Linear(hidden_dim, 5) → logits
 ```
 
-**Why MIL:** The MIL aggregator sees all loci jointly, which matches the biological reality that population structure emerges from distributed multi-locus patterns.
+**Overparameterization guard (from GeoGenIE):** If `hidden_dim > n_input_features × 10`, the width is reduced by 20% recursively until compliant.
 
-**Positional conditioning:** Each window embedding is augmented with a continuous 1D sinusoidal encoding derived from its absolute base-pair position. This gives the attention mechanism genomic context without unfreezing or modifying the DNABERT-2 backbone.
+**Hyperparameter optimization:** Optuna (TPE sampler) tunes architecture and training hyperparameters. Each trial runs full LOOCV (55 folds), minimizing median Haversine distance. Default budget: 100 trials.
 
-**Head design:** The MIL aggregator produces one pooled bag representation per jaguar. The existing coordinate regression head and biome classification head are then reused unchanged on top of that pooled representation, so the objective remains joint regression + classification while the upstream architecture operates on full per-individual bags.
+### VES Integration Strategies
 
-**Biome classes:** The five target biomes are alphabetically sorted for determinism: Amazon, Atlantic Forest, Caatinga, Cerrado, Pantanal. Any sample with an unrecognized biome label is rejected at dataset construction time.
+Three modes, controlled by config (`ves_mode`):
 
-### Offline Extraction and MIL Training Schedule
+| Mode | Transform | Use case |
+|------|-----------|----------|
+| `"selection"` | Keep top-K loci by \|VES\| | Transfer-learning-guided marker selection — no population labels needed |
+| `"weighted"` | Multiply genotypes × \|VES\| | Constrained loci contribute more to the input signal |
+| `"none"` | Raw genotype vector | Control experiment (no transfer learning) |
 
-The jaguar path now uses two operational stages instead of a frozen-then-unfreeze backbone schedule:
-
-**Stage A — `extract-embeddings`:**
-- Load the pretrained DNABERT-2 checkpoint in eval mode and freeze all backbone parameters.
-- Encode every jaguar window once and materialize float32 embeddings to disk.
-- Store base-pair positions and contig metadata beside each per-individual shard.
-- Purpose: prevent catastrophic forgetting and keep VRAM bounded before any full-bag learning starts.
-
-**Stage B — `mil-finetune`:**
-- Load one full embedding bag per individual from the offline shards.
-- Train a single-phase positional MIL model with locus dropout regularization and O(N) bag aggregation.
-- Optimize only the MIL module plus the coordinate/biome heads; the DNABERT-2 backbone remains offline and frozen throughout.
-
-The MIL trainer still uses AdamW, cosine decay with linear warmup, patience-based early stopping on median Haversine distance, and optional evaluation capping via `eval_max_steps`.
+The default configuration uses `"selection"` mode.
 
 ### Loss Functions and Task Weighting
 
-The MIL training loss is a weighted sum of classification and regression components:
-
 ```
-total_loss = cls_loss_weight × CrossEntropy(biome_logits, biome_label)
-           + reg_loss_weight × Huber(pred_coords, target_coords)
+total_loss = coord_loss_weight × Huber(pred_coords, target_coords)
+           + cls_loss_weight × CrossEntropy(biome_logits, biome_label)
 ```
 
-| Component | Function | Default Weight | Rationale |
-|-----------|----------|----------------|-----------|
-| Regression | Huber loss (delta=1.0) | 1.0 | The primary task and research contribution; more robust than MSE to outlier mispredictions — Huber transitions from L2 to L1 behavior beyond delta, limiting the influence of large geographic errors |
-| Classification | Cross-entropy | 0.1 | Serves primarily as an auxiliary regularizer that encourages the shared backbone to learn population-structure-aware representations, indirectly benefiting regression |
+| Component | Function | Default Weight |
+|-----------|----------|----------------|
+| Regression | Huber loss (delta=1.0) | 1.0 |
+| Classification | Cross-entropy | 1.0 |
 
-The 1:10 weighting (regression-dominant) reflects two observations: (1) continuous geographic assignment is the hard task and the novel contribution of this work — it needs the majority of gradient budget from step 1; (2) biome classification saturates early, and a high classification weight would spend gradient budget sharpening already-correct logits rather than reducing geographic error. At 0.1 weight the classification head still converges to high accuracy, while the regression head receives first-class optimization throughout training. Both losses are computed in float32 regardless of mixed-precision settings to ensure numerical stability, and both operate on the pooled bag representation produced by the MIL aggregator rather than a single-window backbone output.
-
-**Gradient management:**
-- Gradient accumulation: 4 steps by default (effective batch size = per_device_batch × 4 × world_size).
-- Gradient clipping: max L2 norm of 1.0.
-- NaN/Inf guards: Steps with non-finite losses or gradients are skipped and counted as anomalies.
+Both tasks are weighted equally by default. Optuna may find a different ratio.
 
 ### Evaluation Metrics
 
-**Classification metrics:**
-- Accuracy: fraction of correctly predicted biome labels.
-- Per-class F1 score for each of the five biomes.
-- Macro F1: unweighted average of per-class F1 scores.
+**Classification:** Accuracy, per-class F1, macro F1.
 
-**Regression metrics:**
-- Mean absolute error (MAE) in degrees for latitude and longitude separately.
-- **Haversine distance (km):** Great-circle distance between predicted and true coordinates, computed via the standard Haversine formula with explicit float32 promotion and epsilon-clamping for numerical stability. Earth radius: 6,371 km.
-- **Median Haversine distance:** Primary checkpoint selection metric. A lower median Haversine distance triggers a best-checkpoint save. When Haversine distance is tied, macro F1 serves as tie-breaker.
+**Regression:** MAE in degrees (lat/lon), Haversine distance (km) — both mean and median. Median Haversine is the primary metric for Optuna optimization and checkpoint selection.
 
-**Baseline comparisons:**
-- Biome baseline: majority-class prediction from the training split.
-- Coordinate baseline: zero vector in normalized space (the training mean), representing a naive "predict the centroid" strategy.
+**Diagnostics (logged per evaluation):**
+- Per-class prediction counts (detects classification head collapse)
+- Per-individual haversine error (full audit trail)
+- Per-biome haversine breakdown
+- Feature importance (gradient-based, post-training)
 
 ---
 
 ## Reproducibility and Integrity Guarantees
 
-The pipeline enforces several reproducibility invariants:
-
-- **Immutable tokenizer pinning:** The DNABERT-2 tokenizer is locked to a specific Git commit hash. Any model trained with this pipeline uses identical tokenization.
-- **Checksum-verified downloads:** All reference assemblies and jaguar raw data files are verified with pinned SHA-256 checksums. Idempotent — second invocations skip already-verified files.
-- **Atomic checkpoint writes:** All checkpoints use temporary files with atomic rename to prevent corruption from mid-write crashes. DDP-safe: rank-0 performs writes with failure broadcasting to prevent deadlocks.
-- **Deterministic split assignment:** SHA-256 hashes of locus identifiers produce identical train/validation splits across runs.
-- **Contig collision detection:** The corpus builder aborts if two species share contig names, preventing silent locus-identifier aliasing.
-- **Frozen configuration:** All config dataclasses are immutable after loading. Validation contracts enforce parameter ranges and cross-field consistency at construction time.
-- **Sequence integrity:** SHA-256 hashes of processed windows are stored alongside tokenized outputs in the Parquet corpus for post-hoc auditing.
+- **Immutable tokenizer pinning:** DNABERT-2 tokenizer locked to a specific Git commit hash.
+- **Checksum-verified downloads:** All assemblies and jaguar raw data verified with pinned SHA-256 checksums.
+- **Atomic checkpoint writes:** Temporary files with atomic rename prevent corruption from mid-write crashes.
+- **Deterministic split assignment:** SHA-256 hashes of locus identifiers produce identical splits across runs.
+- **Frozen configuration:** All config dataclasses are immutable after loading.
+- **Sequence integrity:** SHA-256 hashes of processed windows stored for post-hoc auditing.
 
 ---
 
@@ -295,6 +280,7 @@ The pipeline enforces several reproducibility invariants:
 
 - Python >=3.11, <3.12
 - `uv` package manager
+- Optional: `optuna` for hyperparameter optimization
 
 ### Setup
 
@@ -317,129 +303,73 @@ The pipeline enforces several reproducibility invariants:
 Download the six approved felid reference FASTAs with integrity verification:
 
 ```bash
-# Validate the foundation config first
 uv run python -m jaguar_geo_assign.cli validate-felid-foundation-config \
   configs/examples/felid_foundation_pretrain.toml
 
-# Download assemblies (idempotent — skips already-verified files)
 uv run python -m jaguar_geo_assign.cli acquire-felid-foundation-assemblies \
   configs/examples/felid_foundation_pretrain.toml
 ```
-
-This downloads ~3 GB of compressed FASTA files to `data/raw/felid_foundation/reference/`. Each file is checksummed against pinned values on download.
 
 ### Step 2: Build the Tokenized Corpus
 
 Construct the windowed, tokenized Parquet corpus from the reference assemblies:
 
 ```bash
-# Optional: preview the configuration
-uv run python -m jaguar_geo_assign.cli describe-felid-foundation-config \
-  configs/examples/felid_foundation_pretrain.toml
-
-# Build the corpus
 uv run python -m jaguar_geo_assign.cli felid-foundation-pretrain \
   configs/examples/felid_foundation_pretrain.toml
 ```
-
-Species are processed sequentially to keep peak memory bounded by the single largest assembly. Output is written to `data/processed/felid_foundation_pretrain/felid_foundation_tokens/` as Parquet files partitioned by split, contig, and block ID.
 
 ### Step 3: Run Foundation Pre-training
 
 Train DNABERT-2 with masked language modeling on the felid corpus:
 
 ```bash
-# Edit configs/examples/felid_foundation_train.toml to set corpus_metadata_path to the
-# metadata.json written by Step 2. Its absolute path follows directly from processed_dir
-# in felid_foundation_pretrain.toml:
-#   corpus_metadata_path = "<repo_root>/data/processed/felid_foundation_pretrain/felid_foundation_tokens/metadata.json"
-
-# Single-GPU training
+# Single-GPU
 uv run python -m jaguar_geo_assign.cli train-felid-foundation \
   --config configs/examples/felid_foundation_train.toml
 
-# Multi-GPU training (example: 8 GPUs)
+# Multi-GPU (example: 8 GPUs)
 uv run accelerate launch --multi_gpu --num_processes 8 \
   -m jaguar_geo_assign.cli train-felid-foundation \
   --config configs/examples/felid_foundation_train.toml
-
-# Quick integration test (verifies forward pass, optimizer step, checkpoint round-trip)
-uv run python -m jaguar_geo_assign.cli train-felid-foundation \
-  --config configs/examples/felid_foundation_train.toml --integration-test
 ```
 
-Training outputs are saved to `models/foundation_felid/`. The best checkpoint (lowest validation MLM loss) is saved under `best/`, with the full HuggingFace model in `best/hf_model/` and tokenizer in `best/tokenizer/`. TensorBoard logs are written to the `tensorboard/` subdirectory.
-
-Training resumes automatically from the latest checkpoint if one exists.
+Best checkpoint is saved to `models/foundation_felid/best/hf_model/`.
 
 ### Step 4: Acquire Jaguar Raw Data
 
-Download the jaguar VCF and location CSV. Both files are hosted on HuggingFace as public datasets and can be fetched without credentials:
+Download the jaguar VCF and location CSV:
 
 ```bash
 uv run python -m jaguar_geo_assign.cli acquire-jaguar-raw-data
 ```
 
-This downloads to `data/raw/` by default:
-- `jaguar.57samples.allChr.snps.hardFilter.bi.maf.ld.masked.hwe.recode.vcf` (147 MB) — hard-filtered, MAF/LD/HWE-cleaned SNPs for 57 jaguar samples; originally published on DataDryad (doi:10.5061/dryad.4tmpg4fkm, CC0)
-- `jaguar_location.csv` — sample metadata with columns: `sample_id`, `individual_id`, `latitude`, `longitude`, `biome_population_label`
+Downloads to `data/raw/`:
+- `jaguar.57samples.allChr.snps.hardFilter.bi.maf.ld.masked.hwe.recode.vcf` (147 MB) — 57 jaguar samples, biallelic SNPs
+- `jaguar_location.csv` — sample metadata (sample_id, individual_id, latitude, longitude, biome_population_label)
 
-Both files are SHA-256 verified on download. Pass `--output-dir` to change the destination.
+### Step 5: Train the Genotype MLP
 
-### Step 5: Prepare Jaguar Fine-tuning Data
-
-Extract 512 bp locus-centered windows from jaguar VCF files. This step requires both files from Step 4 and the DNA Zoo *Panthera onca* HiC reference FASTA from Step 1:
+This single command handles genotype matrix construction, VES scoring, and MLP training with LOOCV:
 
 ```bash
-uv run python -m jaguar_geo_assign.cli extract-finetune-windows \
-  --reference-fasta data/raw/felid_foundation/reference/DNAZOO_Panthera_onca_HiC.fna.gz \
-  --vcf data/raw/jaguar.57samples.allChr.snps.hardFilter.bi.maf.ld.masked.hwe.recode.vcf \
-  --metadata-csv data/raw/jaguar_location.csv \
-  --output-jsonl data/processed/finetune/windows.jsonl
+uv run python -m jaguar_geo_assign.cli genotype-finetune \
+  --config configs/examples/genotype_finetune.toml
 ```
 
-The window extraction produces a JSONL file of `FinetuneWindow` records. Each record contains the 512 bp sequence, allele annotations, genotype, and genomic coordinates.
+**What happens under the hood:**
 
-### Step 6: Extract Offline Embeddings
+1. **Genotype matrix** is built from the VCF (cached to `genotype_cache_dir` for reuse)
+2. **VES scores** are computed using the felid-pretrained backbone (cached alongside the genotype matrix)
+3. **Top-K SNPs by |VES|** are selected (transfer-learning-guided marker selection)
+4. **Optuna** runs 100 trials, each performing full 55-fold LOOCV, minimizing median Haversine distance
+5. **Ensemble** averages predictions from the top-5 trials for reduced variance
+6. Final predictions, metrics, and best hyperparameters are saved to `output_dir`
 
-```bash
-uv run python -m jaguar_geo_assign.cli extract-embeddings \
-  --config configs/examples/embedding_extraction.toml
-```
-
-This stage freezes the pretrained DNABERT-2 checkpoint, encodes every jaguar window once, and writes per-individual embedding shards for downstream MIL training.
-
-The extraction config is defined in `EmbeddingExtractionConfig` and minimally requires:
-
-```toml
-[extraction]
-backbone_path = "models/foundation_felid/best/hf_model"
-windows_jsonl = "data/processed/finetune/windows.jsonl"
-metadata_csv  = "data/raw/jaguar_location.csv"
-output_dir    = "data/processed/finetune/embeddings"
-```
-
-Outputs include one `{individual_id}.pt` shard per jaguar plus `manifest.jsonl` and `contig_rank.json`. This keeps the DNABERT-2 backbone out of the full-bag training loop and preserves the pretrained representation.
-
-### Step 7: Run Positional MIL Fine-tuning
-
-```bash
-uv run python -m jaguar_geo_assign.cli mil-finetune \
-  --config configs/examples/mil_finetune.toml
-```
-
-The MIL trainer loads the offline shards, applies positional gated attention over each full bag, and predicts both coordinates and biome labels from the pooled bag embedding.
-
-The `MILFinetuneConfig` TOML minimally requires:
-
-```toml
-[training]
-embeddings_dir = "data/processed/finetune/embeddings"
-metadata_csv   = "data/raw/jaguar_location.csv"
-output_dir     = "models/jaguar_mil"
-```
-
-`mil-finetune` trains on complete bags of approximately 84,000 windows, uses locus dropout as bag-level regularization, and selects the best checkpoint by median Haversine distance with macro F1 as tie-breaker.
+**Outputs:**
+- `predictions.json` — all 57 per-individual predictions with true/predicted coordinates, haversine errors, and biome classifications
+- `best_hyperparams.json` — the Optuna-selected hyperparameter configuration
+- `tensorboard/` — training curves for all trials
 
 ---
 
@@ -447,15 +377,15 @@ output_dir     = "models/jaguar_mil"
 
 ```
 src/jaguar_geo_assign/
-├── cli.py                          # Top-level CLI entry points
+├── cli.py                          # CLI entry points
 ├── config.py                       # Typed config loaders and contract enforcement
 ├── data/
 │   ├── felid_assemblies.py         # Approved felid assembly registry (6 species)
 │   ├── felid_acquisition.py        # Assembly download with checksum verification
-│   ├── jaguar_raw_data.py          # Jaguar VCF + location CSV registry with pinned SHA-256
-│   ├── jaguar_raw_acquisition.py   # Jaguar raw data download with checksum verification
+│   ├── jaguar_raw_data.py          # Jaguar VCF + location CSV registry
+│   ├── jaguar_raw_acquisition.py   # Jaguar raw data download
 │   ├── finetune_windows.py         # Jaguar VCF → 512 bp locus-centered windows
-│   ├── consensus.py                # VCF parsing helpers shared with fine-tuning
+│   ├── consensus.py                # VCF parsing helpers
 │   ├── preprocessor.py             # Core preprocessing pipeline
 │   ├── tokenized_corpus_reader.py  # Parquet corpus reader for training
 │   ├── acquisition.py              # Download primitives with retry/checksum
@@ -466,27 +396,25 @@ src/jaguar_geo_assign/
 │   ├── foundation_training.py        # DNABERT-2 continued MLM pre-training
 │   └── _shared.py                    # Cross-pipeline helpers
 ├── fine_tune/
-│   ├── extract_embeddings.py       # Offline DNABERT-2 embedding materialization
-│   ├── mil_dataset.py              # Per-individual bag dataset for embedding shards
-│   ├── mil_trainer.py              # Positional MIL training loop over full bags
-│   ├── model.py                    # Shared coordinate/biome heads
-│   ├── positional_mil.py           # Continuous positional encoding + gated attention MIL
-│   └── dataset.py                  # Jaguar training data helpers and shared constants
-├── baselines/                      # Baseline evaluation constants
-├── evaluation/                     # Evaluation module (scaffold)
-└── reporting/                      # Report generation (scaffold)
+│   ├── genotype_dataset.py         # VCF → genotype matrix (0/1/2) construction
+│   ├── variant_scoring.py          # DNABERT-2 masked prediction → VES scores
+│   ├── genotype_model.py           # Genotype MLP architecture + VES helpers
+│   ├── genotype_trainer.py         # LOOCV + Optuna training loop
+│   ├── model.py                    # Shared coordinate/biome head definitions
+│   ├── trainer.py                  # Shared loss/metric helpers
+│   └── dataset.py                  # Shared data constants (BIOME_CLASSES, CoordStats)
 
 configs/examples/
 ├── felid_foundation_pretrain.toml  # Corpus construction configuration
 ├── felid_foundation_train.toml     # Foundation training hyperparameters
-├── fine_tune.toml                  # Fine-tuning experiment bootstrap config
-├── embedding_extraction.toml       # Offline jaguar embedding extraction config
-├── mil_finetune.toml               # Positional MIL fine-tuning config
-└── regression_transfer.toml        # Full transfer-learning pipeline config
+├── genotype_finetune.toml          # Genotype MLP + VES training config
+└── fine_tune.toml                  # Fine-tuning experiment bootstrap config
 
-tests/
-├── test_*.py                       # Unit tests for all modules
-└── integration/                    # End-to-end integration tests
+design-logs/
+└── option-a-ves-genotype-architecture.md  # Full architecture specification
+
+dev_docs/
+└── pipeline_diagnosis_and_plan.md  # Root-cause analysis of MIL pipeline failure
 ```
 
 ---
@@ -496,10 +424,10 @@ tests/
 ### Running Tests
 
 ```bash
-# Unit tests only (default, excludes integration tests)
+# Unit tests only (default)
 uv run pytest
 
-# Include integration tests (requires network access to NCBI and HuggingFace)
+# Include integration tests (requires network access)
 uv run pytest -m integration
 ```
 
@@ -513,8 +441,9 @@ The project uses `ruff` for linting and formatting (target: Python 3.11, line le
 |---------|---------|
 | torch | Deep learning framework |
 | transformers | DNABERT-2 model and tokenizer loading |
-| accelerate | Distributed training, mixed precision, gradient accumulation |
+| accelerate | Distributed training, mixed precision |
 | pyarrow | Parquet corpus I/O |
 | scikit-learn | StratifiedGroupKFold cross-validation |
 | tensorboard | Training metrics visualization |
 | beartype + jaxtyping | Runtime type and shape checking |
+| optuna | Hyperparameter optimization (optional) |
