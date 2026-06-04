@@ -28,6 +28,7 @@ from torch import Tensor
 from torch.optim import AdamW
 from transformers import get_cosine_schedule_with_warmup
 
+from jaguar_geo_assign.config import load_genotype_finetune_config
 from jaguar_geo_assign.fine_tune.dataset import BIOME_CLASSES, CoordStats, _fit_coord_stats
 from jaguar_geo_assign.fine_tune.genotype_dataset import (
     GenotypeMatrixResult,
@@ -328,38 +329,20 @@ def run_loocv(
         ves_mode,
     )
 
-    # Step 1: Apply VES integration to the raw genotype matrix.
-    genotypes_f32_raw = geno_result.genotypes.float()
-
+    # Step 1: Validate VES mode and resolve effective_top_k.
+    # The actual VES integration (weighting or selection) is applied per-fold
+    # after imputation to avoid data leakage.
+    effective_top_k: int | None = None
     if ves_mode == "weighted":
         if ves_scores is None:
             raise ValueError("ves_mode='weighted' requires ves_scores to be provided")
-        genotypes_for_ves = genotypes_f32_raw.clone()
-        # Replace missing values (-1) with 0 temporarily for VES weighting;
-        # actual imputation is done per-fold below.
-        genotypes_for_ves[genotypes_for_ves < 0] = 0.0
-        genotypes_f32_base = apply_ves_weighting(genotypes_for_ves, ves_scores)
-        # Restore missing markers so per-fold imputation can detect them.
-        missing_mask = geno_result.genotypes < 0
-        genotypes_f32_base[missing_mask] = -1.0
-        logger.info("Applied VES weighting to genotype matrix.")
+        logger.info("VES mode: weighted (all %d loci, scaled by |VES|).", n_loci)
     elif ves_mode == "selection":
         if ves_scores is None:
             raise ValueError("ves_mode='selection' requires ves_scores to be provided")
         effective_top_k = ves_top_k if ves_top_k is not None else n_loci
-        genotypes_f32_base, selected_indices = apply_ves_selection(
-            genotypes_f32_raw,
-            ves_scores,
-            effective_top_k,
-        )
-        logger.info(
-            "Applied VES selection: %d -> %d loci (top_k=%d).",
-            n_loci,
-            genotypes_f32_base.shape[1],
-            effective_top_k,
-        )
+        logger.info("VES mode: selection (top %d of %d loci by |VES|).", effective_top_k, n_loci)
     elif ves_mode == "none":
-        genotypes_f32_base = genotypes_f32_raw
         logger.info("VES integration disabled; using raw genotypes.")
     else:
         raise ValueError(
@@ -716,27 +699,12 @@ def run_genotype_training(config_path: str | Path) -> GenotypeTrainResult:
     """Main entry point for genotype MLP training.
 
     Orchestrates the full pipeline:
-    1. Load configuration from TOML file.
+    1. Load and validate configuration via :func:`load_genotype_finetune_config`.
     2. Build or load the genotype matrix.
     3. Compute or load VES scores.
     4. Run Optuna hyperparameter optimization where each trial executes
        a full LOOCV run.
     5. Save final results.
-
-    The TOML config is expected to have a ``[training]`` section with fields
-    matching the hyperparameter dictionary used by :func:`_train_single_fold`,
-    plus pipeline-level settings:
-
-    - ``vcf_path``, ``metadata_csv``: paths for genotype matrix construction.
-    - ``genotype_matrix_dir``: directory for caching the built matrix.
-    - ``ves_scores_path``: base path for cached VES scores (without extension).
-    - ``backbone_path``, ``reference_fasta``: paths for VES computation.
-    - ``ves_mode``: one of ``"weighted"``, ``"selection"``, ``"none"``.
-    - ``ves_top_k``: top-K for selection mode.
-    - ``output_dir``: directory for training outputs.
-    - ``seed``: random seed.
-    - ``device``: ``"auto"``, ``"cuda"``, or ``"cpu"``.
-    - ``optuna_n_trials``: number of Optuna trials.
 
     Args:
         config_path: Path to the TOML configuration file.
@@ -746,22 +714,14 @@ def run_genotype_training(config_path: str | Path) -> GenotypeTrainResult:
 
     Raises:
         FileNotFoundError: If the config file does not exist.
-        ValueError: If required config fields are missing.
+        ValueError: If required config fields are missing or invalid.
     """
-    import tomllib
 
-    config_path = Path(config_path)
-    if not config_path.exists():
-        raise FileNotFoundError(f"Config file not found: {config_path}")
-
-    with open(config_path, "rb") as f:
-        raw_config = tomllib.load(f)
-
-    training_cfg = raw_config.get("training", {})
+    config = load_genotype_finetune_config(config_path)
     logger.info("Loaded genotype training config from %s", config_path)
 
     # Resolve device.
-    device_name = training_cfg.get("device", "auto")
+    device_name = config.device
     if device_name == "auto":
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     elif device_name == "cuda":
@@ -772,60 +732,55 @@ def run_genotype_training(config_path: str | Path) -> GenotypeTrainResult:
         device = torch.device(device_name)
     logger.info("Using device: %s", device)
 
-    seed = int(training_cfg.get("seed", 42))
+    seed = config.seed
     set_seed(seed)
 
-    output_dir = Path(training_cfg.get("output_dir", "genotype_training_output"))
+    output_dir = Path(config.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
     # Step 2: Build or load genotype matrix.
-    genotype_matrix_dir = training_cfg.get("genotype_matrix_dir")
-    if genotype_matrix_dir is not None and Path(genotype_matrix_dir).exists():
-        logger.info("Loading cached genotype matrix from %s", genotype_matrix_dir)
-        geno_result = load_genotype_matrix(genotype_matrix_dir)
+    genotype_cache_dir = config.genotype_cache_dir
+    if genotype_cache_dir is not None and Path(genotype_cache_dir).exists():
+        logger.info("Loading cached genotype matrix from %s", genotype_cache_dir)
+        geno_result = load_genotype_matrix(genotype_cache_dir)
     else:
-        vcf_path = training_cfg.get("vcf_path")
-        metadata_csv = training_cfg.get("metadata_csv")
-        if vcf_path is None or metadata_csv is None:
-            raise ValueError(
-                "Config must specify either 'genotype_matrix_dir' (for cached matrix) "
-                "or both 'vcf_path' and 'metadata_csv' (for building from VCF)."
-            )
-        logger.info("Building genotype matrix from VCF: %s", vcf_path)
-        geno_result = build_genotype_matrix(vcf_path, metadata_csv)
-        if genotype_matrix_dir is not None:
-            save_genotype_matrix(geno_result, genotype_matrix_dir)
-            logger.info("Cached genotype matrix to %s", genotype_matrix_dir)
+        logger.info("Building genotype matrix from VCF: %s", config.vcf_path)
+        geno_result = build_genotype_matrix(config.vcf_path, config.metadata_csv)
+        if genotype_cache_dir is not None:
+            save_genotype_matrix(geno_result, genotype_cache_dir)
+            logger.info("Cached genotype matrix to %s", genotype_cache_dir)
 
     n_individuals = geno_result.genotypes.shape[0]
     n_loci = geno_result.genotypes.shape[1]
     logger.info("Genotype matrix: %d individuals x %d loci", n_individuals, n_loci)
 
     # Step 3: Compute or load VES scores.
-    ves_mode = training_cfg.get("ves_mode", "none")
+    ves_mode = config.ves_mode
     ves_scores: Tensor | None = None
-    ves_top_k: int | None = training_cfg.get("ves_top_k")
+    ves_top_k = config.ves_top_k
 
     if ves_mode != "none":
-        ves_scores_path = training_cfg.get("ves_scores_path")
-        if ves_scores_path is not None and Path(ves_scores_path).with_suffix(".pt").exists():
+        ves_scores_path = (
+            Path(config.genotype_cache_dir) / "ves_scores"
+            if config.genotype_cache_dir is not None
+            else None
+        )
+        if ves_scores_path is not None and ves_scores_path.with_suffix(".pt").exists():
             logger.info("Loading cached VES scores from %s", ves_scores_path)
             ves_result = load_ves_scores(ves_scores_path)
             ves_scores = ves_result.scores
         else:
-            backbone_path = training_cfg.get("backbone_path")
-            reference_fasta = training_cfg.get("reference_fasta")
-            if backbone_path is None or reference_fasta is None:
+            if not config.compute_ves:
                 raise ValueError(
-                    f"ves_mode={ves_mode!r} requires either cached VES scores "
-                    "(ves_scores_path) or both 'backbone_path' and 'reference_fasta' "
-                    "for computing VES from scratch."
+                    f"ves_mode={ves_mode!r} requires VES scores but compute_ves=false "
+                    "and no cached scores found."
                 )
-            logger.info("Computing VES scores from backbone: %s", backbone_path)
+            logger.info("Computing VES scores from backbone: %s", config.backbone_path)
             ves_result = compute_variant_effect_scores(
                 geno_result.locus_info,
-                reference_fasta,
-                backbone_path,
+                config.reference_fasta,
+                config.backbone_path,
+                batch_size=config.ves_batch_size,
                 device=device_name,
             )
             ves_scores = ves_result.scores
@@ -836,7 +791,8 @@ def run_genotype_training(config_path: str | Path) -> GenotypeTrainResult:
     # Step 4: Optuna LOOCV optimization.
     import optuna
 
-    optuna_n_trials = int(training_cfg.get("optuna_n_trials", 50))
+    optuna_n_trials = config.optuna_n_trials
+    optuna_study_name = config.optuna_study_name
     logger.info(
         "Starting Optuna hyperparameter optimization: %d trials",
         optuna_n_trials,
@@ -890,7 +846,7 @@ def run_genotype_training(config_path: str | Path) -> GenotypeTrainResult:
 
     study = optuna.create_study(
         direction="minimize",
-        study_name="genotype_mlp_loocv",
+        study_name=optuna_study_name,
     )
     study.optimize(objective, n_trials=optuna_n_trials)
 
