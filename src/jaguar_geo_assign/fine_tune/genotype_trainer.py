@@ -850,6 +850,13 @@ def run_genotype_training(config_path: str | Path) -> GenotypeTrainResult:
     )
     study.optimize(objective, n_trials=optuna_n_trials)
 
+    completed_trials = [t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE]
+    if not completed_trials:
+        raise RuntimeError(
+            f"All {len(study.trials)} Optuna trials failed. "
+            "Check logs for per-trial errors (CUDA OOM, imputation failures, etc.)."
+        )
+
     logger.info(
         "Optuna optimization complete. Best trial: %d, "
         "best haversine_median=%.1f km, best params=%s",
@@ -864,6 +871,7 @@ def run_genotype_training(config_path: str | Path) -> GenotypeTrainResult:
         "best_value": study.best_trial.value,
         "best_params": study.best_trial.params,
         "n_trials": len(study.trials),
+        "n_completed": len(completed_trials),
     }
     optuna_summary_path = output_dir / "optuna_summary.json"
     optuna_summary_path.write_text(
