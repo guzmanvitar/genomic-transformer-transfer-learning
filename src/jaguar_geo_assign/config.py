@@ -1704,9 +1704,10 @@ def load_genotype_finetune_config(path: str | Path) -> GenotypeFinetuneConfig:
 
         if ves_batch_size <= 0:
             raise ValueError("training.ves_batch_size must be positive")
-        if ves_mode not in ("weighted", "selection", "none"):
+        if ves_mode not in ("weighted", "selection", "none", "learnable"):
             raise ValueError(
-                f"training.ves_mode must be 'weighted', 'selection', or 'none'; got {ves_mode!r}"
+                f"training.ves_mode must be 'weighted', 'selection', 'none', "
+                f"or 'learnable'; got {ves_mode!r}"
             )
         if ves_mode == "selection" and ves_top_k is not None and ves_top_k <= 0:
             raise ValueError("training.ves_top_k must be positive when ves_mode is 'selection'")

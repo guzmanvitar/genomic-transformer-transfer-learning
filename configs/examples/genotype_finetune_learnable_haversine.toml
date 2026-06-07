@@ -1,0 +1,43 @@
+# Jaguar Genotype MLP Fine-tuning — Learnable VES gates + Haversine loss
+#
+# Uses all ~83k loci with learnable per-locus gates initialized from VES
+# scores.  The foundation model provides a prior on locus importance;
+# backprop refines it during training.  Combined with haversine-based
+# coordinate loss for metric-aligned optimization.
+#
+# Biome classification head disabled (cls_loss_weight = 0.0) — biome can
+# be derived post-hoc from predicted coordinates via spatial polygon lookup.
+
+[training]
+# Required paths.
+vcf_path = "data/raw/jaguar.57samples.allChr.snps.hardFilter.bi.maf.ld.masked.hwe.recode.vcf"
+reference_fasta = "data/raw/felid_foundation/reference/DNAZOO_Panthera_onca_HiC.fna.gz"
+metadata_csv = "data/raw/jaguar_location.csv"
+backbone_path = "models/foundation_felid/best/hf_model"
+output_dir = "models/jaguar_genotype_learnable_haversine"
+
+# Genotype matrix caching (shared with other runs).
+genotype_cache_dir = "data/processed/genotype_matrix"
+
+# VES configuration.
+compute_ves = true
+ves_batch_size = 128
+
+# VES integration: learnable per-locus gates initialized from VES scores.
+ves_mode = "learnable"
+
+# Disable biome classification head — coordinate regression only.
+cls_loss_weight = 0.0
+
+# Cross-validation.
+cv_strategy = "loocv"
+n_folds = 5
+seed = 42
+
+# Hyperparameter optimization.
+optuna_n_trials = 100
+optuna_study_name = "jaguar_genotype_learnable_haversine"
+
+# Runtime.
+device = "auto"
+tensorboard_subdir = "tensorboard"
