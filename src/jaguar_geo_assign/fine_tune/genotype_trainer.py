@@ -394,13 +394,6 @@ def run_loocv(
                 ves_scores,
                 effective_top_k,
             )
-        elif ves_mode == "learnable":
-            imputed_raw = impute_missing_genotypes(
-                geno_result.genotypes,
-                train_idx,
-                seed=seed + fold_idx,
-            )
-            fold_genotypes = imputed_raw.float()
         else:
             imputed_raw = impute_missing_genotypes(
                 geno_result.genotypes,
