@@ -1521,8 +1521,8 @@ def load_mil_finetune_config(path: str | Path) -> MILFinetuneConfig:
             raise ValueError("training.n_biomes must be between 1 and 5 inclusive")
         if weight_decay < 0.0:
             raise ValueError("training.weight_decay must be non-negative")
-        if cls_loss_weight <= 0.0:
-            raise ValueError("training.cls_loss_weight must be positive")
+        if cls_loss_weight < 0.0:
+            raise ValueError("training.cls_loss_weight must be non-negative")
         if reg_loss_weight <= 0.0:
             raise ValueError("training.reg_loss_weight must be positive")
         if huber_delta <= 0.0:
@@ -1726,8 +1726,8 @@ def load_genotype_finetune_config(path: str | Path) -> GenotypeFinetuneConfig:
             raise ValueError("training.weight_decay must be non-negative")
         if coord_loss_weight <= 0.0:
             raise ValueError("training.coord_loss_weight must be positive")
-        if cls_loss_weight <= 0.0:
-            raise ValueError("training.cls_loss_weight must be positive")
+        if cls_loss_weight < 0.0:
+            raise ValueError("training.cls_loss_weight must be non-negative")
         if cv_strategy not in ("loocv", "stratified_kfold"):
             raise ValueError(
                 f"training.cv_strategy must be 'loocv' or 'stratified_kfold'; got {cv_strategy!r}"
