@@ -31,7 +31,6 @@ cls_loss_weight = 0.0
 
 # Cross-validation.
 cv_strategy = "loocv"
-n_folds = 5
 seed = 42
 
 # Hyperparameter optimization.

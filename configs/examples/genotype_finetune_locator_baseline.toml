@@ -42,7 +42,6 @@ coord_loss_weight = 1.0
 
 # Cross-validation.
 cv_strategy = "loocv"
-n_folds = 5
 seed = 42
 
 optuna_study_name = "jaguar_locator_baseline"
