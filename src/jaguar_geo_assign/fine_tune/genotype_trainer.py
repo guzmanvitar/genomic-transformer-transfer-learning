@@ -810,7 +810,11 @@ def run_genotype_training(config_path: str | Path) -> GenotypeTrainResult:
             "learning_rate": trial.suggest_float("learning_rate", 1.5e-3, 1.5e-2, log=True),
             "weight_decay": trial.suggest_float("weight_decay", 1e-5, 5e-3, log=True),
             "coord_loss_weight": trial.suggest_float("coord_loss_weight", 0.5, 6.0, log=True),
-            "cls_loss_weight": trial.suggest_float("cls_loss_weight", 0.1, 3.0, log=True),
+            "cls_loss_weight": (
+                0.0
+                if config.cls_loss_weight == 0.0
+                else trial.suggest_float("cls_loss_weight", 0.1, 3.0, log=True)
+            ),
             "max_epochs": trial.suggest_int("max_epochs", 200, 800),
         }
         if ves_mode == "selection":

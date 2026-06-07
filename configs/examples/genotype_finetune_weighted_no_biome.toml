@@ -1,0 +1,43 @@
+# Jaguar Genotype MLP Fine-tuning — VES-weighted, NO biome head (ablation)
+#
+# Identical to genotype_finetune_weighted.toml except cls_loss_weight = 0.0,
+# which disables the biome classification loss entirely. The coordinate
+# regression head receives 100% of the gradient signal.
+#
+# Purpose: ablation to test whether the biome head helps or hurts geographic
+# assignment accuracy. The paper achieves 98% biome accuracy with DAPC; biome
+# can be derived post-hoc from predicted coordinates via spatial polygon lookup.
+
+[training]
+# Required paths (same as weighted config).
+vcf_path = "data/raw/jaguar.57samples.allChr.snps.hardFilter.bi.maf.ld.masked.hwe.recode.vcf"
+reference_fasta = "data/raw/felid_foundation/reference/DNAZOO_Panthera_onca_HiC.fna.gz"
+metadata_csv = "data/raw/jaguar_location.csv"
+backbone_path = "models/foundation_felid/best/hf_model"
+output_dir = "models/jaguar_genotype_weighted_no_biome"
+
+# Genotype matrix caching (shared with other runs).
+genotype_cache_dir = "data/processed/genotype_matrix"
+
+# VES configuration.
+compute_ves = true
+ves_batch_size = 128
+
+# VES integration mode: all loci retained, weighted by |VES|.
+ves_mode = "weighted"
+
+# Disable biome classification head
+cls_loss_weight = 0.0
+
+# Cross-validation.
+cv_strategy = "loocv"
+n_folds = 5
+seed = 42
+
+# Hyperparameter optimization.
+optuna_n_trials = 100
+optuna_study_name = "jaguar_genotype_ves_weighted_no_biome"
+
+# Runtime.
+device = "auto"
+tensorboard_subdir = "tensorboard"
