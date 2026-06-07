@@ -1,6 +1,6 @@
 # Jaguar Geographic Assignment via DNABERT-2 Transfer Learning
 
-A transfer-learning pipeline for geographic assignment of jaguars (*Panthera onca*) from whole-genome sequencing data. The system pre-trains DNABERT-2 on multi-species felid reference genomes, uses the pre-trained model to score variant functional importance (Variant Effect Scoring), then trains a genotype-matrix-based MLP that predicts geographic coordinates and biome labels from allele counts weighted by those scores.
+A transfer-learning pipeline for geographic assignment of jaguars (*Panthera onca*) from whole-genome sequencing data. The system pre-trains DNABERT-2 on multi-species felid reference genomes, uses the pre-trained model to score variant functional importance (Variant Effect Scoring), then trains a genotype-matrix-based MLP with learnable per-locus importance gates — initialized from VES scores and refined by backpropagation — that predicts geographic coordinates from allele counts using a haversine-based loss directly aligned with the evaluation metric.
 
 This work addresses a core challenge in conservation genomics: endangered species that most need precise forensic tools have the least genetic data available for model development. By using felid-pretrained DNABERT-2 to identify functionally constrained SNPs — a label-free alternative to FST-based marker selection — the pipeline transfers cross-species genomic knowledge into a geographic assignment model that works with just 55 jaguar samples.
 
@@ -27,6 +27,7 @@ This work addresses a core challenge in conservation genomics: endangered specie
    - [VES Integration Strategies](#ves-integration-strategies)
    - [Loss Functions and Task Weighting](#loss-functions-and-task-weighting)
    - [Evaluation Metrics](#evaluation-metrics)
+   - [Locator Baseline](#locator-baseline)
 5. [Reproducibility and Integrity Guarantees](#reproducibility-and-integrity-guarantees)
 6. [Installation](#installation)
 7. [Running the Pipeline](#running-the-pipeline)
@@ -91,17 +92,20 @@ The second stage uses the felid-pretrained DNABERT-2 to compute a functional imp
 
 ### Stage 3: Genotype MLP Training
 
-The third stage trains a Locator/GeoGenIE-style MLP on the genotype matrix (individuals × loci, values 0/1/2), filtered or weighted by VES scores.
+The third stage trains a Locator/GeoGenIE-style MLP on the genotype matrix (individuals × loci, values 0/1/2), with VES-guided locus importance from the felid foundation model.
 
 **Input representation:** A dense genotype matrix is constructed directly from the VCF. All genotypes are retained — including homozygous reference (0/0), which carries critical population-level information (the absence of a variant is as diagnostic as its presence).
 
-**Architecture:** BatchNorm → [Linear → ELU → Dropout] × L → dual-head output (2 coordinates + 5 biome logits).
+**Architecture:** Optional learnable locus gate → BatchNorm → [Linear → ELU → Dropout] × L → coordinate head (2 outputs). When using the `"learnable"` VES mode, per-locus sigmoid gates initialized from VES scores modulate the genotype input before the MLP trunk — the foundation model provides a prior on locus importance that backpropagation refines during training.
 
-**Evaluation:** Leave-one-out cross-validation (55 folds) with optional Optuna Bayesian hyperparameter optimization.
+**Loss function:** Differentiable haversine distance. The model predicts coordinates in Z-score normalized space; the loss denormalizes predictions to decimal degrees and computes mean great-circle distance against degree-space targets. This aligns the training objective directly with the evaluation metric.
+
+**Evaluation:** Leave-one-out cross-validation (55 folds) with optional Optuna Bayesian hyperparameter optimization (100 trials default). Fixed-hyperparameter mode (`optuna_n_trials = 0`) is available for controlled baseline comparisons.
 
 **Key outputs:**
-- `models/jaguar_genotype/predictions.json` — Per-individual coordinate predictions and biome classifications
-- `models/jaguar_genotype/best_hyperparams.json` — Optuna best trial parameters (if used)
+- `loocv_predictions.json` — Per-individual coordinate predictions with haversine errors and biome classifications
+- `loocv_summary.json` — Aggregate metrics (haversine median/mean, distance thresholds, per-biome breakdown)
+- `optuna_summary.json` — Best trial parameters (when Optuna is used)
 
 ---
 
@@ -163,9 +167,13 @@ VES scores are computed once and cached. The computation requires:
 
 The scoring uses `AutoModelForMaskedLM` (not `AutoModel`) to access the MLM logits head. The center token is identified via the tokenizer's offset mapping, masked, and the log-likelihood ratio between alternate and reference alleles is computed from the softmax output.
 
-### Coordinate Normalization
+### Coordinate Normalization and Haversine Loss
 
-Latitude and longitude are z-score normalized per LOOCV fold using statistics from the training individuals only. Standard deviations are clamped to 1e-6. Normalization parameters are saved alongside predictions for denormalization.
+The model predicts coordinates in Z-score normalized space: per LOOCV fold, latitude and longitude means and standard deviations are computed from the training individuals only (standard deviations clamped to 1e-6). This centers the model's output range around zero for optimizer-friendly gradients.
+
+The loss function operates in degree space. During training, model predictions are denormalized back to decimal degrees via `pred_deg = pred_z × std + mean`, then the mean haversine (great-circle) distance to degree-space targets is computed. The raw haversine (km) is scaled by 1/1000 (converting to megameters) for gradient stability — this places the coordinate loss on a comparable scale to the cross-entropy classification loss.
+
+This design aligns the training objective with the evaluation metric: the model directly minimizes the geographic distance it is evaluated on, while maintaining numerically stable optimization through Z-score output space. The haversine function naturally accounts for the cos(latitude) factor that makes 1° longitude vary from ~111 km at the equator to ~100 km at latitude -25°, which a Euclidean loss in Z-score space cannot capture.
 
 ---
 
@@ -212,54 +220,83 @@ The geographic assignment model is a GeoGenIE-style MLP operating on genotype ve
 
 ```
 Input: genotype vector (n_loci,) values in {0, 1, 2}
-  → VES-based locus selection (top-K by |VES|)
+  → [Optional] Learnable locus gate: x = genotypes × sigmoid(gate)
   → BatchNorm1d
   → [Linear → ELU → Dropout] × L hidden layers
   → Coordinate head: Linear(hidden_dim, 2) → (lat_z, lon_z)
-  → Biome head: Linear(hidden_dim, 5) → logits
+  → Biome head: Linear(hidden_dim, 5) → logits  [disabled when cls_loss_weight=0]
 ```
+
+**Learnable locus gate:** When `ves_mode="learnable"`, a per-locus sigmoid gate is applied before BatchNorm. The gate parameter vector has shape `(n_loci,)` — one scalar per SNP — initialized from VES scores via z-scored log-transform: `logit = 2 × (log|VES| - mean) / std`. This maps `sigmoid(logit)` to approximately [0.02, 0.98], so high-|VES| loci (functionally constrained in the felid context) start with gates near 1, while low-|VES| loci start near 0. During training, backpropagation refines these gates — the foundation model provides a prior on locus importance, and the geographic labels provide the task-specific signal to adjust it. The gate adds ~83,000 learnable scalar parameters, negligible compared to the MLP trunk.
 
 **Overparameterization guard (from GeoGenIE):** If `hidden_dim > n_input_features × 10`, the width is reduced by 20% recursively until compliant.
 
-**Hyperparameter optimization:** Optuna (TPE sampler) tunes architecture and training hyperparameters. Each trial runs full LOOCV (55 folds), minimizing median Haversine distance. Default budget: 100 trials.
+**Hyperparameter optimization:** Optuna (TPE sampler) tunes architecture and training hyperparameters. Each trial runs full LOOCV (55 folds), minimizing median haversine distance. Default budget: 100 trials. When `optuna_n_trials = 0`, a single LOOCV run uses the hyperparameters specified in the configuration file — this mode is used for controlled baseline comparisons (e.g., Locator reproduction).
 
 ### VES Integration Strategies
 
-Three modes, controlled by config (`ves_mode`):
+Four modes, controlled by config (`ves_mode`):
 
 | Mode | Transform | Use case |
 |------|-----------|----------|
-| `"selection"` | Keep top-K loci by \|VES\| | Transfer-learning-guided marker selection — no population labels needed |
-| `"weighted"` | Multiply genotypes × \|VES\| | Constrained loci contribute more to the input signal |
-| `"none"` | Raw genotype vector | Control experiment (no transfer learning) |
+| `"learnable"` | Per-locus sigmoid gates initialized from VES, refined by backprop | Foundation model provides prior on locus importance; training refines it |
+| `"weighted"` | Multiply genotypes × \|VES\| | All loci retained, constrained loci contribute more to the input signal |
+| `"selection"` | Keep top-K loci by \|VES\| | Hard feature selection — reduces dimensionality from ~83k to ~3k loci |
+| `"none"` | Raw genotype vector | Baseline (no transfer learning from the felid foundation model) |
 
-The default configuration uses `"selection"` mode.
+The `"learnable"` mode is recommended: it retains all loci, uses the foundation model's evolutionary signal as initialization, and allows the training objective to refine which loci matter for geographic assignment. The `"weighted"` mode achieved the best results in early experiments (146 km median haversine) before learnable gates were introduced. The `"none"` mode serves as the no-transfer-learning control.
 
 ### Loss Functions and Task Weighting
 
 ```
-total_loss = coord_loss_weight × Huber(pred_coords, target_coords)
+total_loss = coord_loss_weight × Haversine(denorm(pred_z), target_deg) / 1000
            + cls_loss_weight × CrossEntropy(biome_logits, biome_label)
 ```
 
-| Component | Function | Default Weight |
-|-----------|----------|----------------|
-| Regression | Huber loss (delta=1.0) | 1.0 |
-| Classification | Cross-entropy | 1.0 |
+| Component | Function | Default Weight | Notes |
+|-----------|----------|----------------|-------|
+| Coordinate regression | Mean haversine distance | 1.0 | Denormalizes Z-score predictions to degrees, computes great-circle distance (km), scales by 1/1000 |
+| Biome classification | Cross-entropy | 0.0 | Set to 0 for coordinate-only mode; biome can be derived post-hoc from predicted coordinates |
 
-Both tasks are weighted equally by default. Optuna may find a different ratio.
+The haversine loss directly optimizes the geographic distance metric used for evaluation. The `/1000` scaling converts from km to megameters, keeping the loss magnitude comparable to the cross-entropy term (~0.2–0.8 range) for balanced gradient flow.
+
+Setting `cls_loss_weight = 0.0` disables the biome classification head entirely, allowing the coordinate regression head to receive 100% of the gradient signal. Biome assignment can be recovered post-hoc from predicted coordinates using spatial polygon lookup (e.g., IBGE biome shapefiles), since the geographic predictions are precise enough to identify biome membership.
 
 ### Evaluation Metrics
 
-**Classification:** Accuracy, per-class F1, macro F1.
+**Primary metric:** Median haversine distance (km) across all LOOCV folds. This is the Optuna optimization target and the main comparison metric against Zenato Lazzari et al. (2025).
 
-**Regression:** MAE in degrees (lat/lon), Haversine distance (km) — both mean and median. Median Haversine is the primary metric for Optuna optimization and checkpoint selection.
+**Distance thresholds (aligned with Zenato Lazzari 2025):**
+- Percentage of individuals assigned within 250 km of true origin
+- Percentage within 500 km (the paper's primary threshold: 65–69%)
+- Percentage within 1,000 km
+
+**Classification:** Accuracy, per-class F1, macro F1 (when biome head is active).
+
+**Per-biome breakdown:** Median and mean haversine distance per true biome, enabling direct comparison with the paper's per-biome SCAT results (Amazon: 708 km, Atlantic Forest: 125 km, Caatinga: 80 km, Cerrado: 493 km, Pantanal: 196 km).
 
 **Diagnostics (logged per evaluation):**
 - Per-class prediction counts (detects classification head collapse)
-- Per-individual haversine error (full audit trail)
-- Per-biome haversine breakdown
-- Feature importance (gradient-based, post-training)
+- Per-individual haversine error (full audit trail for outlier analysis)
+- Per-biome accuracy (when biome head is active)
+
+### Locator Baseline
+
+To isolate the transfer learning contribution, the pipeline includes a faithful reproduction of Locator (Battey et al., 2020) as a baseline. Rather than installing the external TensorFlow-based Locator package, the baseline uses the same Locator-family MLP architecture already implemented in this pipeline, configured with Locator's published default hyperparameters:
+
+| Parameter | Value | Source |
+|-----------|-------|--------|
+| Hidden layers | 10 | Battey et al. (2020) default |
+| Hidden dimension | 256 | Battey et al. (2020) default |
+| Dropout | 0.25 | Battey et al. (2020) default |
+| Learning rate | 0.001 | Adam default |
+| Weight decay | 0.0 | Standard Adam (no decoupled weight decay) |
+| Max epochs | 5,000 | Battey et al. (2020) default |
+| VES mode | `"none"` | Raw genotypes, no transfer learning |
+| Biome head | disabled | Locator predicts coordinates only |
+| Optuna | disabled | Fixed hyperparameters for controlled comparison |
+
+The baseline uses the same LOOCV protocol (55 folds), the same haversine loss function, the same evaluation metrics, and the same missing data imputation strategy (binomial draws from training allele frequencies, matching Locator's contract). The only difference is the absence of VES-guided locus importance — any performance gap is directly attributable to the felid foundation model's transfer learning signal.
 
 ---
 
@@ -353,23 +390,32 @@ Downloads to `data/raw/`:
 This single command handles genotype matrix construction, VES scoring, and MLP training with LOOCV:
 
 ```bash
+# Recommended: learnable VES gates + haversine loss
 uv run python -m jaguar_geo_assign.cli genotype-finetune \
-  --config configs/examples/genotype_finetune.toml
+  --config configs/examples/genotype_finetune_learnable_haversine.toml
+
+# Locator baseline (fixed hyperparameters, no VES, no Optuna)
+uv run python -m jaguar_geo_assign.cli genotype-finetune \
+  --config configs/examples/genotype_finetune_locator_baseline.toml
+
+# VES-weighted mode (all loci weighted by |VES|)
+uv run python -m jaguar_geo_assign.cli genotype-finetune \
+  --config configs/examples/genotype_finetune_weighted.toml
 ```
 
 **What happens under the hood:**
 
 1. **Genotype matrix** is built from the VCF (cached to `genotype_cache_dir` for reuse)
-2. **VES scores** are computed using the felid-pretrained backbone (cached alongside the genotype matrix)
-3. **Top-K SNPs by |VES|** are selected (transfer-learning-guided marker selection)
-4. **Optuna** runs 100 trials, each performing full 55-fold LOOCV, minimizing median Haversine distance
-5. **Ensemble** averages predictions from the top-5 trials for reduced variance
-6. Final predictions, metrics, and best hyperparameters are saved to `output_dir`
+2. **VES scores** are computed using the felid-pretrained backbone (cached alongside the genotype matrix; skipped when `ves_mode="none"`)
+3. **VES integration** is applied according to the configured mode: learnable gates, static weighting, hard selection, or none
+4. **LOOCV training** — when `optuna_n_trials > 0`, Optuna runs N trials, each performing full 55-fold LOOCV minimizing median haversine distance, then averages predictions from the top-5 trials (ensemble). When `optuna_n_trials = 0`, a single LOOCV run uses the config-specified hyperparameters directly.
+5. Final predictions, metrics, and hyperparameters are saved to `output_dir`
 
 **Outputs:**
-- `predictions.json` — all 57 per-individual predictions with true/predicted coordinates, haversine errors, and biome classifications
-- `best_hyperparams.json` — the Optuna-selected hyperparameter configuration
-- `tensorboard/` — training curves for all trials
+- `loocv_predictions.json` — all per-individual predictions with true/predicted coordinates, haversine errors, and biome classifications
+- `loocv_summary.json` — aggregate metrics, per-biome breakdown, distance thresholds
+- `optuna_summary.json` — best trial parameters (when Optuna is used)
+- `tensorboard/` — training curves
 
 ---
 
@@ -405,10 +451,14 @@ src/jaguar_geo_assign/
 │   └── dataset.py                  # Shared data constants (BIOME_CLASSES, CoordStats)
 
 configs/examples/
-├── felid_foundation_pretrain.toml  # Corpus construction configuration
-├── felid_foundation_train.toml     # Foundation training hyperparameters
-├── genotype_finetune.toml          # Genotype MLP + VES training config
-└── fine_tune.toml                  # Fine-tuning experiment bootstrap config
+├── felid_foundation_pretrain.toml             # Corpus construction configuration
+├── felid_foundation_train.toml                # Foundation training hyperparameters
+├── genotype_finetune.toml                     # Genotype MLP + VES selection mode
+├── genotype_finetune_weighted.toml            # VES-weighted mode (all loci × |VES|)
+├── genotype_finetune_weighted_no_biome.toml   # Biome head ablation (weighted, no biome loss)
+├── genotype_finetune_learnable_haversine.toml # Learnable VES gates + haversine loss
+├── genotype_finetune_locator_baseline.toml    # Locator reproduction (fixed params, no VES)
+└── fine_tune.toml                             # Fine-tuning experiment bootstrap config
 
 design-logs/
 └── option-a-ves-genotype-architecture.md  # Full architecture specification
