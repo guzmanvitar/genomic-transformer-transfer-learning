@@ -1,6 +1,6 @@
 # Jaguar Geographic Assignment via DNABERT-2 Transfer Learning
 
-A transfer-learning pipeline for geographic assignment of jaguars (*Panthera onca*) from whole-genome sequencing data. The system pre-trains DNABERT-2 on multi-species felid reference genomes, uses the pre-trained model to score variant functional importance (Variant Effect Scoring), then trains a genotype-matrix-based MLP with learnable per-locus importance gates — initialized from VES scores and refined by backpropagation — that predicts geographic coordinates from allele counts using a haversine-based loss directly aligned with the evaluation metric.
+A transfer-learning pipeline for geographic assignment of jaguars (*Panthera onca*) from whole-genome sequencing data. The system pre-trains DNABERT-2 on multi-species felid reference genomes, uses the pre-trained model to score variant functional importance (Variant Effect Scoring), then trains a genotype-matrix-based MLP with learnable per-locus importance gates — initialized from VES scores and refined by backpropagation — that predicts geographic coordinates from allele counts using a haversine loss.
 
 This work addresses a core challenge in conservation genomics: endangered species that most need precise forensic tools have the least genetic data available for model development. By using felid-pretrained DNABERT-2 to identify functionally constrained SNPs — a label-free alternative to FST-based marker selection — the pipeline transfers cross-species genomic knowledge into a geographic assignment model that works with just 55 jaguar samples.
 
@@ -98,7 +98,7 @@ The third stage trains a Locator/GeoGenIE-style MLP on the genotype matrix (indi
 
 **Architecture:** Optional learnable locus gate → BatchNorm → [Linear → ELU → Dropout] × L → coordinate head (2 outputs). When using the `"learnable"` VES mode, per-locus sigmoid gates initialized from VES scores modulate the genotype input before the MLP trunk — the foundation model provides a prior on locus importance that backpropagation refines during training.
 
-**Loss function:** Differentiable haversine distance. The model predicts coordinates in Z-score normalized space; the loss denormalizes predictions to decimal degrees and computes mean great-circle distance against degree-space targets. This aligns the training objective directly with the evaluation metric.
+**Loss function:** Differentiable haversine distance. The model predicts coordinates in Z-score normalized space; the loss denormalizes predictions to decimal degrees and computes mean great-circle distance against degree-space targets.
 
 **Evaluation:** Leave-one-out cross-validation (55 folds) with optional Optuna Bayesian hyperparameter optimization (100 trials default). Fixed-hyperparameter mode (`optuna_n_trials = 0`) is available for controlled baseline comparisons.
 
@@ -173,7 +173,7 @@ The model predicts coordinates in Z-score normalized space: per LOOCV fold, lati
 
 The loss function operates in degree space. During training, model predictions are denormalized back to decimal degrees via `pred_deg = pred_z × std + mean`, then the mean haversine (great-circle) distance to degree-space targets is computed. The raw haversine (km) is scaled by 1/1000 (converting to megameters) for gradient stability — this places the coordinate loss on a comparable scale to the cross-entropy classification loss.
 
-This design aligns the training objective with the evaluation metric: the model directly minimizes the geographic distance it is evaluated on, while maintaining numerically stable optimization through Z-score output space. The haversine function naturally accounts for the cos(latitude) factor that makes 1° longitude vary from ~111 km at the equator to ~100 km at latitude -25°, which a Euclidean loss in Z-score space cannot capture.
+The haversine function accounts for the cos(latitude) factor that makes 1° longitude vary from ~111 km at the equator to ~100 km at latitude -25°, which a Euclidean loss in Z-score space cannot capture.
 
 ---
 
@@ -258,7 +258,7 @@ total_loss = coord_loss_weight × Haversine(denorm(pred_z), target_deg) / 1000
 | Coordinate regression | Mean haversine distance | 1.0 | Denormalizes Z-score predictions to degrees, computes great-circle distance (km), scales by 1/1000 |
 | Biome classification | Cross-entropy | 0.0 | Set to 0 for coordinate-only mode; biome can be derived post-hoc from predicted coordinates |
 
-The haversine loss directly optimizes the geographic distance metric used for evaluation. The `/1000` scaling converts from km to megameters, keeping the loss magnitude comparable to the cross-entropy term (~0.2–0.8 range) for balanced gradient flow.
+The `/1000` scaling converts from km to megameters, keeping the loss magnitude comparable to the cross-entropy term (~0.2–0.8 range) for balanced gradient flow.
 
 Setting `cls_loss_weight = 0.0` disables the biome classification head entirely, allowing the coordinate regression head to receive 100% of the gradient signal. Biome assignment can be recovered post-hoc from predicted coordinates using spatial polygon lookup (e.g., IBGE biome shapefiles), since the geographic predictions are precise enough to identify biome membership.
 
