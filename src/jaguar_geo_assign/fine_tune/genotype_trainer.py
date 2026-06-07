@@ -43,6 +43,7 @@ from jaguar_geo_assign.fine_tune.genotype_model import (
     apply_ves_selection,
     apply_ves_weighting,
     compute_genotype_loss,
+    compute_ves_gate_init,
 )
 from jaguar_geo_assign.fine_tune.trainer import compute_eval_metrics, haversine_distance_km
 from jaguar_geo_assign.fine_tune.variant_scoring import (
@@ -128,12 +129,13 @@ def _train_single_fold(
     config: dict[str, Any],
     seed: int,
     device: torch.device,
+    ves_init_logits: Tensor | None = None,
 ) -> LOOCVPrediction:
     """Train on N-1 individuals, predict the held-out one.
 
     This is the inner loop of LOOCV. The function:
     1. Fits ``CoordStats`` on training individuals only.
-    2. Z-score normalizes coordinates using those stats.
+    2. Prepares degree-space coordinate targets for haversine loss.
     3. Builds the MLP model, optimizer, and cosine LR scheduler.
     4. Trains for ``max_epochs`` on the full training batch.
     5. Predicts the held-out individual in eval mode.
@@ -157,6 +159,9 @@ def _train_single_fold(
             ``coord_loss_weight``, ``cls_loss_weight``, ``max_epochs``.
         seed: Random seed for reproducibility within this fold.
         device: Target device for tensors and model parameters.
+        ves_init_logits: Optional gate initialization logits from
+            :func:`compute_ves_gate_init`.  When provided, the model
+            uses a learnable per-locus gate initialized from VES scores.
 
     Returns:
         A :class:`LOOCVPrediction` for the held-out individual.
@@ -174,16 +179,11 @@ def _train_single_fold(
     ]
     coord_stats = _fit_coord_stats(records)
 
-    # Step 2: Z-score normalize coordinates.
-    train_lats = torch.tensor(
-        [(latitudes[i] - coord_stats.lat_mean) / coord_stats.lat_std for i in train_idx],
+    # Step 2: Prepare degree-space coordinate targets for haversine loss.
+    train_coords_deg = torch.tensor(
+        [[latitudes[i], longitudes[i]] for i in train_idx],
         dtype=torch.float32,
-    )
-    train_lons = torch.tensor(
-        [(longitudes[i] - coord_stats.lon_mean) / coord_stats.lon_std for i in train_idx],
-        dtype=torch.float32,
-    )
-    train_coords = torch.stack([train_lats, train_lons], dim=-1).to(device)
+    ).to(device)
     train_biomes = biome_indices[train_idx].to(device)
     train_geno = genotypes_f32[train_idx].to(device)
 
@@ -198,7 +198,7 @@ def _train_single_fold(
         hidden_dim=int(config.get("hidden_dim", 256)),
         dropout=float(config.get("dropout", 0.2)),
     )
-    model = JaguarGenotypeMLP(mlp_config).to(device)
+    model = JaguarGenotypeMLP(mlp_config, ves_init_logits=ves_init_logits).to(device)
 
     max_epochs = int(config.get("max_epochs", 500))
     learning_rate = float(config.get("learning_rate", 1e-3))
@@ -225,8 +225,9 @@ def _train_single_fold(
         outputs = model(train_geno)
         total_loss, *_ = compute_genotype_loss(
             outputs,
-            train_coords,
+            train_coords_deg,
             train_biomes,
+            coord_stats=coord_stats,
             coord_loss_weight=coord_loss_weight,
             cls_loss_weight=cls_loss_weight,
         )
@@ -333,6 +334,7 @@ def run_loocv(
     # The actual VES integration (weighting or selection) is applied per-fold
     # after imputation to avoid data leakage.
     effective_top_k: int | None = None
+    ves_init_logits: Tensor | None = None
     if ves_mode == "weighted":
         if ves_scores is None:
             raise ValueError("ves_mode='weighted' requires ves_scores to be provided")
@@ -342,11 +344,17 @@ def run_loocv(
             raise ValueError("ves_mode='selection' requires ves_scores to be provided")
         effective_top_k = ves_top_k if ves_top_k is not None else n_loci
         logger.info("VES mode: selection (top %d of %d loci by |VES|).", effective_top_k, n_loci)
+    elif ves_mode == "learnable":
+        if ves_scores is None:
+            raise ValueError("ves_mode='learnable' requires ves_scores to be provided")
+        ves_init_logits = compute_ves_gate_init(ves_scores)
+        logger.info("VES mode: learnable gates (all %d loci, gate init from VES).", n_loci)
     elif ves_mode == "none":
         logger.info("VES integration disabled; using raw genotypes.")
     else:
         raise ValueError(
-            f"Unrecognized ves_mode={ves_mode!r}; expected 'weighted', 'selection', or 'none'"
+            f"Unrecognized ves_mode={ves_mode!r}; "
+            "expected 'weighted', 'selection', 'learnable', or 'none'"
         )
 
     # Build biome index tensor.
@@ -367,7 +375,6 @@ def run_loocv(
         # VES-weighted values are continuous and not suitable for allele
         # frequency estimation.
         if ves_mode == "weighted":
-            # For weighted mode, impute in raw space then re-apply weighting.
             imputed_raw = impute_missing_genotypes(
                 geno_result.genotypes,
                 train_idx,
@@ -408,6 +415,7 @@ def run_loocv(
             config=config,
             seed=seed + fold_idx,
             device=device,
+            ves_init_logits=ves_init_logits,
         )
         predictions.append(pred)
 
