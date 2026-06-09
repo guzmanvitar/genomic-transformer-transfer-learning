@@ -17,6 +17,7 @@ from jaguar_geo_assign.config import (
     _validate_felid_species_entries,
     load_felid_foundation_pipeline_config,
     load_foundation_training_config,
+    load_genotype_finetune_config,
 )
 from jaguar_geo_assign.data.pipeline_contract import (
     DNABERT2_TOKENIZER_REVISION,
@@ -194,3 +195,29 @@ def test_validate_felid_species_entries_rejects_legacy_accession_key() -> None:
         _validate_felid_species_entries(raw_species)
 
     assert not re.search(r"<[A-Z][A-Z-]*>", str(exc_info.value))
+
+
+def test_load_genotype_finetune_config_no_ves_tuned() -> None:
+    """The no-VES tuned baseline config should load cleanly."""
+    config = load_genotype_finetune_config("configs/examples/genotype_finetune_no_ves_tuned.toml")
+    assert config.ves_mode == "none"
+    assert config.compute_ves is False
+    assert config.cls_loss_weight == 0.0
+    assert config.optuna_n_trials == 100
+
+
+def test_load_genotype_finetune_config_rejects_zero_optuna_trials(tmp_path: Path) -> None:
+    """optuna_n_trials=0 should be rejected."""
+    config_path = tmp_path / "zero_trials.toml"
+    config_path.write_text(
+        "[training]\n"
+        'vcf_path = "data.vcf"\n'
+        'reference_fasta = "ref.fa"\n'
+        'metadata_csv = "meta.csv"\n'
+        'backbone_path = "model"\n'
+        'output_dir = "out"\n'
+        "optuna_n_trials = 0\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="optuna_n_trials must be positive"):
+        load_genotype_finetune_config(config_path)

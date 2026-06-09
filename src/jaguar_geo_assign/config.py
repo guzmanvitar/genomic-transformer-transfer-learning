@@ -1595,6 +1595,11 @@ class GenotypeFinetuneConfig:
     variant effect scoring -> Locator/GeoGenIE-style MLP with LOOCV evaluation
     pipeline.
 
+    Architecture and training hyperparameters (``n_hidden_layers``,
+    ``hidden_dim``, ``dropout``, ``learning_rate``, ``weight_decay``,
+    ``max_epochs``, ``coord_loss_weight``) are controlled entirely by the
+    Optuna search space in the trainer module, not by this config.
+
     Attributes:
         vcf_path: Path to the jaguar VCF file (biallelic SNPs).
         reference_fasta: Path to the DNA Zoo jaguar reference FASTA.
@@ -1605,22 +1610,14 @@ class GenotypeFinetuneConfig:
         compute_ves: Whether to compute VES scores (requires backbone + FASTA).
         ves_batch_size: Batch size for VES forward passes through DNABERT-2.
         ves_mode: VES integration strategy: ``"weighted"``, ``"selection"``,
-            or ``"none"``.
+            ``"learnable"``, or ``"none"``.
         ves_top_k: Number of top loci to retain in ``"selection"`` mode.
-        n_biomes: Number of biome classes.
-        n_hidden_layers: MLP hidden layer count (overridden by Optuna).
-        hidden_dim: MLP hidden layer width (overridden by Optuna).
-        dropout: Dropout probability (overridden by Optuna).
-        max_epochs: Maximum training epochs per LOOCV fold.
-        learning_rate: AdamW learning rate.
-        weight_decay: AdamW weight decay.
-        coord_loss_weight: Weight on Huber coordinate loss.
-        cls_loss_weight: Weight on cross-entropy biome loss.
+        cls_loss_weight: Weight on cross-entropy biome loss. Set to 0 to
+            disable the biome head entirely.
         cv_strategy: Cross-validation strategy: ``"loocv"`` or
             ``"stratified_kfold"``.
-        n_folds: Fold count when ``cv_strategy`` is ``"stratified_kfold"``.
         seed: Random seed for reproducibility.
-        optuna_n_trials: Number of Optuna trials.
+        optuna_n_trials: Number of Optuna trials (must be positive).
         optuna_study_name: Optuna study name.
         device: Compute device: ``"auto"``, ``"cuda"``, or ``"cpu"``.
         tensorboard_subdir: Subdirectory under ``output_dir`` for tracker files.
@@ -1636,17 +1633,8 @@ class GenotypeFinetuneConfig:
     ves_batch_size: int = 128
     ves_mode: str = "selection"
     ves_top_k: int | None = 459
-    n_biomes: int = 5
-    n_hidden_layers: int = 2
-    hidden_dim: int = 256
-    dropout: float = 0.2
-    max_epochs: int = 500
-    learning_rate: float = 1e-3
-    weight_decay: float = 0.01
-    coord_loss_weight: float = 1.0
     cls_loss_weight: float = 1.0
     cv_strategy: str = "loocv"
-    n_folds: int = 5
     seed: int = 42
     optuna_n_trials: int = 100
     optuna_study_name: str = "jaguar_genotype_ves"
@@ -1682,18 +1670,9 @@ def load_genotype_finetune_config(path: str | Path) -> GenotypeFinetuneConfig:
         ves_top_k_raw = training.get("ves_top_k")
         ves_top_k = int(ves_top_k_raw) if ves_top_k_raw is not None else None
 
-        n_biomes = int(training.get("n_biomes", 5))
-        n_hidden_layers = int(training.get("n_hidden_layers", 2))
-        hidden_dim = int(training.get("hidden_dim", 256))
-        dropout = float(training.get("dropout", 0.2))
-        max_epochs = int(training.get("max_epochs", 500))
-        learning_rate = float(training.get("learning_rate", 1e-3))
-        weight_decay = float(training.get("weight_decay", 0.01))
-        coord_loss_weight = float(training.get("coord_loss_weight", 1.0))
         cls_loss_weight = float(training.get("cls_loss_weight", 1.0))
 
         cv_strategy = str(training.get("cv_strategy", "loocv"))
-        n_folds = int(training.get("n_folds", 5))
         seed = int(training.get("seed", 42))
 
         optuna_n_trials = int(training.get("optuna_n_trials", 100))
@@ -1711,30 +1690,12 @@ def load_genotype_finetune_config(path: str | Path) -> GenotypeFinetuneConfig:
             )
         if ves_mode == "selection" and ves_top_k is not None and ves_top_k <= 0:
             raise ValueError("training.ves_top_k must be positive when ves_mode is 'selection'")
-        if not 1 <= n_biomes <= 5:
-            raise ValueError("training.n_biomes must be between 1 and 5 inclusive")
-        if n_hidden_layers <= 0:
-            raise ValueError("training.n_hidden_layers must be positive")
-        if hidden_dim <= 0:
-            raise ValueError("training.hidden_dim must be positive")
-        if not 0.0 <= dropout < 1.0:
-            raise ValueError("training.dropout must be in [0, 1)")
-        if max_epochs <= 0:
-            raise ValueError("training.max_epochs must be positive")
-        if learning_rate <= 0.0:
-            raise ValueError("training.learning_rate must be positive")
-        if weight_decay < 0.0:
-            raise ValueError("training.weight_decay must be non-negative")
-        if coord_loss_weight <= 0.0:
-            raise ValueError("training.coord_loss_weight must be positive")
         if cls_loss_weight < 0.0:
             raise ValueError("training.cls_loss_weight must be non-negative")
         if cv_strategy not in ("loocv", "stratified_kfold"):
             raise ValueError(
                 f"training.cv_strategy must be 'loocv' or 'stratified_kfold'; got {cv_strategy!r}"
             )
-        if cv_strategy == "stratified_kfold" and n_folds < 2:
-            raise ValueError("training.n_folds must be >= 2 for stratified_kfold")
         if optuna_n_trials <= 0:
             raise ValueError("training.optuna_n_trials must be positive")
         if device not in ("auto", "cuda", "cpu"):
@@ -1757,17 +1718,8 @@ def load_genotype_finetune_config(path: str | Path) -> GenotypeFinetuneConfig:
         ves_batch_size=ves_batch_size,
         ves_mode=ves_mode,
         ves_top_k=ves_top_k,
-        n_biomes=n_biomes,
-        n_hidden_layers=n_hidden_layers,
-        hidden_dim=hidden_dim,
-        dropout=dropout,
-        max_epochs=max_epochs,
-        learning_rate=learning_rate,
-        weight_decay=weight_decay,
-        coord_loss_weight=coord_loss_weight,
         cls_loss_weight=cls_loss_weight,
         cv_strategy=cv_strategy,
-        n_folds=n_folds,
         seed=seed,
         optuna_n_trials=optuna_n_trials,
         optuna_study_name=optuna_study_name,
