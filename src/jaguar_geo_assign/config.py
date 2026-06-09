@@ -1735,8 +1735,8 @@ def load_genotype_finetune_config(path: str | Path) -> GenotypeFinetuneConfig:
             )
         if cv_strategy == "stratified_kfold" and n_folds < 2:
             raise ValueError("training.n_folds must be >= 2 for stratified_kfold")
-        if optuna_n_trials < 0:
-            raise ValueError("training.optuna_n_trials must be non-negative")
+        if optuna_n_trials <= 0:
+            raise ValueError("training.optuna_n_trials must be positive")
         if device not in ("auto", "cuda", "cpu"):
             raise ValueError(f"training.device must be 'auto', 'cuda', or 'cpu'; got {device!r}")
         if not tensorboard_subdir:
