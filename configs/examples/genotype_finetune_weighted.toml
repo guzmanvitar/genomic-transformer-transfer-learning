@@ -24,7 +24,6 @@ ves_mode = "weighted"
 
 # Cross-validation.
 cv_strategy = "loocv"
-n_folds = 5
 seed = 42
 
 # Hyperparameter optimization.
