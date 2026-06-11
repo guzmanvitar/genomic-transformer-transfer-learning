@@ -27,7 +27,7 @@ This work addresses a core challenge in conservation genomics: endangered specie
    - [VES Integration Strategies](#ves-integration-strategies)
    - [Loss Functions and Task Weighting](#loss-functions-and-task-weighting)
    - [Evaluation Metrics](#evaluation-metrics)
-   - [Locator Baseline](#locator-baseline)
+   - [No-VES Tuned Baseline](#no-ves-tuned-baseline)
 5. [Reproducibility and Integrity Guarantees](#reproducibility-and-integrity-guarantees)
 6. [Installation](#installation)
 7. [Running the Pipeline](#running-the-pipeline)
@@ -231,7 +231,7 @@ Input: genotype vector (n_loci,) values in {0, 1, 2}
 
 **Overparameterization guard (from GeoGenIE):** If `hidden_dim > n_input_features × 10`, the width is reduced by 20% recursively until compliant.
 
-**Hyperparameter optimization:** Optuna (TPE sampler) tunes architecture and training hyperparameters. Each trial runs full LOOCV (55 folds), minimizing median haversine distance. Default budget: 100 trials. When `optuna_n_trials = 0`, a single LOOCV run uses the hyperparameters specified in the configuration file — this mode is used for controlled baseline comparisons (e.g., Locator reproduction).
+**Hyperparameter optimization:** Optuna (TPE sampler) tunes architecture and training hyperparameters. Each trial runs full LOOCV (55 folds), minimizing median haversine distance. Default budget: 100 trials.
 
 ### VES Integration Strategies
 
@@ -280,23 +280,9 @@ Setting `cls_loss_weight = 0.0` disables the biome classification head entirely,
 - Per-individual haversine error (full audit trail for outlier analysis)
 - Per-biome accuracy (when biome head is active)
 
-### Locator Baseline
+### No-VES Tuned Baseline
 
-To isolate the transfer learning contribution, the pipeline includes a faithful reproduction of Locator (Battey et al., 2020) as a baseline. Rather than installing the external TensorFlow-based Locator package, the baseline uses the same Locator-family MLP architecture already implemented in this pipeline, configured with Locator's published default hyperparameters:
-
-| Parameter | Value | Source |
-|-----------|-------|--------|
-| Hidden layers | 10 | Battey et al. (2020) default |
-| Hidden dimension | 256 | Battey et al. (2020) default |
-| Dropout | 0.25 | Battey et al. (2020) default |
-| Learning rate | 0.001 | Adam default |
-| Weight decay | 0.0 | Standard Adam (no decoupled weight decay) |
-| Max epochs | 5,000 | Battey et al. (2020) default |
-| VES mode | `"none"` | Raw genotypes, no transfer learning |
-| Biome head | disabled | Locator predicts coordinates only |
-| Optuna | disabled | Fixed hyperparameters for controlled comparison |
-
-The baseline uses the same LOOCV protocol (55 folds), the same haversine loss function, the same evaluation metrics, and the same missing data imputation strategy (binomial draws from training allele frequencies, matching Locator's contract). The only difference is the absence of VES-guided locus importance — any performance gap is directly attributable to the felid foundation model's transfer learning signal.
+To isolate the transfer learning contribution, the pipeline includes a no-VES baseline that uses the same Optuna optimization budget (100 trials), the same MLP architecture search space, the same LOOCV protocol, and the same haversine loss — but operates on raw genotypes with `ves_mode="none"`. This ensures that any performance gap between the baseline and VES-guided models is attributable to the felid foundation model's locus importance signal, not to differences in hyperparameter tuning.
 
 ---
 
@@ -394,9 +380,9 @@ This single command handles genotype matrix construction, VES scoring, and MLP t
 uv run python -m jaguar_geo_assign.cli genotype-finetune \
   --config configs/examples/genotype_finetune_learnable_haversine.toml
 
-# Locator baseline (fixed hyperparameters, no VES, no Optuna)
+# No-VES tuned baseline (same Optuna budget, raw genotypes)
 uv run python -m jaguar_geo_assign.cli genotype-finetune \
-  --config configs/examples/genotype_finetune_locator_baseline.toml
+  --config configs/examples/genotype_finetune_no_ves_tuned.toml
 
 # VES-weighted mode (all loci weighted by |VES|)
 uv run python -m jaguar_geo_assign.cli genotype-finetune \
@@ -457,7 +443,7 @@ configs/examples/
 ├── genotype_finetune_weighted.toml            # VES-weighted mode (all loci × |VES|)
 ├── genotype_finetune_weighted_no_biome.toml   # Biome head ablation (weighted, no biome loss)
 ├── genotype_finetune_learnable_haversine.toml # Learnable VES gates + haversine loss
-├── genotype_finetune_locator_baseline.toml    # Locator reproduction (fixed params, no VES)
+├── genotype_finetune_no_ves_tuned.toml         # No-VES tuned baseline (same Optuna budget)
 └── fine_tune.toml                             # Fine-tuning experiment bootstrap config
 
 design-logs/

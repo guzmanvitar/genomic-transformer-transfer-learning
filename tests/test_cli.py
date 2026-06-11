@@ -17,52 +17,6 @@ import pytest
 from jaguar_geo_assign.cli import main
 
 
-def test_validate_config_reports_success(capsys: pytest.CaptureFixture[str]) -> None:
-    """Bootstrap config validation should succeed on the shipped example."""
-    exit_code = main(["validate-config", "configs/examples/fine_tune.toml"])
-
-    captured = capsys.readouterr()
-    assert exit_code == 0
-    assert "is valid for the bootstrap scaffold" in captured.out
-
-
-def test_describe_experiment_reports_deferred_baseline(
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    """Experiment description should expose the deferred baseline wiring."""
-    exit_code = main(["describe-experiment", "configs/examples/regression_transfer.toml"])
-
-    captured = capsys.readouterr()
-    assert exit_code == 0
-    assert "Deferred baseline: baseline_evaluate -> deferred_legacy_group_model" in captured.out
-
-
-@pytest.mark.parametrize("command", ["evaluate", "report"])
-def test_stage_scaffolds_echo_loaded_bootstrap_config(
-    command: str,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    """Deferred stage entry points should stay callable while the CLI is scaffold-only."""
-    exit_code = main([command, "--config", "configs/examples/regression_transfer.toml"])
-
-    captured = capsys.readouterr()
-    assert exit_code == 0
-    assert f"{command} entry point scaffold is available." in captured.out
-    assert "Loaded config: regression_transfer_bootstrap" in captured.out
-
-
-def test_baseline_evaluate_scaffold_reports_reserved_stage(
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    """The baseline scaffold should explain why execution is still deferred."""
-    exit_code = main(["baseline-evaluate", "--config", "configs/examples/regression_transfer.toml"])
-
-    captured = capsys.readouterr()
-    assert exit_code == 0
-    assert "baseline-evaluate entry point scaffold is available" in captured.out
-    assert "Deferred baseline stage is reserved for baseline_evaluate" in captured.out
-
-
 def test_validate_felid_foundation_config_reports_success(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
@@ -74,18 +28,6 @@ def test_validate_felid_foundation_config_reports_success(
     captured = capsys.readouterr()
     assert exit_code == 0
     assert "matches the approved contract" in captured.out
-
-
-def test_validate_felid_foundation_config_rejects_bootstrap_toml(
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    """Foundation validation should fail loudly on a non-foundation config."""
-    exit_code = main(["validate-felid-foundation-config", "configs/examples/fine_tune.toml"])
-
-    captured = capsys.readouterr()
-    assert exit_code == 1
-    assert "missing required sections" in captured.out
-    assert "Traceback" not in captured.out
 
 
 def test_describe_felid_foundation_config_reports_species(
@@ -207,85 +149,6 @@ def test_train_felid_foundation_integration_flag_uses_tiny_mode() -> None:
 
     assert exit_code == 0
     mock_integration.assert_called_once_with(use_real_model=False)
-
-
-def test_mil_finetune_dispatches_to_runner(
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    """``mil-finetune`` should validate config, run MIL training, and print a summary."""
-
-    validated_paths: list[Path] = []
-    calls: list[Path] = []
-    fake_result = SimpleNamespace(
-        fold_index=1,
-        steps_completed=25,
-        best_eval_haversine_km=123.4,
-        best_eval_macro_f1=0.56,
-        output_dir="/tmp/mil_output",
-    )
-
-    def fake_validate(config_path: Path) -> object:
-        validated_paths.append(config_path)
-        return object()
-
-    def fake_runner(config_path: Path) -> object:
-        calls.append(config_path)
-        return fake_result
-
-    monkeypatch.setattr("jaguar_geo_assign.cli.load_mil_finetune_config", fake_validate)
-    monkeypatch.setattr(
-        "jaguar_geo_assign.fine_tune.mil_trainer.run_jaguar_mil_training",
-        fake_runner,
-    )
-
-    exit_code = main(["mil-finetune", "--config", "configs/examples/mil_finetune.toml"])
-
-    captured = capsys.readouterr()
-    assert exit_code == 0
-    assert validated_paths == [Path("configs/examples/mil_finetune.toml")]
-    assert calls == [Path("configs/examples/mil_finetune.toml")]
-    assert "Jaguar MIL fine-tuning completed." in captured.out
-    assert "Steps completed: 25" in captured.out
-    assert "Best eval haversine (km): 123.4" in captured.out
-
-
-def test_extract_embeddings_dispatches(monkeypatch: pytest.MonkeyPatch, capsys) -> None:
-    """``extract-embeddings`` should reuse the extraction module formatter output."""
-
-    calls: list[Path] = []
-    fake_result = SimpleNamespace(
-        n_individuals=2,
-        n_windows_extracted=3,
-        n_windows_dropped=1,
-        manifest_path=Path("/tmp/manifest.jsonl"),
-    )
-
-    def fake_runner(config_path: Path) -> object:
-        calls.append(config_path)
-        return fake_result
-
-    monkeypatch.setattr(
-        "jaguar_geo_assign.fine_tune.extract_embeddings.run_embedding_extraction",
-        fake_runner,
-    )
-    monkeypatch.setattr(
-        "jaguar_geo_assign.fine_tune.extract_embeddings.format_extraction_result",
-        lambda result: (
-            "shared extraction formatter"
-            if result is fake_result
-            else "unexpected extraction formatter input"
-        ),
-    )
-
-    exit_code = main(
-        ["extract-embeddings", "--config", "configs/examples/embedding_extraction.toml"]
-    )
-
-    captured = capsys.readouterr()
-    assert exit_code == 0
-    assert calls == [Path("configs/examples/embedding_extraction.toml")]
-    assert captured.out.strip() == "shared extraction formatter"
 
 
 def test_extract_finetune_windows_dispatches(

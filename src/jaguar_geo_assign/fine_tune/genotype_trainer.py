@@ -796,35 +796,10 @@ def run_genotype_training(config_path: str | Path) -> GenotypeTrainResult:
                 save_ves_scores(ves_result, ves_scores_path)
                 logger.info("Cached VES scores to %s", ves_scores_path)
 
-    # Step 4: LOOCV training — fixed hyperparameters or Optuna optimization.
-    optuna_n_trials = config.optuna_n_trials
-
-    if optuna_n_trials == 0:
-        logger.info("optuna_n_trials=0: running single LOOCV with config hyperparameters.")
-        fixed_config: dict[str, Any] = {
-            "n_hidden_layers": config.n_hidden_layers,
-            "hidden_dim": config.hidden_dim,
-            "dropout": config.dropout,
-            "learning_rate": config.learning_rate,
-            "weight_decay": config.weight_decay,
-            "coord_loss_weight": config.coord_loss_weight,
-            "cls_loss_weight": config.cls_loss_weight,
-            "max_epochs": config.max_epochs,
-        }
-        best_result = run_loocv(
-            geno_result=geno_result,
-            ves_scores=ves_scores,
-            ves_mode=ves_mode,
-            ves_top_k=ves_top_k,
-            config=fixed_config,
-            seed=seed,
-            device=device,
-            output_dir=output_dir / "fixed",
-        )
-        return best_result
-
+    # Step 4: Optuna LOOCV optimization.
     import optuna
 
+    optuna_n_trials = config.optuna_n_trials
     optuna_study_name = config.optuna_study_name
     logger.info(
         "Starting Optuna hyperparameter optimization: %d trials",

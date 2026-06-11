@@ -1,0 +1,38 @@
+# No-VES Tuned Baseline — Optuna-optimized MLP on raw genotypes
+#
+# Uses the same Optuna budget (100 trials) and search space as the
+# VES-guided experiments, but with ves_mode="none" — raw genotypes only.
+# This isolates the transfer learning contribution: any performance gap
+# between this baseline and the VES-guided models is attributable to
+# the felid foundation model's locus importance signal, not to
+# hyperparameter tuning.
+
+[training]
+# Required paths (same as other configs).
+vcf_path = "data/raw/jaguar.57samples.allChr.snps.hardFilter.bi.maf.ld.masked.hwe.recode.vcf"
+reference_fasta = "data/raw/felid_foundation/reference/DNAZOO_Panthera_onca_HiC.fna.gz"
+metadata_csv = "data/raw/jaguar_location.csv"
+backbone_path = "models/foundation_felid/best/hf_model"
+output_dir = "models/jaguar_genotype_no_ves_tuned"
+
+# Genotype matrix caching (shared with other runs).
+genotype_cache_dir = "data/processed/genotype_matrix"
+
+# No VES — raw genotypes only.
+compute_ves = false
+ves_mode = "none"
+
+# Coordinate regression only (matching VES experiments).
+cls_loss_weight = 0.0
+
+# Same Optuna budget as VES experiments.
+optuna_n_trials = 100
+optuna_study_name = "jaguar_genotype_no_ves_tuned"
+
+# Cross-validation.
+cv_strategy = "loocv"
+seed = 42
+
+# Runtime.
+device = "auto"
+tensorboard_subdir = "tensorboard"
