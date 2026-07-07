@@ -1,8 +1,5 @@
-"""Fine-tuning stage — scaffold namespace for later implementation.
+"""Fine-tuning stage for jaguar geographic assignment.
 
-Will contain the DNABERT-2 fine-tuning loop, data-loader construction, and
-checkpoint management once the pretrained corpus is ready and downstream
-jaguar geographic-assignment labels are available.  Currently reserved so
-that the CLI and config validation can reference the fine-tune stage without
-import errors.
+Contains the genotype MLP with VES-guided locus gates, variant effect
+scoring via DNABERT-2 masked prediction, and LOOCV training infrastructure.
 """

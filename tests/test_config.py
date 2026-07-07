@@ -206,8 +206,10 @@ def test_load_genotype_finetune_config_no_ves_tuned() -> None:
     assert config.optuna_n_trials == 100
 
 
-def test_load_genotype_finetune_config_rejects_zero_optuna_trials(tmp_path: Path) -> None:
-    """optuna_n_trials=0 should be rejected."""
+def test_load_genotype_finetune_config_rejects_zero_optuna_trials_without_fixed_hparams(
+    tmp_path: Path,
+) -> None:
+    """optuna_n_trials=0 without fixed hyperparameters should be rejected."""
     config_path = tmp_path / "zero_trials.toml"
     config_path.write_text(
         "[training]\n"
@@ -219,5 +221,5 @@ def test_load_genotype_finetune_config_rejects_zero_optuna_trials(tmp_path: Path
         "optuna_n_trials = 0\n",
         encoding="utf-8",
     )
-    with pytest.raises(ValueError, match="optuna_n_trials must be positive"):
+    with pytest.raises(ValueError, match="optuna_n_trials=0 requires fixed hyperparameters"):
         load_genotype_finetune_config(config_path)

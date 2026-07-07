@@ -17,12 +17,16 @@ from __future__ import annotations
 
 import json
 import logging
+import shutil
+import sys
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 import torch
-from torch import Tensor
-from transformers import AutoModelForMaskedLM
+from huggingface_hub import hf_hub_download
+from torch import Tensor, nn
+from transformers import AutoModelForMaskedLM, AutoTokenizer
 
 from jaguar_geo_assign.data.finetune_windows import (
     UPSTREAM_BASES,
@@ -30,13 +34,120 @@ from jaguar_geo_assign.data.finetune_windows import (
     extract_fasta_window,
     load_reference_index,
 )
-from jaguar_geo_assign.fine_tune.extract_embeddings import (
-    _disable_flash_attention_if_present,
-    _load_tokenizer,
+from jaguar_geo_assign.data.pipeline_contract import (
+    DNABERT2_TOKENIZER_ID,
+    DNABERT2_TOKENIZER_REVISION,
 )
-from jaguar_geo_assign.fine_tune.trainer import _ensure_custom_code
 
 logger = logging.getLogger(__name__)
+
+
+def _ensure_custom_code(backbone_path: Path) -> None:
+    """Ensure custom Python files referenced by ``auto_map`` exist in the model directory.
+
+    Locally-saved checkpoints may be missing the custom ``.py`` files that
+    DNABERT-2 needs when loaded with ``trust_remote_code=True``.  If any are
+    absent we download them from the pinned Hub revision.
+    """
+    config_path = backbone_path / "config.json"
+    if not config_path.exists():
+        return
+
+    with open(config_path) as f:
+        cfg = json.load(f)
+
+    auto_map = cfg.get("auto_map", {})
+    if not auto_map:
+        return
+
+    py_files = {v.split(".")[0] + ".py" for v in auto_map.values()}
+    missing = [f for f in py_files if not (backbone_path / f).exists()]
+    if not missing:
+        return
+
+    for filename in missing:
+        try:
+            cached = hf_hub_download(
+                DNABERT2_TOKENIZER_ID,
+                filename,
+                revision=DNABERT2_TOKENIZER_REVISION,
+            )
+            shutil.copy2(cached, backbone_path / filename)
+            logger.info("Downloaded missing custom code file: %s", filename)
+        except Exception:
+            logger.warning("Could not download %s from Hub", filename, exc_info=True)
+
+    for extra in ("bert_padding.py", "flash_attn_triton.py"):
+        if (backbone_path / extra).exists():
+            continue
+        try:
+            cached = hf_hub_download(
+                DNABERT2_TOKENIZER_ID,
+                extra,
+                revision=DNABERT2_TOKENIZER_REVISION,
+            )
+            shutil.copy2(cached, backbone_path / extra)
+            logger.info("Downloaded missing dependency file: %s", extra)
+        except Exception:
+            pass
+
+
+def _load_tokenizer(backbone_path: Path, backbone: nn.Module | None = None) -> Any:
+    """Load a DNABERT-2-compatible tokenizer from the local backbone directory.
+
+    To guarantee that ``pad_token_id`` is defined, a three-step fallback is
+    applied if the pretrained tokenizer is missing a pad token:
+
+    1. Reuse ``eos_token`` as pad when present.
+    2. Otherwise reuse ``unk_token``.
+    3. Otherwise add a new ``[PAD]`` token.  When a backbone is supplied, its
+       embedding matrix is resized so that model and tokenizer remain aligned.
+    """
+
+    tokenizer_dir = backbone_path.parent / "tokenizer"
+    tokenizer_src = str(tokenizer_dir) if tokenizer_dir.is_dir() else str(backbone_path)
+    tokenizer = AutoTokenizer.from_pretrained(tokenizer_src, trust_remote_code=True)
+
+    pad_added = False
+    if tokenizer.pad_token is None:
+        if tokenizer.eos_token is not None:
+            tokenizer.pad_token = tokenizer.eos_token
+        elif tokenizer.unk_token is not None:
+            tokenizer.pad_token = tokenizer.unk_token
+        else:
+            tokenizer.add_special_tokens({"pad_token": "[PAD]"})
+            pad_added = True
+
+    if tokenizer.pad_token is None:
+        raise RuntimeError(
+            "_load_tokenizer: failed to set pad_token; tokenizer has no eos/unk token and "
+            "add_special_tokens did not register a pad token."
+        )
+
+    if pad_added and backbone is not None:
+        backbone.resize_token_embeddings(len(tokenizer))
+
+    return tokenizer
+
+
+def _disable_flash_attention_if_present() -> None:
+    """Disable DNABERT-2's Triton flash-attention hook when it is incompatible.
+
+    The local custom-code path may import a Triton kernel that uses APIs removed
+    in newer Triton builds. This defensive patch ensures the backbone falls back
+    to PyTorch's native attention implementation.
+    """
+
+    patched_any = False
+    for module_name, module in list(sys.modules.items()):
+        if not module_name.endswith(".bert_layers") or module is None:
+            continue
+        if getattr(module, "flash_attn_qkvpacked_func", None) is None:
+            continue
+        module.flash_attn_qkvpacked_func = None
+        patched_any = True
+    if patched_any:
+        logger.info("Disabled DNABERT-2 Triton flash attention; using PyTorch fallback.")
 
 
 @dataclass(frozen=True)

@@ -486,10 +486,8 @@ src/jaguar_geo_assign/
 ├── fine_tune/
 │   ├── genotype_dataset.py         # VCF → genotype matrix (0/1/2) construction
 │   ├── variant_scoring.py          # DNABERT-2 masked prediction → VES scores
-│   ├── genotype_model.py           # Genotype MLP architecture + VES helpers
+│   ├── genotype_model.py           # Genotype MLP architecture + VES locus gates
 │   ├── genotype_trainer.py         # LOOCV + Optuna training loop
-│   ├── model.py                    # Shared coordinate/biome head definitions
-│   ├── trainer.py                  # Shared loss/metric helpers
 │   └── dataset.py                  # Shared data constants (BIOME_CLASSES, CoordStats)
 
 configs/examples/
@@ -499,11 +497,8 @@ configs/examples/
 ├── genotype_finetune_weighted.toml            # VES-weighted mode (all loci × |VES|)
 ├── genotype_finetune_weighted_no_biome.toml   # Biome head ablation (weighted, no biome loss)
 ├── genotype_finetune_learnable_haversine.toml # Learnable VES gates + haversine loss
-├── genotype_finetune_no_ves_tuned.toml         # No-VES tuned baseline (same Optuna budget)
-└── fine_tune.toml                             # Fine-tuning experiment bootstrap config
-
-design-logs/
-└── option-a-ves-genotype-architecture.md  # Full architecture specification
+├── genotype_finetune_no_ves_tuned.toml        # No-VES tuned baseline (same Optuna budget)
+└── genotype_finetune_locator_baseline.toml    # Locator baseline (no VES)
 
 dev_docs/
 └── pipeline_diagnosis_and_plan.md  # Root-cause analysis of MIL pipeline failure

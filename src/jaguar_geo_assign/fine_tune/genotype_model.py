@@ -15,6 +15,7 @@ architecture.
 from __future__ import annotations
 
 import logging
+import math
 from dataclasses import dataclass
 
 import torch
@@ -23,10 +24,76 @@ from jaxtyping import Float, Int, jaxtyped
 from torch import Tensor, nn
 
 from jaguar_geo_assign.fine_tune.dataset import CoordStats
-from jaguar_geo_assign.fine_tune.model import JaguarMTLOutput
-from jaguar_geo_assign.fine_tune.trainer import haversine_distance_km
 
 logger = logging.getLogger(__name__)
+
+# Alias used only in jaxtyping shape annotations; kept out of runtime logic.
+batch = "batch"  # noqa: F841
+
+
+@dataclass
+class GeoPredictionOutput:
+    """Container for geographic prediction model outputs.
+
+    Attributes:
+        coordinate: Tensor of shape ``(batch_size, 2)`` containing
+            ``(latitude, longitude)`` predictions in the same units as the
+            training targets.
+        biome_logits: Optional tensor of shape ``(batch_size, num_biomes)``
+            with unnormalised classification scores. ``None`` when the model
+            was constructed without a biome head.
+    """
+
+    coordinate: torch.Tensor
+    biome_logits: torch.Tensor | None = None
+
+
+@jaxtyped(typechecker=beartype)
+def haversine_distance_km(
+    pred_deg: Float[Tensor, "batch 2"],
+    target_deg: Float[Tensor, "batch 2"],
+    *,
+    radius_km: float = 6371.0,
+    epsilon: float = 1e-7,
+) -> Float[Tensor, batch]:
+    """Compute great-circle distance between coordinate pairs in kilometres.
+
+    The implementation follows the standard Haversine formula with explicit
+    numerical guards suitable for mixed-precision training:
+
+    * Inputs are promoted to ``float32`` before trigonometric operations.
+    * The intermediate ``a`` term is clamped to ``[epsilon, 1-epsilon]`` to
+      avoid invalid values inside :func:`torch.asin` due to rounding.
+    * The square root is applied *before* ``asin`` (``asin(sqrt(a))``); omitting
+      the square root would systematically over-estimate distances.
+    """
+
+    if pred_deg.ndim != 2 or target_deg.ndim != 2:
+        raise ValueError("haversine_distance_km expects 2D tensors of shape [B, 2]")
+    if pred_deg.shape[-1] != 2 or target_deg.shape[-1] != 2:
+        raise ValueError("haversine_distance_km last dimension must be of size 2 (lat, lon)")
+
+    pred = pred_deg.to(dtype=torch.float32)
+    target = target_deg.to(dtype=torch.float32)
+
+    lat1, lon1 = torch.unbind(pred, dim=-1)
+    lat2, lon2 = torch.unbind(target, dim=-1)
+
+    deg2rad = math.pi / 180.0
+    lat1 = lat1 * deg2rad
+    lon1 = lon1 * deg2rad
+    lat2 = lat2 * deg2rad
+    lon2 = lon2 * deg2rad
+
+    dlat = lat2 - lat1
+    dlon = lon2 - lon1
+
+    sin_dlat = torch.sin(dlat * 0.5)
+    sin_dlon = torch.sin(dlon * 0.5)
+    a = sin_dlat.square() + torch.cos(lat1) * torch.cos(lat2) * sin_dlon.square()
+    a_clamped = a.clamp(min=epsilon, max=1.0 - epsilon)
+    c = 2.0 * torch.asin(a_clamped.sqrt())
+    return radius_km * c
 
 
 @dataclass(frozen=True)
@@ -112,7 +179,7 @@ class JaguarGenotypeMLP(nn.Module):
     def forward(
         self,
         genotypes: Float[Tensor, "batch n_features"],
-    ) -> JaguarMTLOutput:
+    ) -> GeoPredictionOutput:
         """Forward pass returning coordinates and biome logits.
 
         Args:
@@ -121,7 +188,7 @@ class JaguarGenotypeMLP(nn.Module):
                 continuous after VES weighting.
 
         Returns:
-            JaguarMTLOutput with coordinate predictions and biome logits.
+            GeoPredictionOutput with coordinate predictions and biome logits.
         """
         if self.locus_gate is not None:
             x = genotypes * torch.sigmoid(self.locus_gate)
@@ -131,12 +198,12 @@ class JaguarGenotypeMLP(nn.Module):
         x = self.trunk(x)
         coordinate = self.coordinate_head(x)
         biome_logits = self.biome_head(x)
-        return JaguarMTLOutput(coordinate=coordinate, biome_logits=biome_logits)
+        return GeoPredictionOutput(coordinate=coordinate, biome_logits=biome_logits)
 
 
 @jaxtyped(typechecker=beartype)
 def compute_genotype_loss(
-    outputs: JaguarMTLOutput,
+    outputs: GeoPredictionOutput,
     coord_target_deg: Float[Tensor, "batch 2"],
     biome_label: Int[Tensor, "batch"],
     *,
@@ -259,10 +326,12 @@ def compute_ves_gate_init(
 
 
 __all__ = [
+    "GeoPredictionOutput",
     "GenotypeMLPConfig",
     "JaguarGenotypeMLP",
     "apply_ves_selection",
     "apply_ves_weighting",
     "compute_genotype_loss",
     "compute_ves_gate_init",
+    "haversine_distance_km",
 ]
