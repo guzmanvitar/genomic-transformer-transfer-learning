@@ -46,6 +46,7 @@ class GenotypeMLPConfig:
     n_hidden_layers: int = 2
     hidden_dim: int = 256
     dropout: float = 0.2
+    dropout_after_layer: int | None = None
 
 
 class JaguarGenotypeMLP(nn.Module):
@@ -96,10 +97,11 @@ class JaguarGenotypeMLP(nn.Module):
 
         layers: list[nn.Module] = []
         in_dim = config.n_input_features
-        for _ in range(config.n_hidden_layers):
+        for layer_num in range(config.n_hidden_layers):
             layers.append(nn.Linear(in_dim, hidden_dim))
             layers.append(nn.ELU())
-            layers.append(nn.Dropout(config.dropout))
+            if config.dropout_after_layer is None or (layer_num + 1) == config.dropout_after_layer:
+                layers.append(nn.Dropout(config.dropout))
             in_dim = hidden_dim
         self.trunk = nn.Sequential(*layers)
 

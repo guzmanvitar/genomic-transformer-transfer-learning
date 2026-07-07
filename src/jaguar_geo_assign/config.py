@@ -1640,6 +1640,15 @@ class GenotypeFinetuneConfig:
     optuna_study_name: str = "jaguar_genotype_ves"
     device: str = "auto"
     tensorboard_subdir: str = "tensorboard"
+    n_hidden_layers: int | None = None
+    hidden_dim: int | None = None
+    dropout: float | None = None
+    dropout_after_layer: int | None = None
+    use_adam: bool = False
+    learning_rate: float | None = None
+    weight_decay: float | None = None
+    max_epochs: int | None = None
+    coord_loss_weight: float | None = None
 
 
 def load_genotype_finetune_config(path: str | Path) -> GenotypeFinetuneConfig:
@@ -1681,6 +1690,31 @@ def load_genotype_finetune_config(path: str | Path) -> GenotypeFinetuneConfig:
         device = str(training.get("device", "auto"))
         tensorboard_subdir = str(training.get("tensorboard_subdir", "tensorboard"))
 
+        # Fixed-hyperparameter fields (used when optuna_n_trials == 0).
+        n_hidden_layers_raw = training.get("n_hidden_layers")
+        n_hidden_layers = int(n_hidden_layers_raw) if n_hidden_layers_raw is not None else None
+        hidden_dim_raw = training.get("hidden_dim")
+        hidden_dim = int(hidden_dim_raw) if hidden_dim_raw is not None else None
+        dropout_raw = training.get("dropout")
+        dropout = float(dropout_raw) if dropout_raw is not None else None
+        learning_rate_raw = training.get("learning_rate")
+        learning_rate = float(learning_rate_raw) if learning_rate_raw is not None else None
+        weight_decay_raw = training.get("weight_decay")
+        weight_decay = float(weight_decay_raw) if weight_decay_raw is not None else None
+        max_epochs_raw = training.get("max_epochs")
+        max_epochs = int(max_epochs_raw) if max_epochs_raw is not None else None
+        coord_loss_weight_raw = training.get("coord_loss_weight")
+        coord_loss_weight = (
+            float(coord_loss_weight_raw) if coord_loss_weight_raw is not None else None
+        )
+        dropout_after_layer_raw = training.get("dropout_after_layer")
+        dropout_after_layer = (
+            int(dropout_after_layer_raw) if dropout_after_layer_raw is not None else None
+        )
+        use_adam = training.get("use_adam", False)
+        if type(use_adam) is not bool:
+            raise ValueError("training.use_adam must be a TOML boolean (true/false)")
+
         if ves_batch_size <= 0:
             raise ValueError("training.ves_batch_size must be positive")
         if ves_mode not in ("weighted", "selection", "none", "learnable"):
@@ -1696,8 +1730,24 @@ def load_genotype_finetune_config(path: str | Path) -> GenotypeFinetuneConfig:
             raise ValueError(
                 f"training.cv_strategy must be 'loocv' or 'stratified_kfold'; got {cv_strategy!r}"
             )
-        if optuna_n_trials <= 0:
-            raise ValueError("training.optuna_n_trials must be positive")
+        if optuna_n_trials < 0:
+            raise ValueError("training.optuna_n_trials must be non-negative")
+        if optuna_n_trials == 0:
+            fixed_fields = {
+                "n_hidden_layers": n_hidden_layers,
+                "hidden_dim": hidden_dim,
+                "dropout": dropout,
+                "learning_rate": learning_rate,
+                "weight_decay": weight_decay,
+                "max_epochs": max_epochs,
+                "coord_loss_weight": coord_loss_weight,
+            }
+            missing = [k for k, v in fixed_fields.items() if v is None]
+            if missing:
+                raise ValueError(
+                    f"optuna_n_trials=0 requires fixed hyperparameters; "
+                    f"missing: {', '.join(missing)}"
+                )
         if device not in ("auto", "cuda", "cpu"):
             raise ValueError(f"training.device must be 'auto', 'cuda', or 'cpu'; got {device!r}")
         if not tensorboard_subdir:
@@ -1725,4 +1775,13 @@ def load_genotype_finetune_config(path: str | Path) -> GenotypeFinetuneConfig:
         optuna_study_name=optuna_study_name,
         device=device,
         tensorboard_subdir=tensorboard_subdir,
+        n_hidden_layers=n_hidden_layers,
+        hidden_dim=hidden_dim,
+        dropout=dropout,
+        dropout_after_layer=dropout_after_layer,
+        use_adam=use_adam,
+        learning_rate=learning_rate,
+        weight_decay=weight_decay,
+        max_epochs=max_epochs,
+        coord_loss_weight=coord_loss_weight,
     )

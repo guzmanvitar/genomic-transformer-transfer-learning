@@ -1,0 +1,49 @@
+# Locator Baseline — Fixed hyperparameters (Battey et al., 2020)
+#
+# Reproduces the Locator MLP architecture and training defaults on the
+# jaguar genotype matrix. No Optuna tuning, no VES — this is what the
+# original tool would give you out of the box.
+#
+# This baseline is intentionally NOT hyperparameter-tuned, so it is not
+# a fair comparison for isolating VES contribution (use the no-VES tuned
+# config for that). It IS a fair reproduction of the original method.
+
+[training]
+# Required paths.
+vcf_path = "data/raw/jaguar.57samples.allChr.snps.hardFilter.bi.maf.ld.masked.hwe.recode.vcf"
+reference_fasta = "data/raw/felid_foundation/reference/DNAZOO_Panthera_onca_HiC.fna.gz"
+metadata_csv = "data/raw/jaguar_location.csv"
+backbone_path = "models/foundation_felid/best/hf_model"
+output_dir = "models/jaguar_genotype_locator_baseline"
+
+# Genotype matrix caching (shared with other runs).
+genotype_cache_dir = "data/processed/genotype_matrix"
+
+# No VES.
+compute_ves = false
+ves_mode = "none"
+
+# Fixed hyperparameters — no Optuna search.
+optuna_n_trials = 0
+
+# Locator defaults (Battey et al., 2020).
+n_hidden_layers = 10
+hidden_dim = 256
+dropout = 0.25
+dropout_after_layer = 5   # Locator: dropout after 5th hidden layer only.
+use_adam = true            # Locator: Adam, not AdamW.
+learning_rate = 0.001
+weight_decay = 0.0
+max_epochs = 5000
+coord_loss_weight = 1.0
+
+# Coordinate regression only.
+cls_loss_weight = 0.0
+
+# Cross-validation.
+cv_strategy = "loocv"
+seed = 42
+
+# Runtime.
+device = "auto"
+tensorboard_subdir = "tensorboard"
