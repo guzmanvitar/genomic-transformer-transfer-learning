@@ -1,3 +1,4 @@
+# ruff: noqa: F722  # jaxtyping shape annotations use string-based dimensions
 """Genotype MLP training with LOOCV and optional Optuna optimization.
 
 This module implements the full training pipeline for the genotype
@@ -24,6 +25,8 @@ from typing import Any
 
 import torch
 from accelerate.utils import set_seed
+from beartype import beartype
+from jaxtyping import Float, Int, jaxtyped
 from torch import Tensor
 from torch.optim import AdamW
 from transformers import get_cosine_schedule_with_warmup
@@ -44,8 +47,8 @@ from jaguar_geo_assign.fine_tune.genotype_model import (
     apply_ves_weighting,
     compute_genotype_loss,
     compute_ves_gate_init,
+    haversine_distance_km,
 )
-from jaguar_geo_assign.fine_tune.trainer import compute_eval_metrics, haversine_distance_km
 from jaguar_geo_assign.fine_tune.variant_scoring import (
     compute_variant_effect_scores,
     load_ves_scores,
@@ -53,6 +56,114 @@ from jaguar_geo_assign.fine_tune.variant_scoring import (
 )
 
 logger = logging.getLogger(__name__)
+
+# Alias used only in jaxtyping shape annotations; kept out of runtime logic.
+batch = "batch"  # noqa: F841
+
+
+@jaxtyped(typechecker=beartype)
+def compute_eval_metrics(
+    cls_logits: Float[Tensor, "batch n_biomes"],
+    coord_pred: Float[Tensor, "batch 2"],
+    biome_label: Int[Tensor, batch],
+    coord_target: Float[Tensor, "batch 2"],
+    coord_stats: CoordStats,
+    n_biomes: int = 5,
+) -> dict[str, float]:
+    """Compute classification and regression metrics on the full eval set.
+
+    Callers are expected to concatenate and gather outputs across all eval
+    batches and DDP ranks *before* invoking this function. Metrics are
+    computed on CPU using numerically stable Torch operations only.
+
+    The implementation explicitly supports coordinate-only heads by allowing
+    ``cls_logits`` to be empty. In that case, classification metrics are
+    reported as ``NaN`` while coordinate metrics remain fully defined.
+    """
+
+    with torch.no_grad():
+        per_class_f1: list[float] = []
+        if cls_logits.numel() == 0:
+            acc = float("nan")
+            macro_f1 = float("nan")
+        else:
+            preds = cls_logits.argmax(dim=1).to("cpu")
+            labels = biome_label.to("cpu")
+
+            correct = (preds == labels).sum().item()
+            acc = correct / max(int(labels.numel()), 1)
+
+            for k in range(n_biomes):
+                true_k = labels == k
+                pred_k = preds == k
+                tp = (true_k & pred_k).sum().item()
+                fp = ((~true_k) & pred_k).sum().item()
+                fn = (true_k & (~pred_k)).sum().item()
+                if tp == 0 and (fp > 0 or fn > 0):
+                    per_class_f1.append(0.0)
+                    continue
+                denom_p = tp + fp
+                denom_r = tp + fn
+                if denom_p == 0 or denom_r == 0:
+                    per_class_f1.append(0.0)
+                    continue
+                precision = tp / denom_p
+                recall = tp / denom_r
+                if precision + recall == 0.0:
+                    per_class_f1.append(0.0)
+                else:
+                    per_class_f1.append(2.0 * precision * recall / (precision + recall))
+
+            if per_class_f1:
+                macro_f1 = float(sum(per_class_f1) / len(per_class_f1))
+            else:
+                macro_f1 = float("nan")
+
+        if coord_pred.numel() == 0 or coord_target.numel() == 0:
+            mae_lat = float("nan")
+            mae_lon = float("nan")
+            hav_mean = float("nan")
+            hav_median = float("nan")
+        else:
+            coord_pred_cpu = coord_pred.to("cpu", dtype=torch.float32)
+            coord_target_cpu = coord_target.to("cpu", dtype=torch.float32)
+
+            lat_pred = coord_pred_cpu[:, 0] * float(coord_stats.lat_std) + float(
+                coord_stats.lat_mean
+            )
+            lon_pred = coord_pred_cpu[:, 1] * float(coord_stats.lon_std) + float(
+                coord_stats.lon_mean
+            )
+            lat_true = coord_target_cpu[:, 0] * float(coord_stats.lat_std) + float(
+                coord_stats.lat_mean
+            )
+            lon_true = coord_target_cpu[:, 1] * float(coord_stats.lon_std) + float(
+                coord_stats.lon_mean
+            )
+
+            mae_lat = (lat_pred - lat_true).abs().mean().item()
+            mae_lon = (lon_pred - lon_true).abs().mean().item()
+
+            pred_deg = torch.stack((lat_pred, lon_pred), dim=-1)
+            target_deg = torch.stack((lat_true, lon_true), dim=-1)
+            hav = haversine_distance_km(pred_deg, target_deg)
+            hav_mean = float(hav.mean().item())
+            hav_median = float(hav.median().item())
+
+    metrics: dict[str, float] = {
+        "accuracy": float(acc),
+        "macro_f1": float(macro_f1),
+        "mae_lat_deg": float(mae_lat),
+        "mae_lon_deg": float(mae_lon),
+        "haversine_km_mean": float(hav_mean),
+        "haversine_km_median": float(hav_median),
+    }
+
+    for idx, biome in enumerate(BIOME_CLASSES[:n_biomes]):
+        if idx < len(per_class_f1):
+            metrics[f"per_class_f1_{biome}"] = float(per_class_f1[idx])
+
+    return metrics
 
 
 @dataclass(frozen=True)

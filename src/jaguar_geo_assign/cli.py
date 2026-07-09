@@ -20,14 +20,10 @@ import traceback
 from collections.abc import Sequence
 from pathlib import Path
 
-from .baselines import BASELINE_EVALUATION_STAGE
 from .config import (
     check_felid_foundation_pipeline_runtime,
-    describe_experiment,
     describe_felid_foundation_config,
-    load_experiment_config,
     load_felid_foundation_pipeline_config,
-    load_mil_finetune_config,
 )
 from .pretrain import (
     acquire_felid_foundation_assemblies,
@@ -36,42 +32,8 @@ from .pretrain import (
 )
 
 
-def format_mil_train_result(result: object) -> str:
-    """Format an MILTrainResult for human-readable CLI output.
-
-    Uses duck-typed attribute access so the CLI can summarize MIL results
-    without importing torch-heavy training modules during startup.
-    """
-
-    lines = [
-        "Jaguar MIL fine-tuning completed.",
-        f"  Fold index: {result.fold_index}",
-        f"  Steps completed: {result.steps_completed}",
-        f"  Best eval haversine (km): {result.best_eval_haversine_km}",
-        f"  Best eval macro F1: {result.best_eval_macro_f1}",
-        f"  Output directory: {result.output_dir}",
-    ]
-    return "\n".join(lines)
-
-
 def build_parser() -> argparse.ArgumentParser:
     """Construct the top-level argument parser with all sub-commands.
-
-    The parser exposes the following sub-commands:
-
-    * ``mil-finetune`` – run positional MIL fine-tuning over offline embeddings.
-    * ``extract-embeddings`` – materialize frozen DNABERT-2 window embeddings.
-    * ``extract-finetune-windows`` – extract 512 bp locus-centered windows from jaguar VCFs.
-    * ``evaluate``, ``baseline-evaluate``, ``report`` –
-      scaffold placeholders for later pipeline stages.
-    * ``validate-config`` – validate a bootstrap TOML config.
-    * ``describe-experiment`` – summarise a bootstrap TOML config.
-    * ``felid-foundation-pretrain`` – run the felid foundation pretraining pipeline.
-    * ``acquire-felid-foundation-assemblies`` – download felid reference FASTAs.
-    * ``validate-felid-foundation-config`` – validate a felid foundation config.
-    * ``describe-felid-foundation-config`` – summarise a felid foundation config.
-    * ``check-felid-foundation-runtime`` – check felid foundation runtime dependencies.
-    * ``train-felid-foundation`` – run felid foundation continued pre-training (DNABERT-2 MLM).
 
     Returns:
         A fully-configured :class:`argparse.ArgumentParser` ready for
@@ -79,21 +41,6 @@ def build_parser() -> argparse.ArgumentParser:
     """
     parser = argparse.ArgumentParser(prog="jaguar-geo-assign")
     subparsers = parser.add_subparsers(dest="command", required=True)
-
-    for command in ("evaluate", "baseline-evaluate", "report"):
-        stage = subparsers.add_parser(command, help=f"Scaffold the {command} stage.")
-        stage.add_argument("--config", type=Path, help="Optional path to a TOML config.")
-
-    mil_finetune = subparsers.add_parser(
-        "mil-finetune",
-        help="Run positional MIL fine-tuning over offline embeddings.",
-    )
-    mil_finetune.add_argument(
-        "--config",
-        type=Path,
-        required=True,
-        help="Path to the MIL fine-tuning TOML config.",
-    )
 
     genotype_finetune = subparsers.add_parser(
         "genotype-finetune",
@@ -105,25 +52,6 @@ def build_parser() -> argparse.ArgumentParser:
         required=True,
         help="Path to the genotype fine-tuning TOML config.",
     )
-
-    extract_embeddings = subparsers.add_parser(
-        "extract-embeddings",
-        help="Materialize frozen DNABERT-2 embeddings for jaguar fine-tune windows.",
-    )
-    extract_embeddings.add_argument(
-        "--config",
-        type=Path,
-        required=True,
-        help="Path to the embedding-extraction TOML config.",
-    )
-
-    validate = subparsers.add_parser("validate-config", help="Validate a bootstrap TOML config.")
-    validate.add_argument("config", type=Path)
-
-    describe = subparsers.add_parser(
-        "describe-experiment", help="Summarize a bootstrap TOML config."
-    )
-    describe.add_argument("config", type=Path)
 
     # Felid foundation pipeline subcommands
     felid_pretrain = subparsers.add_parser(
@@ -245,15 +173,6 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(list(argv) if argv is not None else None)
 
-    if args.command == "validate-config":
-        config = load_experiment_config(args.config)
-        print(f"Config '{config.name}' is valid for the bootstrap scaffold.")
-        return 0
-
-    if args.command == "describe-experiment":
-        print(describe_experiment(args.config))
-        return 0
-
     if args.command == "felid-foundation-pretrain":
         try:
             result = run_felid_foundation_pretrain(args.config)
@@ -322,35 +241,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             return 1
         return 0
 
-    if args.command == "mil-finetune":
-        from .fine_tune.mil_trainer import run_jaguar_mil_training
-
-        try:
-            load_mil_finetune_config(args.config)
-            result = run_jaguar_mil_training(args.config)
-            print(format_mil_train_result(result))
-        except (RuntimeError, ValueError) as error:
-            print(str(error))
-            return 1
-        return 0
-
     if args.command == "genotype-finetune":
         from .fine_tune.genotype_trainer import format_genotype_train_result, run_genotype_training
 
         try:
             result = run_genotype_training(args.config)
             print(format_genotype_train_result(result))
-        except (RuntimeError, ValueError) as error:
-            print(str(error))
-            return 1
-        return 0
-
-    if args.command == "extract-embeddings":
-        from .fine_tune.extract_embeddings import format_extraction_result, run_embedding_extraction
-
-        try:
-            result = run_embedding_extraction(args.config)
-            print(format_extraction_result(result))
         except (RuntimeError, ValueError) as error:
             print(str(error))
             return 1
@@ -389,21 +285,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"  Output: {result.output_path}")
         return 0
 
-    config_name = None
-    if args.config is not None:
-        config = load_experiment_config(args.config)
-        config_name = config.name
-
-    print(f"{args.command} entry point scaffold is available.")
-    if config_name:
-        print(f"Loaded config: {config_name}")
-        if args.command == "baseline-evaluate":
-            print(
-                "Deferred baseline stage is reserved for "
-                f"{BASELINE_EVALUATION_STAGE} without enabling legacy execution."
-            )
-    print("Detailed pipeline implementation is intentionally deferred to later tasks.")
-    return 0
+    parser.error(f"Unknown command: {args.command}")
+    return 1
 
 
 if __name__ == "__main__":

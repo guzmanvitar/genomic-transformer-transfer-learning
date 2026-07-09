@@ -1,10 +1,7 @@
 """Canonical field contracts for jaguar sample metadata.
 
 Defines the required metadata columns that every jaguar sample manifest must
-contain.  These fields are validated at config-load time
-(:func:`~jaguar_geo_assign.config.load_experiment_config`) to guarantee that
-downstream stages (splitting, evaluation, reporting) receive a consistent
-schema.
+contain.
 """
 
 # The ordering is significant: config validation compares tuples element-wise
