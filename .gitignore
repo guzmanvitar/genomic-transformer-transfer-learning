@@ -230,3 +230,23 @@ models/foundation_felid/
 
 # Trained models
 /models
+
+# macOS
+.DS_Store
+
+# LaTeX build artifacts (thesis/)
+*.aux
+*.bbl
+*.blg
+*.lof
+*.lot
+*.toc
+*.out
+*.fls
+*.fdb_latexmk
+*.synctex.gz
+*.loa
+*.lob
+*.los
+*.lov
+/thesis/main.pdf

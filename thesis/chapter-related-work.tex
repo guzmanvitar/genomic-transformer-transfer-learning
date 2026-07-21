@@ -1,0 +1,98 @@
+\chapter{RELATED WORK}
+\label{chap:related_work}
+
+\section{Introduction}
+
+Geographic assignment of individuals based on genetic data is an important task in conservation genomics, particularly for forensic applications aimed at combating poaching and illegal trade.
+
+Traditional approaches, such as PCA or Bayesian clustering, have provided valuable insights but often require large sample sizes and struggle with subtle differentiation across fragmented populations.
+
+In recent years, machine learning methods, ranging from kernel-based dimensionality reduction to deep learning, have emerged as powerful alternatives to traditional methods. These approaches improve accuracy, scalability, and the ability to capture non-linear patterns in genomic data.
+
+\section{Deep Learning for Geographical Assignment \& Genetic Data Representation}
+
+\subsection{Battey et al – Locator: Deep Neural Network for Geographic Assignment}
+
+Battey and colleagues (2020) \cite{battey2020predicting} set out to address the limitations of traditional Bayesian geographic assignment models, which, while powerful, are computationally expensive and often struggle with fine-scale resolution.
+
+Their goal was to explore whether deep neural networks could offer both greater accuracy and efficiency by directly predicting the geographic coordinates of individuals from their genomic data. By reframing the problem as a regression task, they aimed to capture subtle spatial allele frequency patterns that classical models often miss.
+
+To implement this, the authors designed a fully connected feedforward neural network architecture, essentially a multilayer perceptron (MLP). The input layer took thousands of SNP-derived genotypes encoded as numerical features, which were then passed through several hidden layers with nonlinear activation functions (ReLU) to model complex interactions among alleles. Dropout layers were included to reduce overfitting, and the output layer consisted of two continuous nodes representing latitude and longitude, optimized with Euclidean distance loss between predicted and true coordinates. This relatively simple but powerful architecture allowed Locator to generalize across genomic windows and datasets, balancing predictive capacity with computational efficiency.
+
+To test their approach, the authors applied their model, Locator, to both simulated and empirical data. The simulated datasets provided controlled scenarios where the true spatial origin of each individual was known, allowing for a rigorous assessment of accuracy.
+
+For empirical validation, they used whole-genome sequencing data from a diverse set of systems: Anopheles mosquitoes sampled across Africa, Plasmodium falciparum parasites from Africa and Asia, and global human genomic datasets. This range of datasets was critical, as it tested the method's robustness under varying marker densities, levels of population structure, and geographic scales.
+
+The results demonstrated that the neural network not only outperformed the Bayesian comparator SPASIBA in terms of speed but also achieved strikingly higher accuracy. Locator localized individuals to within approximately four dispersal generations in simulated data, while in empirical datasets median assignment errors ranged from only 5.7 km in mosquitoes to about 85 km in Plasmodium and human populations. Importantly, the runtime improvements were substantial, with Locator operating an order of magnitude faster than SPASIBA, making it suitable for genome-wide applications.
+
+Despite these advances, the study highlighted two key limitations: the model's dependence on large, representative training datasets and its black-box nature, which obscures the biological interpretation of the features driving predictions.
+
+\subsection{Degen et al – Comparing Machine Learning Approaches for Continuous Spatial Assignment}
+
+Degen and colleagues (2025) \cite{degen2025machine} investigated whether modern machine learning approaches could improve the continuous geographic assignment of individuals from SNP data in European tree species. Their goal was to benchmark several methods against each other, including deep learning, Gaussian process regression (GPR), k-nearest neighbors, and genomic best linear unbiased prediction (GBLUP).
+
+The deep learning component was built around a multilayer perceptron (MLP) similar in spirit to Battey et al.'s Locator, but optimized for continuous regression of geographic coordinates. Genotype features (SNPs) were passed into a network of dense hidden layers with nonlinear activations, designed to capture allele frequency gradients and complex dependencies between loci. Hyperparameters such as layer depth, number of units per layer, and dropout rates were tuned to balance generalization with predictive performance. The output layer produced two continuous values for latitude and longitude, again trained with a regression loss function that minimized the Euclidean distance between predicted and true coordinates. This allowed the DNN to flexibly model nonlinear genotype–geography relationships, while complementing GPR, which excelled at uncertainty estimation.
+
+The datasets used were SNP panels from two widespread species: European beech (\textit{Fagus sylvatica}) and European oak (\textit{Quercus robur}). Both species were sampled broadly across their ranges, providing thousands of individuals with known geographic origins. These large datasets offered an opportunity to test whether machine learning could recover fine-scale population structure and spatial gradients of allele frequencies that reflect evolutionary and demographic processes.
+
+Results revealed that both deep neural networks (multi-layer perceptrons) and GPR with a Matérn kernel achieved the highest accuracy, predicting origins with median errors of $\sim$55–76 km for beech and $\sim$263–278 km for oak. These errors were substantially smaller than those achieved by simpler models like k-NN or GBLUP.
+
+The authors noted that GPR provided probabilistic uncertainty estimates, which are useful in practice, while DNNs were more flexible in modeling nonlinear interactions between SNPs. Both methods required large amounts of training data and computational resources.
+
+\subsection{Bayliss et al. - Hierarchical ML for Geographic Assignment of Genomic Samples}
+
+A recent preprint by Bayliss et al. (2023) \cite{bayliss2022hierarchical} introduces a hierarchical machine learning framework for predicting the geographic origin of genomic samples, with Salmonella enterica serovar Enteritidis as the proof of concept. The aim is to trace sources of infection by assigning each genome to its most likely continent, sub-region, and country of origin directly from DNA data. Rather than relying on deep neural networks, the authors explored more classical ML approaches such as random forests, gradient boosting, and support vector machines, demonstrating the strength of these methods in large-scale genomic inference.
+
+The dataset consisted of 2,313 S. Enteritidis genomes collected by the UK Health Security Agency between 2014 and 2019, each linked to one of 53 geographic classes organized hierarchically: four continents, eleven sub-regions, and thirty-eight countries. Instead of training a single flat classifier, the researchers implemented a ``local classifier per node" strategy, cascading models so that predictions flowed from continent to sub-region to country. This design reduced misclassifications by ensuring that finer-level predictions were restricted to plausible sub-areas once higher-level categories were determined.
+
+Genetic features were extracted from sequencing data using k-mer units, and multiple algorithms were systematically evaluated under consistent conditions. The team tested random forests, SVMs, k-nearest neighbors, XGBoost, and Naïve Bayes, while carefully addressing class imbalance with resampling techniques and reducing feature dimensionality through iterative selection based on random forest importance scores. Ultimately, optimized random forests were selected at each hierarchical level, striking a balance between predictive accuracy, interpretability, and computational speed. The resulting pipeline could analyze raw reads and deliver a geographic prediction in under four minutes—a stark contrast with more labor-intensive phylogeographic analyses.
+
+The results were compelling. At the continental level, accuracy was extremely high (macro F1 $\approx$ 0.954). Performance remained strong at the sub-regional level (F1 $\approx$ 0.718) and reached a respectable macro F1 of 0.661 at the country level, even across 38 classes. In practice, some countries—particularly those with high travel links to the UK—achieved hierarchical F1 scores above 0.90, reflecting near-perfect precision. Crucially, the method generalized well: when applied to external Salmonella datasets outside the original training set, accuracy remained robust, indicating that the models captured true geographic signals in the genomes rather than simply memorizing the data.
+
+The novelty of this work lies in showing that established ensemble methods, implemented hierarchically, can deliver accurate, fine-scale geographic predictions from genomic data without the heavy computational demands of deep learning. Bayliss et al.'s approach enriches the methodological toolkit for geographic assignment, complementing deep-learning tools like Locator and Gaussian-process models with a practical, transparent, and efficient alternative.
+
+\subsection{Our proposal: Transfer Learning for Geographical Assignment}
+
+The central aim of this project is to adapt DNA language modeling to the conservation genomics context by training a DNABERT-style transformer from scratch on felid genomes and fine-tuning it for jaguar population-of-origin assignment. This two-stage approach allows us to exploit the abundant genomic resources available for domestic cats and related felids, while directly targeting the geographic assignment challenge in jaguars, where data are scarce and populations fragmented.
+
+\subsubsection{Pretraining on felid genomes}
+
+In the pretraining stage, we will train a DNABERT-2 architecture \cite{zhou2024dnabert} from scratch using large-scale felid genomic data (domestic cat resequencing projects, wild felid genomes, and publicly available assemblies). The model will tokenize DNA sequences with a byte-pair encoding (BPE) scheme, which reduces redundancy compared to fixed k-mer tokenization and yields more compact representations of genomic features. Sequences will be broken into fixed-length segments (e.g., 128 bp windows) and fed into the transformer.
+
+The pretraining task will be masked language modeling (MLM), analogous to BERT for text. Random spans of nucleotides will be masked (typically 15–20\% of tokens), and the model will learn to reconstruct the missing bases given their left and right contexts. This forces the transformer to build an internal representation of nucleotide composition, motifs, and longer-range dependencies across felid genomes.
+
+By training on billions of tokens from felid genomes, the model will capture both conserved and lineage-specific sequence features relevant to the Felidae family. The resulting embeddings should generalize to jaguar data, even when jaguar-specific samples are limited.
+
+\subsubsection{Fine-tuning on jaguar geographic assignment}
+
+The second stage will fine-tune the pretrained felid DNABERT on jaguar-specific SNP datasets, with the objective of population-of-origin assignment. Two complementary formulations are possible:
+
+\begin{enumerate}
+	\item \textbf{Classification task:} assign individuals to one of a discrete set of populations (e.g., Amazon, Pantanal, Atlantic Forest, Cerrado, Caatinga). In this setup, the final transformer layer is connected to a softmax classifier, and the loss function is cross-entropy. This allows categorical assignment of jaguar individuals to their most likely population of origin.
+	\item \textbf{Regression task:} predict geographic coordinates (latitude/longitude) directly from genetic sequences, similar to \textit{Locator} \cite{battey2020predicting}. Here, the transformer output is connected to a regression head, and the loss function is Euclidean distance (L2) between predicted and true coordinates. This formulation is more flexible, especially when population boundaries are uncertain or continuous gradients of allele frequencies exist.
+\end{enumerate}
+
+Both tasks will be explored, and it is possible to use a hybrid loss, where the model is trained jointly on classification and regression, improving robustness across fragmented datasets. Given the scarcity of samples in some populations, techniques such as data augmentation (sliding sequence windows, synthetic minority oversampling), dropout regularization, and careful cross-validation will be analized to minimize overfitting.
+
+
+\section{Comparative Summary of Methods}
+
+\begin{table}[H]
+\centering
+\caption{Comparison of machine learning approaches for geographic assignment}
+\label{tab:ml_methods_comparison}
+\small
+\begin{tabular}{p{2.5cm}p{2.5cm}p{2.5cm}p{2.5cm}p{2.5cm}}
+\hline
+\textbf{Study} & \textbf{Goals} & \textbf{Methods} & \textbf{Results} & \textbf{Limitations} \\
+\hline
+Battey et al. (2020) & Improve speed and accuracy of geographic assignment & Deep neural network (Locator) predicting coordinates & Median errors 5.7–85 km; 10× faster than Bayesian models & Requires large datasets; limited interpretability \\
+\hline
+Degen et al. (2025) & Benchmark ML models for continuous assignment & DNNs, GPR, k-NN, GBLUP & DNN and GPR: 55–76 km (beech), 263–278 km (oak) & High computational demands; requires large datasets \\
+\hline
+Bayliss et al. (2022) & Hierarchical geographic assignment & Random Forests, SVMs, XGBoost (hierarchical) & F1: 0.954 (continent), 0.718 (sub-region), 0.661 (country) & Performance drops at finer scales; requires substantial data \\
+\hline
+Our Proposal & Apply transfer learning to overcome data scarcity & Fine-tune DNABERT-2 on jaguar data after pretraining on felid genomes & Expected to improve assignment accuracy in small, fragmented populations & Novel approach; requires validation \\
+\hline
+\end{tabular}
+\end{table}
