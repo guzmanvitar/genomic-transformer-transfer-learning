@@ -1,0 +1,21 @@
+# vim:filetype=perl
+#
+# Latexmkrc configuration file for compiling the thesis proposal
+# using the pucrs-ppgcc.cls class.
+#
+# Modified for main.tex by Guzman Vitar
+@default_files = ( "main" );
+
+push @generated_exts, "loa";
+push @generated_exts, "lob";
+push @generated_exts, "los";
+push @generated_exts, "lov";
+
+$pdf_mode   = 1;
+$pdflatex   = "pdflatex -shell-escape %O %S";
+$bibtex     = "bibtex %O %S";
+$sleep_time = 1;
+$bibtex_use = 2;
+
+#$force_mode = 1;
+#$preview_continuous_mode = 1;
