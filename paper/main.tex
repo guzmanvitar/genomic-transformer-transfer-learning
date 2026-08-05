@@ -109,12 +109,12 @@ Assignment of Jaguars (\textit{Panthera onca}) Using Complete Genomes and Transf
 Endangered species that most require precise forensic tools for anti-poaching enforcement are
 typically those for which the fewest genomes are available for model development. In the jaguar
 (\textit{Panthera onca}), assigning a trafficked individual to its population of origin is
-constrained both by small, fragmented samples and by a feature-to-sample ratio that makes
-locus selection challenging. We addressed geographic assignment from SNP data through
-cross-species transfer learning. We first finetunned DNABERT-2 \citep{zhou2024dnabert} on six felid
-reference assemblies, and then used the resulting foundation model to compute a label-free Variant
-Effect Score (VES) for each SNP, a measure of how surprising the alternate allele is in the felid
-genomic context. These scores initialized per-locus learnable gates in a genotype-matrix multilayer
+constrained both by small, fragmented samples and by a feature-to-sample ratio that makes locus
+selection challenging. We addressed geographic assignment from SNP data through cross-species
+transfer learning. We first finetunned DNABERT-2 \citep{zhou2024dnabert} on six felid reference
+assemblies, and then used the resulting foundation model to compute a label-free Variant Effect
+Score (VES) for each SNP, a measure of how surprising the alternate allele is in the felid genomic
+context. These scores initialized per-locus learnable gates in a genotype-matrix multilayer
 perceptron, which we trained with a differentiable haversine loss to predict coordinates directly.
 We evaluated every model with $55$-fold leave-one-out cross-validation over the jaguar genomes,
 tuned hyperparameters by $100$-trial Optuna Bayesian search, and benchmarked against an identically
@@ -125,25 +125,15 @@ tuned trial reached $174$\,km, against a roughly $350$--$400$\,km SCAT reference
 VES-initialized gates improved this further: the top-$5$ trial ensemble reached $165$\,km median
 haversine, while the best single Optuna trial reached $149$\,km and assigned $83.6\%$ of individuals
 within $500$\,km of their true origin. Bayesian tuning and cross-species transfer thus contributed
-successive gains in median error, from $199$ to $174$\,km and from $174$ to $149$\,km. These gains
-were metric-dependent, however: the VES model lowered the median but not the within-$500$\,km rate,
-which was highest for the tuned no-VES model ($89.1\%$) rather than for the best single VES trial
-($83.6\%$). Taken together, these results show that a foundation model pre-trained across the
-Felidae can supply constraint signal that a small, fragmented jaguar sample cannot provide on its
-own.
+successive gains in median error, from $199$ to $174$\,km and from $174$ to $149$\,km. Taken
+together, these results show that a foundation model pre-trained across the Felidae can supply extra
+signal during feature selection that a small, fragmented jaguar sample cannot provide on its own.
 \end{abstract}
 
 % Introduction
 \section{Introduction}
 
-\TODO{Intro condensation + tense pass: the Introduction below reuses proposal literature verbatim
-(jaguar conservation; conservation genomics and ML; the data-scarcity paradox; traditional methods
-SCAT/SPASIBA/STRUCTURE/KLFDAPC + comparative table + Zenato Lazzari; deep-learning methods
-Battey-Locator/Degen/Bayliss + comparative table; the transfer-learning promise + foundation models;
-and the objectives). This is thesis-length. CONDENSE to E\&E introduction length --- keep the
-jaguar/forensic motivation, the data-scarcity framing, the transfer-learning rationale, and the
-objectives; trim the method-by-method literature to citations. Also run a future-tense pass on the
-flagged passages (the objectives; "The innovative approach proposed here...").}
+\TODO{Intro condensation: I copyied most of this from the proposal, looks too long.}
 
 \subsection*{Jaguar Conservation}
 
@@ -1082,8 +1072,8 @@ classification and enables targeted enforcement at critical poaching hotspots.
 
 The geographic assignment stage mapped each individual's genotype vector directly onto a geographic
 coordinate, using a compact multilayer perceptron (MLP) in the spirit of Locator
-\citep{battey2020predicting} and GeoGenIE \TODO{EXTEND: add reference for GeoGenIE (Martin et al.,
-2025)}. The network took as input a per-individual vector of allele counts, one entry per retained
+\citep{battey2020predicting} and GeoGenIE \TODO{need the GeoGenIE citation, Martin et al. 2025}. The
+network took as input a per-individual vector of allele counts, one entry per retained
 single-nucleotide polymorphism (SNP) locus, with values in $\{0,1,2\}$ for the homozygous-reference,
 heterozygous, and homozygous-alternate states; once variant-effect-score (VES) weighting was
 applied, these entries became continuous. In the full-locus configuration behind the reported model,
@@ -1242,7 +1232,7 @@ individuals assigned within 250, 500, and 1000\,km, the last three chosen to ali
 population-genetics benchmark of \citet{lazzari2025development}.
 
 We optimized the model's architecture and training hyperparameters with the Optuna framework
-\TODO{EXTEND: add reference for the Optuna hyperparameter-optimization framework}, treating the
+\TODO{need Optuna citation}, treating the
 median LOOCV haversine distance as a black-box objective to be minimized. Each Optuna trial executed
 a complete 55-fold LOOCV under a candidate hyperparameter set and returned the resulting median
 haversine distance; we created the study with \texttt{direction="minimize"} and ran it for 100
@@ -1394,8 +1384,8 @@ Seed & $42$ \\
 
 \paragraph{Tuned no-VES baseline.} The second baseline holds the loss function, the LOOCV protocol
 and the raw-genotype input identical to the VES-guided experiments, but replaces Locator's fixed
-defaults with the same Optuna hyperparameter search we used for those experiments \TODO{EXTEND: add
-reference for Optuna}, again with \texttt{ves\_mode}${}=$\texttt{none}. This isolates the
+defaults with the same Optuna hyperparameter search we used for those experiments \TODO{same Optuna
+citation as above}, again with \texttt{ves\_mode}${}=$\texttt{none}. This isolates the
 contribution of Bayesian architecture search: set against the Locator baseline it quantifies the
 gain from tuning alone, while set against the VES-guided models it provides an upper bound on the
 gain attributable to the felid foundation model's locus-importance signal, holding tuning constant
@@ -1513,9 +1503,8 @@ regression head received the entire gradient signal; the classification metrics 
 that run (accuracy $0.182$, macro-$F_1$ $0.171$ in \texttt{loocv\_summary.json}) therefore reflect
 an untrained head and are not interpretable as biome-assignment performance. The configuration for
 that run notes that biome membership could instead be recovered post hoc from the predicted
-coordinates via spatial polygon lookup, but \TODO{EXTEND: no post-hoc polygon-lookup code path or
-recovered-biome field is present in the run outputs, so this procedure and any biome-assignment
-accuracy derived from it could not be confirmed from the sources.}
+coordinates via spatial polygon lookup, but \TODO{couldn't find the polygon-lookup code anywhere in
+the repo, so not sure this part actually ran.}
 
 \subsection{Implementation and Reproducibility}
 We implemented the entire pipeline as a single installable Python package,
@@ -1531,8 +1520,8 @@ they remain off by default (\texttt{addopts = "-q -m 'not integration'"}).
 Table~\ref{tab:dependencies} lists the core runtime libraries and the lower bounds pinned for each
 in \texttt{pyproject.toml}; the numerical and modelling backbone is \texttt{torch}, with
 \texttt{transformers} loading the DNABERT-2 model and tokenizer \citep{zhou2024dnabert} and
-\texttt{accelerate} handling distributed training and mixed precision. \TODO{EXTEND: add software
-citations for Python, PyTorch, HuggingFace Transformers, Accelerate, scikit-learn, Optuna, and uv}
+\texttt{accelerate} handling distributed training and mixed precision. \TODO{still need citations
+for the main libraries (torch, transformers, etc)}
 
 \begin{table*}[t]
 \centering
@@ -1549,13 +1538,12 @@ accelerate & \(\geq\)1.13.0 & Distributed training, mixed precision \\
 pyarrow & \(\geq\)16, \(<\)20 & Parquet corpus I/O \\
 scikit-learn
   & \(\geq\)1.8.0
-  & Cross-validation \TD{EXTEND: confirm scikit-learn role; README lists StratifiedGroupKFold
-  cross-validation, but no module under src/ imports scikit-learn and the genotype fine-tuning
-  uses a bespoke LOOCV loop} \\
+  & Cross-validation \TD{not sure sklearn is really used here, README says so but I can't find it
+  imported anywhere} \\
 tensorboard & \(\geq\)2.20.0 & Training-metrics logging \\
 beartype + jaxtyping & \(\geq\)0.22.9 / \(\geq\)0.3.9 & Runtime type and shape checking \\
 optuna & \(\geq\)4.9.0 & Hyperparameter optimization \\
-einops & \(\geq\)0.8.2 & \TD{EXTEND: confirm einops role} \\
+einops & \(\geq\)0.8.2 & \TD{not sure what einops is used for} \\
 \bottomrule
 \end{tabular}
 \end{table*}
@@ -1640,10 +1628,9 @@ the fact that a materialised corpus matches its source sequences without having 
 sequences themselves, closing the reproducibility loop from the raw assembly download through to the
 tokenized training input.
 
-\TODO{EXTEND: the actual training hardware (GPU model and count --- i.e.\ the data-parallel world
-size $W$ in the $32\times2\times W$ effective batch size) and the wall-clock runtimes for foundation
-pre-training, VES scoring, and the two 100-trial $\times$ 55-fold Optuna searches are not recorded
-in the sources and should be added here.}
+\TODO{need to add the actual GPU/hardware used and how long the runs took (foundation pre-training,
+VES scoring, the two Optuna searches) -- don't have these numbers written down anywhere, have to dig
+through old logs.}
 
 % Results
 \section{Results}
@@ -1695,10 +1682,8 @@ two side by side.
 Throughout, we report point estimates only. With $n=55$ individuals --- and as few as five
 (Caatinga) or six (Pantanal) per biome for two of the populations --- small differences in median
 kilometres and all per-biome comparisons carry substantial sampling variance, and we did not attach
-confidence intervals to any figure. \TODO{EXTEND: a bootstrap confidence interval for the overall
-median haversine and a paired Wilcoxon signed-rank test on the 55 per-individual VES vs.\ no-VES
-errors are not present in the run outputs; both could be computed from
-\texttt{loocv\_predictions.json}.}
+confidence intervals to any figure. \TODO{should add a bootstrap CI and a Wilcoxon test on the VES
+vs no-VES errors, can probably compute both from \texttt{loocv\_predictions.json}.}
 
 \begin{table*}[t]
 \centering
@@ -1731,9 +1716,8 @@ bracket our headline result: framed as a continuous-coordinate regression in the
 \citet{battey2020predicting}, the pipeline places a typical held-out jaguar within roughly 150--165
 km of its true origin, and assigns the great majority of individuals to within 500~km --- the
 threshold most relevant for comparison against traditional population-genetic assignment for this
-species \TODO{EXTEND: exact within-500 km assignment rate and fold-improvement reported by
-\citet{lazzari2025development} for jaguar --- present only in the README characterisation, not in
-the code/JSON sources of truth}.
+species \TODO{need the exact within-500km number from \citet{lazzari2025development}, only have it
+from the README not the actual output files}.
 
 \subsection{Comparison With Published Methods}
 The most directly comparable published benchmark for jaguar geographic assignment is the study of
@@ -1870,7 +1854,7 @@ against which to measure the effect of tuning rather than as confirmation of fid
 implementation.
 
 The second configuration replaced these fixed defaults with a 100-trial Optuna Bayesian search
-\TODO{EXTEND: add reference for Optuna (Akiba et al., 2019)}, holding the loss, the LOOCV protocol,
+\TODO{same Optuna citation as above, Akiba et al. 2019}, holding the loss, the LOOCV protocol,
 and the genotype input identical to the baseline. Each trial ran a complete 55-fold LOOCV and was
 scored by its median haversine distance, which the search minimized directly using Optuna's default
 Tree-structured Parzen Estimator sampler. The search space spanned the number of hidden layers (3 or
@@ -2165,32 +2149,27 @@ Taken together, these results show that our two contributions acted on complemen
 performance. The best single VES-learnable trial achieved the lowest median haversine distance
 overall, at 149.2\,km, whereas the largest single gain in within-500\,km accuracy came from Bayesian
 optimization of the Locator architecture alone, which lifted the fraction of individuals assigned
-within 500\,km from 67.3\% to 89.1\%. \TODO{EXTEND: error-distribution map not generated in repo
-outputs}
+within 500\,km from 67.3\% to 89.1\%. \TODO{still need to make the error-distribution map}
 
 % Discussion
 \section{Discussion}
 
-\TODO{PH-W (Discussion): interpret the results around four contribution threads --- (1) Bayesian
-optimisation unlocks Locator on small samples; (2) the felid foundation model as a reusable asset;
-(3) VES as a label-free alternative to F\_ST; (4) transfer learning helps most where data is
-scarcest --- plus limitations and future work. Draw on README "Key Contributions"; the proposal
-"EXPECTED OUTCOMES" (chapter-proposal.tex L157--170) may be used as idea material only, not copied.}
+\TODO{write the discussion -- bayesopt unlocking locator on small samples, the felid foundation
+model as a reusable asset, VES as a label-free alternative to F\_ST, transfer learning helping most
+where data is scarcest. also limitations and future work.}
 
 % back matter
 \section*{Author Contributions}
-\TODO{PH-X (Author Contributions): CRediT roles per author.}
+\TODO{add author contributions (CRediT roles)}
 
 \section*{Acknowledgements}
-\TODO{PH-Z (Acknowledgements): funders, LBGM-PUCRS, and field collaborators (the proposal
-acknowledgements block is empty).}
+\TODO{acknowledgements -- funders, LBGM-PUCRS, field collaborators}
 
 \section*{Ethics Statement}
-\TODO{Ethics Statement: sampling and collection permits and animal-ethics approvals for the jaguar
-genomes (permit numbers and issuing authorities; not present in the proposal sources).}
+\TODO{need permit numbers and ethics approval info for the jaguar samples, don't have these on hand}
 
 \section*{Conflict of Interest}
-\TODO{PH-AA (Conflict of Interest): standard declaration.}
+\TODO{add conflict of interest statement}
 
 \section*{Data Availability Statement}
 The felid foundation model was pretrained on six publicly available reference assemblies spanning
@@ -2249,18 +2228,15 @@ the HuggingFace model hub (\texttt{zhihan1996/DNABERT-2-117M}) and was pinned to
 \texttt{\seqsplit{7bce263b15377fc15361f52cfab88f8b586abda0}} for exact reproducibility. Finally, all
 of the analysis code --- data acquisition with checksum verification, corpus construction and
 tokenization, foundation pretraining, Variant Effect Scoring, and the genotype-MLP fine-tuning and
-evaluation pipeline --- is available in the accompanying repository \TODO{EXTEND: add public URL/DOI
-for the analysis code repository (genomic-transformer-transfer-learning); no repository URL is
-declared in the sources}.
+evaluation pipeline --- is available in the accompanying repository \TODO{add the repo link once
+it's public}.
 
-\TODO{Citation cleanup: reused proposal prose sometimes names an author and year inline (e.g.
-"Battey and colleagues (2020)") in addition to the \textbackslash citep citation, which now renders
-a redundant parenthetical under author--year style. Reconcile these to \textbackslash citet /
-\textbackslash citep as appropriate --- a citation-command change only, not a wording change.}
+\TODO{some spots name the author inline (e.g. "Battey and colleagues (2020)") on top of the citep,
+so it double prints. go through and fix these to citet where that happens.}
 
 \bibliography{bibliography}
 
 \section*{Supporting Information}
-\TODO{PH-AB (Supporting Information): optional; list supplementary tables/figures if any.}
+\TODO{only need this section if there end up being supplementary tables/figures}
 
 \end{document}
